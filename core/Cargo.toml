@@ -1,0 +1,48 @@
+[package]
+name = "aether-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "AETHER Protocol Core Library"
+
+[dependencies]
+# 非同期
+tokio.workspace = true
+
+# ネットワーク
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+stun.workspace = true
+
+# 暗号
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+pqcrypto-kyber.workspace = true
+chacha20poly1305.workspace = true
+argon2.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+rand.workspace = true
+
+# データ処理
+reed-solomon-erasure.workspace = true
+zstd.workspace = true
+bincode.workspace = true
+serde.workspace = true
+
+# ストレージ
+sled.workspace = true
+
+# ユーティリティ
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile = "3.24.0"
+tokio-test = "0.4"

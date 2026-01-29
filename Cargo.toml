@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["AETHER Team"]
+license = "MIT OR Apache-2.0"
+rust-version = "1.93"  # Updated to match current env
+
+[workspace.dependencies]
+# 非同期ランタイム
+tokio = { version = "1.43", features = ["full"] }
+
+# QUIC実装
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"  # 自己署名証明書生成
+
+# 暗号系
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+pqcrypto-kyber = "0.8"  # Kyber (ML-KEM)
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+
+# データ処理
+reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
+zstd = "0.13"
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+
+# ローカルDB
+sled = "0.34"
+
+# ユーティリティ
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+hex = "0.4"
+stun = "0.6"  # Added for STUN support
+
+# CLI用
+clap = { version = "4", features = ["derive"] }
