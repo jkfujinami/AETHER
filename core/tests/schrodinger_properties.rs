@@ -192,6 +192,28 @@ async fn shards_of_a_different_message_are_rejected() {
     assert_eq!(recovered, b"message A, the first one");
 }
 
+#[tokio::test]
+async fn decrypt_hint_recovers_the_nonce_behind_the_mailbox_key() {
+    // 再放流(18.3-A)の前提：受信者は Hint から nonce を取り出せ、
+    // その nonce から同じ mailbox_key を再現できる（＝同じコンテンツを指す
+    // 新しい Hint を作れる）。
+    use sha2::{Digest, Sha256};
+
+    let mb = mailbox_for(BOB, SECRET);
+    let (payload, hint) = mb.prepare_packet(&BOB, b"public content").unwrap();
+    let mailbox_key = &payload[0..32];
+
+    let (nonce, secret) = mb.decrypt_hint(&hint).expect("自分の Hint は復号できる");
+    assert_eq!(secret, SECRET);
+
+    let derived: [u8; 32] = Sha256::digest(nonce).into();
+    assert_eq!(
+        &derived[..],
+        mailbox_key,
+        "decrypt_hint の nonce から mailbox_key を再現できる"
+    );
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }

@@ -6,6 +6,7 @@ use crate::mailbox::server::MailboxServer;
 use crate::net::gossip_server::{self, GossipServer, HintAction};
 use crate::net::hint_batcher::{self, HintBatcher};
 use crate::net::hint_log::{HintDigest, HintLog};
+use crate::net::dandelion::{DandelionRouter, Route};
 use crate::protocol::hint::current_timestamp;
 use crate::net::pex::{self, PexRequest, PexResponse};
 use crate::net::relay_list::{RelayDescriptor, RelayDirectory};
@@ -17,7 +18,7 @@ use crate::crypto::pow;
 use crate::protocol::hint::HintPacket;
 use crate::net::tunnel::TunnelRelay;
 use crate::node::peer::PeerManager;
-use crate::crypto::identity::Identity;
+use crate::crypto::identity::{Identity, NodeId};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tracing::{info, error, debug};
@@ -34,6 +35,12 @@ const HINT_REPLICAS: usize = 5;
 
 /// Hint backlog の差分同期間隔
 const HINT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Dandelion++ の stem フェイルセーフ (3-2)
+///
+/// stem した Hint がこの時間内に fluff で戻ってこなければ、自分で fluff する。
+/// stem 後継が黒穴でも配送を保証する。
+const DANDELION_STEM_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 期限切れデータの掃除間隔
 const GC_INTERVAL: Duration = Duration::from_secs(300);
@@ -77,6 +84,8 @@ pub struct NodeServer {
     filtering: Arc<RwLock<NatFiltering>>,
     /// 分散 Hint backlog（19.1.3・オフライン受信）
     hint_log: Arc<Mutex<HintLog>>,
+    /// Dandelion++ の経路ポリシー（放流元秘匿 / 3-2）
+    dandelion: Arc<Mutex<DandelionRouter>>,
 }
 
 
@@ -102,6 +111,8 @@ pub struct PacketContext {
     pub remote_addr: Option<SocketAddr>,
     /// 分散 Hint backlog（19.1.3）
     pub hint_log: Arc<Mutex<HintLog>>,
+    /// Dandelion++ の経路ポリシー（3-2）
+    pub dandelion: Arc<Mutex<DandelionRouter>>,
 }
 
 impl NodeServer {
@@ -184,6 +195,7 @@ impl NodeServer {
             filter_check_pending: Arc::new(AtomicBool::new(false)),
             filtering: Arc::new(RwLock::new(NatFiltering::Unknown)),
             hint_log: Arc::new(Mutex::new(HintLog::default())),
+            dandelion: Arc::new(Mutex::new(DandelionRouter::new())),
         })
     }
 
@@ -308,6 +320,7 @@ impl NodeServer {
                 local_addr,
                 remote_addr: None,
                 hint_log: self.hint_log.clone(),
+                dandelion: self.dandelion.clone(),
             };
 
             tokio::spawn(async move {
@@ -333,6 +346,7 @@ impl NodeServer {
             local_addr,
             remote_addr: None,
             hint_log: self.hint_log.clone(),
+            dandelion: self.dandelion.clone(),
         };
 
         while let Some(conn) = self.server.accept().await {
@@ -443,8 +457,9 @@ impl NodeServer {
                             }
                             wire::InnerPacketType::GossipHint => {
                                 // 出口リレーが Gossip ネットワークへの投入点になる。
-                                // 送信者の IP はここまで届かない。
-                                Self::relay_hint(body, &ctx).await?;
+                                // 送信者の IP はここまで届かない。**ここで Dandelion++ に入れる**：
+                                // すぐ全放流せず、まず stem（1本道）で数ホップ運んでから fluff する。
+                                Self::inject_hint(body, None, &ctx).await;
                             }
                         }
                     }
@@ -452,6 +467,21 @@ impl NodeServer {
             },
             PacketType::GossipHint => {
                 Self::relay_hint(&payload, &ctx).await?;
+            },
+            PacketType::StemHint => {
+                // Dandelion++ の stem 相。送り主を除外して次の判断（forward / fluff）へ。
+                let sender = match ctx.remote_addr {
+                    Some(addr) => {
+                        let want = crate::net::addr::normalize(addr);
+                        let dir = ctx.directory.read().await;
+                        dir.all()
+                            .into_iter()
+                            .find(|d| crate::net::addr::normalize(d.addr) == want)
+                            .map(|d| d.node_id)
+                    }
+                    None => None,
+                };
+                Self::inject_hint(&payload, sender, &ctx).await;
             },
             PacketType::GossipHintBatch => {
                 Self::relay_hint_batch(&payload, &ctx).await?;
@@ -621,6 +651,32 @@ impl NodeServer {
             PacketType::MailboxPut => {
                 ctx.mailbox.handle_put(&payload).await?;
             },
+            PacketType::IndexPut => {
+                // 索引に記述子を1件追加（19.7 / Phase 2-3）
+                ctx.mailbox.handle_index_put(&payload).await?;
+            },
+            PacketType::IndexQuery => {
+                // 索引の列挙。返信は Inbound Tunnel 経由（検索者の IP を隠す）。
+                let (index_key, reply_to) = wire::parse_mailbox_get(&payload)?;
+
+                let records = ctx.mailbox.handle_index_list(&index_key).await?;
+                if !records.is_empty() {
+                    // 1メッセージにまとめて返す: [TunnelID(32)][bincode(Vec<record>)]
+                    let body = bincode::serialize(&records)
+                        .map_err(|e| crate::AetherError::Serialization(e.to_string()))?;
+                    let mut tunnel_payload = Vec::with_capacity(32 + body.len());
+                    tunnel_payload.extend_from_slice(&reply_to.tunnel_id);
+                    tunnel_payload.extend_from_slice(&body);
+
+                    if let Err(e) = ctx
+                        .router
+                        .send_packet(reply_to.gateway, PacketType::TunnelData, &tunnel_payload)
+                        .await
+                    {
+                        debug!("Failed to reply to index query tunnel: {}", e);
+                    }
+                }
+            },
             PacketType::MailboxGet => {
                 // 要求側が返信先の Inbound Tunnel を同梱している。
                 // uni-directional stream なので直接は返せず、
@@ -728,7 +784,82 @@ impl NodeServer {
         Ok(())
     }
 
-    /// 単発の Hint を処理して拡散キューに積む
+    /// Dandelion++ の注入点 ── stem（1本道）で運ぶか fluff（放流）するか決める (3-2)
+    ///
+    /// onion 出口での投入と、stem 相の中継の両方から呼ぶ。stem なら単一の後継へ
+    /// [`StemHint`](PacketType::StemHint) を送る。fluff なら通常の gossip 放流
+    /// ([`relay_hint`](Self::relay_hint)) に落とす。
+    ///
+    /// **フェイルセーフ:** stem した Hint が [`DANDELION_STEM_TIMEOUT`] 内に fluff で
+    /// 戻ってこなければ自分で fluff する。stem 後継が黒穴でも配送を保証する。
+    async fn inject_hint(hint_bytes: &[u8], sender: Option<NodeId>, ctx: &PacketContext) {
+        let packet: HintPacket = match bincode::deserialize(hint_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("Invalid Hint for injection discarded: {}", e);
+                return;
+            }
+        };
+
+        // 拡散先候補 = ディレクトリの他ノード
+        let neighbors: Vec<NodeId> = {
+            let dir = ctx.directory.read().await;
+            dir.all()
+                .into_iter()
+                .map(|d| d.node_id)
+                .filter(|id| *id != ctx.descriptor.node_id)
+                .collect()
+        };
+
+        // 注入点では sender が無いので自分を送り主扱い（自分を除外するだけ）
+        let sender_id = sender.unwrap_or(ctx.descriptor.node_id);
+
+        let route = {
+            let mut d = ctx.dandelion.lock().unwrap();
+            d.route(
+                &sender_id,
+                &neighbors,
+                std::time::Instant::now(),
+                &mut rand::thread_rng(),
+            )
+        };
+
+        match route {
+            Route::Forward(target) => {
+                let target_addr = {
+                    let dir = ctx.directory.read().await;
+                    dir.get(&target).map(|d| d.addr)
+                };
+                let Some(addr) = target_addr else {
+                    // 後継が引けない → 即 fluff
+                    let _ = Self::relay_hint(hint_bytes, ctx).await;
+                    return;
+                };
+
+                let _ = ctx
+                    .router
+                    .send_packet(addr, PacketType::StemHint, hint_bytes)
+                    .await;
+
+                // フェイルセーフ: 一定時間 fluff が観測できなければ自分で fluff する
+                let id = packet.id();
+                let ctx2 = ctx.clone();
+                let bytes = hint_bytes.to_vec();
+                tokio::spawn(async move {
+                    tokio::time::sleep(DANDELION_STEM_TIMEOUT).await;
+                    if !ctx2.gossip.has_seen(&id).await {
+                        debug!("Dandelion fail-safe: fluffing a stemmed hint");
+                        let _ = Self::relay_hint(&bytes, &ctx2).await;
+                    }
+                });
+            }
+            Route::Fluff => {
+                let _ = Self::relay_hint(hint_bytes, ctx).await;
+            }
+        }
+    }
+
+    /// 単発の Hint を処理して拡散キューに積む（fluff 相）
     async fn relay_hint(hint_bytes: &[u8], ctx: &PacketContext) -> Result<()> {
         let packet: HintPacket = match bincode::deserialize(hint_bytes) {
             Ok(p) => p,
@@ -801,9 +932,22 @@ impl NodeServer {
     /// あるいはバッチ満杯時にまとめて送る。
     /// Hint 90バイトに対しヘッダが約53バイト乗るため、
     /// 1件ずつ送ると帯域の4割弱がヘッダで消える。
+    ///
+    /// **拡散先はディレクトリ（既知リレー全体）から無作為抽選する。**
+    /// PeerManager（自分が accept した inbound 接続のみ）だと、種のように
+    /// Connection Reversal で「相手の接続の上に返信するだけ」の相手が集合から漏れる。
+    /// その結果、出口リレー ≠ 購読者 のとき Hint が購読者へ届かず、
+    /// Broadcast Veil（全ノードが全 Hint を受け取る）が破れる。既知リレーへ撒けば、
+    /// router が生存接続を再利用（無ければダイヤル）して全体に伝播する。
     async fn enqueue_for_relay(packets: Vec<HintPacket>, ctx: &PacketContext) {
         for packet in packets {
-            let peers = ctx.peers.get_random_peers(GOSSIP_FANOUT).await;
+            let peers: Vec<SocketAddr> = {
+                let dir = ctx.directory.read().await;
+                dir.random_path(GOSSIP_FANOUT, std::slice::from_ref(&ctx.descriptor.node_id))
+                    .into_iter()
+                    .map(|r| r.addr)
+                    .collect()
+            };
 
             for peer_addr in peers {
                 if peer_addr == ctx.local_addr {

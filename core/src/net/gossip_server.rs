@@ -176,6 +176,11 @@ impl GossipServer {
     pub async fn seen_count(&self) -> usize {
         self.seen.lock().await.len()
     }
+
+    /// 既に見た Hint か（**挿入せずに**確認する。Dandelion のフェイルセーフ用 / 3-2）
+    pub async fn has_seen(&self, id: &[u8; 32]) -> bool {
+        self.seen.lock().await.contains(id)
+    }
 }
 
 #[cfg(test)]

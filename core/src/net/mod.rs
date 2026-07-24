@@ -19,6 +19,7 @@ pub mod reachability;
 pub mod shaper;
 pub mod tunnel;
 pub mod connection_pool;
+pub mod dandelion; // Dandelion++ 放流元秘匿（3-2）
 
 pub use quic::{QuicClient, QuicServer, QuicConnection};
 pub use stun::StunResolver;

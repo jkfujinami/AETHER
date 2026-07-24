@@ -25,11 +25,20 @@ pub enum PacketType {
     /// 上記への応答。相手が欠けている Hint 群 (bincode Vec<HintPacket>)。
     /// **live gossip とは違い再拡散しない** ── 追いつき用の一方向配送。
     HintBacklog = 0x13,
+    /// Dandelion++ の stem（茎）相 Hint (3-2)。単一の後継へ1本道で中継する。
+    /// 中身は `GossipHint` と同じ HintPacket。fluff 相へ移ると `GossipHintBatch` になる。
+    StemHint = 0x14,
 
     // Mailbox
     MailboxPut = 0x20,
     MailboxGet = 0x21,
     MailboxResponse = 0x22,
+
+    // 索引層 (19.7 / Phase 2-3)
+    /// 索引に記述子を1件追加: `[index_key(32)][record_id(32)][record...]`
+    IndexPut = 0x23,
+    /// 索引の列挙要求: `[index_key(32)][bincode(TunnelEndpoint)]`（返信は tunnel 経由）
+    IndexQuery = 0x24,
 
     // Peer Exchange (0x4x)
     PexRequest = 0x40,
@@ -142,6 +151,8 @@ pub fn parse_typed_forward(body: &[u8]) -> Result<(SocketAddr, PacketType, &[u8]
         0x21 => PacketType::MailboxGet,
         0x10 => PacketType::GossipHint,
         0x11 => PacketType::GossipHintBatch,
+        0x23 => PacketType::IndexPut,
+        0x24 => PacketType::IndexQuery,
         other => {
             return Err(AetherError::Protocol(format!(
                 "TypedForward may not carry packet type 0x{:02x}",
@@ -220,9 +231,12 @@ pub async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Packet
         0x11 => PacketType::GossipHintBatch,
         0x12 => PacketType::HintDigest,
         0x13 => PacketType::HintBacklog,
+        0x14 => PacketType::StemHint,
         0x20 => PacketType::MailboxPut,
         0x21 => PacketType::MailboxGet,
         0x22 => PacketType::MailboxResponse,
+        0x23 => PacketType::IndexPut,
+        0x24 => PacketType::IndexQuery,
         0x50 => PacketType::PunchRequest,
         0x51 => PacketType::PunchNotify,
         0x52 => PacketType::FilterCheck,

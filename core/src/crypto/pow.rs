@@ -83,6 +83,14 @@ pub mod hint {
     pub fn verify(payload: &[u8], nonce: u64, difficulty: u32) -> bool {
         difficulty == 0 || meets_difficulty(&digest(payload, nonce), difficulty)
     }
+
+    /// この nonce が実際に達成した先頭ゼロビット数
+    ///
+    /// ランク付け (2-7) に使う。要求難易度を満たしているかだけでなく、
+    /// **どれだけ積んだか**を weight として扱う。偽れない（実ハッシュの結果）。
+    pub fn achieved_bits(payload: &[u8], nonce: u64) -> u32 {
+        super::leading_zero_bits(&digest(payload, nonce))
+    }
 }
 
 /// NodeId 用のメモリハード PoW（Argon2id）

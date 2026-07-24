@@ -37,6 +37,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "pqcrypto-kyber",
+ "pqcrypto-traits",
  "quinn",
  "rand 0.8.5",
  "rcgen",

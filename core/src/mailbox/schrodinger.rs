@@ -4,7 +4,10 @@ use crate::net::gossip::GossipClient;
 use crate::net::gossip_server;
 use crate::net::relay_list::RelayDirectory;
 use crate::mailbox::sharding::{self, Shard};
+use crate::mailbox::index::{self, IndexDescriptor, IndexRecord};
+use crate::mailbox::chunk;
 use crate::mailbox::hint_release::{ReleasePolicy, UploadProfile};
+use crate::net::tunnel::TunnelEndpoint;
 use std::time::Instant;
 use crate::protocol::hint::{self, HintPacket, HintPayload};
 use crate::protocol::wire;
@@ -257,24 +260,64 @@ impl SchrodingerMailbox {
         to: &NodeId,
         message: &[u8],
     ) -> Result<(HintPacket, [u8; 32], UploadProfile)> {
-        let started = Instant::now();
-        let mut sent_bytes: u64 = 0;
         let shared_secret = self.shared_secret_for(to)?;
         let (payload, hint) = self.prepare_packet(to, message)?;
 
         let mailbox_key: [u8; 32] = payload[0..32].try_into().expect("payload 先頭は 32 バイト");
 
-        // 1. 本体を Reed-Solomon 3+2 に分割し、シャードごとに別の座標へ置く
-        //
-        // どの保持者もファイル全体を持たない。5個中3個で復元でき、
-        // 検閲するにはリング上の離れた3箇所を同時に押さえる必要がある。
-        let body = &payload[32..];
-        let shards = sharding::encode(body)?;
+        // 本体（[msg_nonce][enc]）を RS で割って配置する。
+        let profile = self
+            .place_object(&mailbox_key, &shared_secret, &payload[32..])
+            .await?;
+
+        Ok((hint, mailbox_key, profile))
+    }
+
+    /// 前方秘匿された本体（[`Session::seal`] 済み）を配置する (3-1)
+    ///
+    /// 本文は既にラチェットで暗号化済みなので、ここは mailbox_key・シャード・Hint を
+    /// 組むだけ。**Hint 認識（blind_tag）は静的な共有秘密のまま**なので、受信者は
+    /// 従来どおり「自分宛て」を判定できる（前方秘匿は本文だけに掛ける）。
+    ///
+    /// [`Session::open`]: crate::crypto::session::Session::open
+    /// [`Session::seal`]: crate::crypto::session::Session::seal
+    pub async fn place_ratchet_body(
+        &self,
+        to: &NodeId,
+        sealed_body: &[u8],
+    ) -> Result<(HintPacket, [u8; 32], UploadProfile)> {
+        use sha2::Digest;
+        let secret = self.shared_secret_for(to)?;
+
+        let nonce = cipher::generate_key(); // 32B。SHA256(nonce) = mailbox_key
+        let mailbox_key: [u8; 32] = Sha256::digest(nonce).into();
+
+        let profile = self.place_object(&mailbox_key, &secret, sealed_body).await?;
+        let hint = self.build_hint(&secret, &nonce)?;
+        Ok((hint, mailbox_key, profile))
+    }
+
+    /// 任意のオブジェクト（`[nonce(12)][ciphertext]`）を指定 mailbox_key に配置する
+    ///
+    /// Reed-Solomon 3+2 に割り、シャードごとに封をして `H(mailbox_key ‖ K ‖ i)` の
+    /// 担当へ置く。**本体・チャンク・Manifest すべてこれを通る**（Hint は作らない）。
+    ///
+    /// - どの保持者もオブジェクト全体を持たない（5個中3個で復元）。
+    /// - 封（HMAC）が無いと、K レプリカの1台が偽シャードを返すだけで復元が止まる。
+    ///   RS は消失訂正であって誤り訂正ではないため。
+    pub async fn place_object(
+        &self,
+        mailbox_key: &[u8; 32],
+        secret: &SharedSecret,
+        object: &[u8],
+    ) -> Result<UploadProfile> {
+        let started = Instant::now();
+        let mut sent_bytes: u64 = 0;
+        let mac_key = self.shard_mac_key(secret);
+        let shards = sharding::encode(object)?;
 
         for shard in &shards {
-            let targets = self
-                .shard_targets(&mailbox_key, &shared_secret, shard.index)
-                .await;
+            let targets = self.shard_targets(mailbox_key, secret, shard.index).await;
 
             if targets.is_empty() {
                 return Err(AetherError::Config(
@@ -282,12 +325,8 @@ impl SchrodingerMailbox {
                 ));
             }
 
-            // Mailbox ペイロード: [ShardKey(32)][封をしたシャード]
-            //
-            // 封（HMAC）が無いと、K レプリカのうち1台が偽シャードを返すだけで
-            // 復元が止まる。保持者は中身を読めないが書き換えは自由にできる
-            let shard_key = sharding::shard_key(&mailbox_key, shard.index);
-            let sealed = sharding::seal(shard, &mailbox_key, &self.shard_mac_key(&shared_secret));
+            let shard_key = sharding::shard_key(mailbox_key, shard.index);
+            let sealed = sharding::seal(shard, mailbox_key, &mac_key);
 
             let mut put = Vec::with_capacity(32 + sealed.len());
             put.extend_from_slice(&shard_key);
@@ -299,12 +338,74 @@ impl SchrodingerMailbox {
             }
         }
 
-        let profile = UploadProfile {
+        Ok(UploadProfile {
             bytes: sent_bytes,
             duration: started.elapsed(),
-        };
+        })
+    }
 
-        Ok((hint, mailbox_key, profile))
+    /// 収束的暗号化でオブジェクト `[nonce(12)][ciphertext]` を作り、content-address を返す
+    ///
+    /// 同じ `(secret, 平文)` からは同じ `(content_ref, object)` が出る ── これが重複排除の要。
+    /// `object` は本体と同じ `[nonce][ct]` 形式なので、取得側は
+    /// [`reassemble`](Self::reassemble) でそのまま平文へ戻せる。
+    fn seal_chunk(&self, secret: &SharedSecret, plaintext: &[u8]) -> Result<([u8; 32], Vec<u8>)> {
+        let message_key = self.derive_key(secret, b"aether_message_v1");
+        let nonce = chunk::convergent_nonce(secret, plaintext);
+        let ciphertext = cipher::encrypt_with_nonce(&message_key, &nonce, plaintext)?;
+
+        let mut object = Vec::with_capacity(12 + ciphertext.len());
+        object.extend_from_slice(&nonce);
+        object.extend_from_slice(&ciphertext);
+
+        let content_ref = chunk::content_address(&object);
+        Ok((content_ref, object))
+    }
+
+    /// 大容量コンテンツをチャンク化して配置し、Manifest の `content_ref` を返す (2-4)
+    ///
+    /// 各チャンクと Manifest を content-addressed に置くので、同一ファイルの再公開は
+    /// **重複排除**され、複数保持者から**並列取得（swarm）**できる。**公開コンテンツ専用。**
+    /// 戻り値を索引の記述子（`chunked = true`）の `content_ref` に載せる。
+    pub async fn place_chunked(
+        &self,
+        secret: &SharedSecret,
+        name: &str,
+        data: &[u8],
+    ) -> Result<[u8; 32]> {
+        let mut chunk_refs = Vec::new();
+        for piece in chunk::split(data) {
+            let (cref, object) = self.seal_chunk(secret, piece)?;
+            self.place_object(&cref, secret, &object).await?;
+            chunk_refs.push(cref);
+        }
+
+        let manifest = chunk::Manifest {
+            name: name.to_string(),
+            size: data.len() as u64,
+            chunk_refs,
+        };
+        let manifest_bytes = manifest.encode()?;
+        let (mref, object) = self.seal_chunk(secret, &manifest_bytes)?;
+        self.place_object(&mref, secret, &object).await?;
+        Ok(mref)
+    }
+
+    /// content-addressed なオブジェクト（チャンク／Manifest）の取得要求を出す (2-4)
+    ///
+    /// [`fetch_by_ref`](Self::fetch_by_ref) と違い `SHA256(nonce)` の変換をしない ──
+    /// `mailbox_key` は content-address そのもの。応答は Inbound Tunnel 経由で戻る。
+    pub async fn request_object(&self, mailbox_key: &[u8; 32], secret: &SharedSecret) -> Result<()> {
+        self.request_body(mailbox_key, secret).await
+    }
+
+    /// 単一 body の `content_ref`（= nonce）から mailbox_key を出す
+    ///
+    /// [`fetch_by_ref`](Self::fetch_by_ref) が内部で行う変換を、取得側が
+    /// 取得要求と復元を分けて回したい場合に使えるよう公開したもの。
+    pub fn body_mailbox_key(content_ref: &[u8; 32]) -> [u8; 32] {
+        use sha2::Digest;
+        Sha256::digest(content_ref).into()
     }
 
     /// Hint を放流する
@@ -315,6 +416,144 @@ impl SchrodingerMailbox {
         self.gossip.broadcast(hint).await
     }
 
+    /// ダウンロードした本体を再シードする (18.3-C・ダウンローダが保持者になる)
+    ///
+    /// 取得して復元に成功した sealed shard を、**現在の** K 最近接へ置き直す。
+    /// 元の保持者が離脱・期限切れになってもコンテンツが生き続け、
+    /// 人気なほど保持者が増える（Winny の「消えない」性質）。
+    ///
+    /// 封を検証してから撒くので、渡された中にゴミが混じっていても伝播しない。
+    /// index 重複はまとめる。戻り値は再シードした distinct shard 数。
+    pub async fn reseed(
+        &self,
+        mailbox_key: &[u8; 32],
+        secret: &SharedSecret,
+        sealed_shards: &[Vec<u8>],
+    ) -> Result<usize> {
+        let mac_key = self.shard_mac_key(secret);
+        let mut seen = std::collections::HashSet::new();
+        let mut count = 0;
+
+        for sealed in sealed_shards {
+            // 封（HMAC）を通った shard だけ再シードする
+            let Some(shard) = sharding::open(sealed, mailbox_key, &mac_key) else {
+                continue;
+            };
+            if !seen.insert(shard.index) {
+                continue; // 同じ index は1回でよい
+            }
+
+            let targets = self.shard_targets(mailbox_key, secret, shard.index).await;
+            let shard_key = sharding::shard_key(mailbox_key, shard.index);
+            let mut put = Vec::with_capacity(32 + sealed.len());
+            put.extend_from_slice(&shard_key);
+            put.extend_from_slice(sealed);
+
+            for target in targets {
+                self.relay.send_onion_message(&put, target).await?;
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// 索引に記述子を1件公開する (19.7 / Phase 2-3)
+    ///
+    /// キーワードの索引位置 `H(index_key ‖ K_pub)` の担当保持者へ、
+    /// **K_pub で封じた記述子**を Onion 経由で追記する。保持者は中身を読めない。
+    pub async fn publish_descriptor(
+        &self,
+        k_pub: &SharedSecret,
+        descriptor: &IndexDescriptor,
+    ) -> Result<()> {
+        let record = IndexRecord::create(k_pub, descriptor, self.hint_pow_difficulty)?;
+        let idx_key = index::index_key(k_pub);
+        let record_bytes = record.encode()?;
+
+        // payload: [index_key(32)][record_id(32)][record]
+        let mut payload = Vec::with_capacity(64 + record_bytes.len());
+        payload.extend_from_slice(&idx_key);
+        payload.extend_from_slice(&record.id());
+        payload.extend_from_slice(&record_bytes);
+
+        let targets = self.mailbox_targets(&idx_key, k_pub).await;
+        if targets.is_empty() {
+            return Err(AetherError::Config("Relay directory is empty".into()));
+        }
+        for target in targets {
+            self.relay
+                .send_onion_message_typed(wire::PacketType::IndexPut, &payload, target)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// 索引を pull で引く（返信は Inbound Tunnel 経由で戻る）(19.7 / Phase 2-3)
+    ///
+    /// キーワードを知っていれば誰でも位置を計算でき、Onion 越しに引ける。
+    /// 保持者からは「その索引が引かれた」ことは見えるが、**誰が引いたかは割れない**。
+    pub async fn query_index(&self, k_pub: &SharedSecret, reply_to: &TunnelEndpoint) -> Result<()> {
+        let idx_key = index::index_key(k_pub);
+        let request = wire::build_mailbox_get(&idx_key, reply_to)?;
+
+        let targets = self.mailbox_targets(&idx_key, k_pub).await;
+        if targets.is_empty() {
+            return Err(AetherError::Config("Relay directory is empty".into()));
+        }
+        for target in targets {
+            self.relay
+                .send_onion_message_typed(wire::PacketType::IndexQuery, &request, target)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// トンネルで回収した索引応答を記述子へ復号する
+    ///
+    /// `decrypted` は [`decrypt_replies`](Self::decrypt_replies) を通したもの。
+    /// K 保持者ぶんの応答が来るので id で重複排除し、PoW を検証してから開く。
+    /// 各記述子に**達成 PoW ビット**（ランク付け用 / 2-7）を添えて返す。
+    pub fn decode_index_replies(
+        &self,
+        decrypted: &[Vec<u8>],
+        k_pub: &SharedSecret,
+    ) -> Vec<(IndexDescriptor, u32)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+
+        for data in decrypted {
+            let Ok(records) = bincode::deserialize::<Vec<Vec<u8>>>(data) else {
+                continue;
+            };
+            for rb in records {
+                let Ok(rec) = IndexRecord::decode(&rb) else { continue };
+                if !rec.verify_pow(self.hint_pow_difficulty) {
+                    continue;
+                }
+                if !seen.insert(rec.id()) {
+                    continue;
+                }
+                let pow_bits = rec.pow_bits();
+                if let Some(d) = rec.open(k_pub) {
+                    out.push((d, pow_bits));
+                }
+            }
+        }
+        out
+    }
+
+    /// 公開コンテンツの Hint を再放流する (18.3-A・保持者による再放流)
+    ///
+    /// nonce（= mailbox_key の素）から鮮度を保った**新しい** Hint を作って流す。
+    /// これで初回 gossip の窓や 24h backlog を超えても発見可能性が続く。
+    /// 頻度 ∝ 保持者数 ∝ 人気、で自己調整される。
+    ///
+    /// **公開コンテンツ専用。** 私信は受信者が読めば役目を終えるので再放流しない。
+    pub async fn republish(&self, secret: &SharedSecret, nonce: &[u8; 32]) -> Result<()> {
+        let hint = self.build_hint(secret, nonce)?;
+        self.gossip.broadcast(&hint).await
+    }
+
     fn shared_secret_for(&self, to: &NodeId) -> Result<SharedSecret> {
         let contacts = self.contacts.lock().unwrap();
         contacts
@@ -323,10 +562,11 @@ impl SchrodingerMailbox {
             .ok_or(AetherError::Config("Contact not found".into()))
     }
 
-    /// 受信した Hint を試行復号する
+    /// 受信した Hint を復号し、`(nonce, 共有秘密)` を返す
     ///
-    /// 戻り値の共有秘密は Mailbox 位置 `H(mailbox_key ‖ K)` の計算に必要。
-    pub fn try_decrypt_hint(&self, hint: &HintPacket) -> Option<([u8; 32], SharedSecret)> {
+    /// `nonce` は `mailbox_key = SHA256(nonce)` の素。再放流 (18.3-A) では
+    /// この nonce から鮮度を保った Hint を作り直す。
+    pub fn decrypt_hint(&self, hint: &HintPacket) -> Option<([u8; 32], SharedSecret)> {
         let candidates = self.find_candidates(&hint.blind_tag, &hint.nonce);
         if candidates.is_empty() { return None; }
 
@@ -343,13 +583,20 @@ impl SchrodingerMailbox {
                 if !payload.is_fresh_within(now, crate::net::hint_log::RETENTION_WINDOW_SECS) {
                     continue;
                 }
-
-                use sha2::Digest;
-                let mailbox_key: [u8; 32] = Sha256::digest(payload.nonce).into();
-                return Some((mailbox_key, shared_secret));
+                return Some((payload.nonce, shared_secret));
             }
         }
         None
+    }
+
+    /// 受信した Hint を試行復号する
+    ///
+    /// 戻り値の共有秘密は Mailbox 位置 `H(mailbox_key ‖ K)` の計算に必要。
+    pub fn try_decrypt_hint(&self, hint: &HintPacket) -> Option<([u8; 32], SharedSecret)> {
+        let (nonce, shared_secret) = self.decrypt_hint(hint)?;
+        use sha2::Digest;
+        let mailbox_key: [u8; 32] = Sha256::digest(nonce).into();
+        Some((mailbox_key, shared_secret))
     }
 
     /// 自分宛ての Hint なら、担当 Mailbox へ取得要求を出す
@@ -363,7 +610,30 @@ impl SchrodingerMailbox {
         let Some((mailbox_key, shared_secret)) = self.try_decrypt_hint(hint) else {
             return Ok(None);
         };
+        self.request_body(&mailbox_key, &shared_secret).await?;
+        Ok(Some(mailbox_key))
+    }
 
+    /// 索引で見つけた `content_ref`（= nonce）から本体の取得要求を出す
+    ///
+    /// pull で発見したコンテンツを取りに行く経路 (Phase 2-3)。
+    /// Hint を受け取っていなくても、nonce と鍵さえあれば取得できる。
+    /// 戻り値の `mailbox_key` は復元・封検証に要る。
+    pub async fn fetch_by_ref(
+        &self,
+        secret: &SharedSecret,
+        content_ref: &[u8; 32],
+    ) -> Result<[u8; 32]> {
+        use sha2::Digest;
+        let mailbox_key: [u8; 32] = Sha256::digest(content_ref).into();
+        self.request_body(&mailbox_key, secret).await?;
+        Ok(mailbox_key)
+    }
+
+    /// 全シャードの取得要求を Inbound Tunnel 返信付きで送る
+    ///
+    /// 3個返れば復元できるので、遅い・落ちたノードを待たない。
+    async fn request_body(&self, mailbox_key: &[u8; 32], secret: &SharedSecret) -> Result<()> {
         let reply_to = {
             let tunnels = self.inbound_tunnels.lock().unwrap();
             tunnels
@@ -374,14 +644,12 @@ impl SchrodingerMailbox {
                 ))?
         };
 
-        // 全シャードを要求する。3個返ってくれば復元できるので、
-        // 遅いノード・落ちたノードを待つ必要がない（これが実効速度の主因）。
         let mut requested = 0;
         for index in 0..sharding::TOTAL_SHARDS as u8 {
-            let shard_key = sharding::shard_key(&mailbox_key, index);
+            let shard_key = sharding::shard_key(mailbox_key, index);
             let request = wire::build_mailbox_get(&shard_key, &reply_to)?;
 
-            for target in self.shard_targets(&mailbox_key, &shared_secret, index).await {
+            for target in self.shard_targets(mailbox_key, secret, index).await {
                 self.relay
                     .send_onion_message_typed(wire::PacketType::MailboxGet, &request, target)
                     .await?;
@@ -392,8 +660,7 @@ impl SchrodingerMailbox {
         if requested == 0 {
             return Err(AetherError::Config("Relay directory is empty".into()));
         }
-
-        Ok(Some(mailbox_key))
+        Ok(())
     }
 
     /// Inbound Tunnel に届いた応答を復号して取り出す
@@ -417,11 +684,28 @@ impl SchrodingerMailbox {
         &self.relay
     }
 
-    /// トンネルで回収したシャード群から本体を復元し、平文へ戻す
+    /// トンネルで回収したシャード群から本体を復元し、平文へ戻す（静的鍵）
     ///
-    /// 3個揃っていれば、どの組み合わせでも復元できる。
-    /// 揃っていなければ `None`（まだ到着待ち）。
+    /// 3個揃っていれば、どの組み合わせでも復元できる。揃っていなければ `None`。
+    /// 公開コンテンツ（K_pub 静的暗号）用。私信の前方秘匿は
+    /// [`reassemble_raw`](Self::reassemble_raw) で生本体を取り、Session で開く。
     pub fn reassemble(
+        &self,
+        replies: &[Vec<u8>],
+        mailbox_key: &[u8; 32],
+        key: &SharedSecret,
+    ) -> Result<Option<Vec<u8>>> {
+        match self.reassemble_raw(replies, mailbox_key, key)? {
+            Some(body) => Ok(Some(self.decrypt_mailbox_value(&body, key)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// シャード群を復元して**生の本体**を返す（復号しない / 3-1 のラチェット用）
+    ///
+    /// 封（HMAC）の検証は静的な共有秘密で行う（完全性・別メッセージ混入防止）。
+    /// 中身の復号は呼び出し側が [`crate::crypto::session::Session::open`] で行う。
+    pub fn reassemble_raw(
         &self,
         replies: &[Vec<u8>],
         mailbox_key: &[u8; 32],
@@ -431,16 +715,11 @@ impl SchrodingerMailbox {
         let mut shards: Vec<Shard> = Vec::new();
 
         for reply in replies {
-            // Mailbox の値は [封をしたシャード]（キーは取得時に剥がれている）。
-            //
-            // 封を検めずに受け入れると、悪意ある保持者が1台いるだけで
-            // 復元が永久に止まる。RS は消失訂正であって誤り訂正ではないので、
-            // 壊れたシャードを1枚混ぜられた時点で結果が丸ごと壊れる。
-            // タグは mailbox_key も含むので、別メッセージの混入も弾ける
+            // 封を検めずに受け入れると、悪意ある保持者1台で復元が止まる（RS は消失訂正）。
+            // タグは mailbox_key も含むので別メッセージの混入も弾ける。
             let Some(shard) = sharding::open(reply, mailbox_key, &mac_key) else {
                 continue;
             };
-
             if !shards.iter().any(|s| s.index == shard.index) {
                 shards.push(shard);
             }
@@ -450,8 +729,7 @@ impl SchrodingerMailbox {
             return Ok(None);
         }
 
-        let body = sharding::decode(&shards)?;
-        Ok(Some(self.decrypt_mailbox_value(&body, key)?))
+        Ok(Some(sharding::decode(&shards)?))
     }
 
     /// Mailbox に格納された値を平文へ戻す

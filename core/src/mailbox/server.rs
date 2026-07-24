@@ -12,6 +12,12 @@ pub const MAX_ENTRY_BYTES: usize = 1024 * 1024;
 /// Tunnel 用エントリのキー接頭辞
 const TUNNEL_PREFIX: &[u8] = b"tunnel:";
 
+/// 索引エントリのキー接頭辞（19.7 / Phase 2-3）
+const INDEX_PREFIX: &[u8] = b"index:";
+
+/// 1索引につき返す記述子の上限（増幅・肥大対策。19.7）
+pub const MAX_INDEX_ENTRIES: usize = 256;
+
 /// ディスク使用量の再測定間隔（秒）
 const SIZE_CACHE_TTL_SECS: u64 = 30;
 
@@ -153,6 +159,59 @@ impl MailboxServer {
         }
 
         Ok(messages)
+    }
+
+    /// 索引に記述子を1件追加する（19.7 / Phase 2-3）
+    ///
+    /// キー: `index:{index_key(32)}:{record_id(32)}`。**追記型**で、
+    /// 複数の公開者が同じ索引へ足しても互いを上書きしない（集合＝ユニオン）。
+    /// `record_id` で重複排除される。no-burn + アクセス連動 TTL は他と共通。
+    pub async fn handle_index_put(&self, payload: &[u8]) -> Result<()> {
+        // payload: [index_key(32)][record_id(32)][record...]
+        if payload.len() < 64 {
+            return Err(AetherError::Protocol("IndexPut payload too short".into()));
+        }
+        let record = &payload[64..];
+        if record.len() > MAX_ENTRY_BYTES {
+            return Err(AetherError::Mailbox("Index record too large".into()));
+        }
+
+        self.ensure_capacity()?;
+
+        let mut key = Vec::with_capacity(INDEX_PREFIX.len() + 64);
+        key.extend_from_slice(INDEX_PREFIX);
+        key.extend_from_slice(&payload[0..64]); // index_key ‖ record_id
+        self.insert_entry(&key, record)
+    }
+
+    /// 索引の記述子を列挙する（19.7 / Phase 2-3）
+    ///
+    /// **削除しない（no-burn）。** 期限切れは除外し、上限で頭打ち。
+    /// アクセスで生きているエントリの寿命を延ばす（人気な索引は残る）。
+    pub async fn handle_index_list(&self, index_key: &[u8; 32]) -> Result<Vec<Vec<u8>>> {
+        let mut prefix = Vec::with_capacity(INDEX_PREFIX.len() + 32);
+        prefix.extend_from_slice(INDEX_PREFIX);
+        prefix.extend_from_slice(index_key);
+
+        let now = current_timestamp();
+        let mut out = Vec::new();
+
+        for item in self.db.scan_prefix(&prefix) {
+            let (k, v) = item.map_err(|e| AetherError::Storage(e.to_string()))?;
+            let Ok(entry) = Self::decode_entry(&v) else { continue };
+            if self.is_expired(&entry, now) {
+                continue;
+            }
+            // アクセスで延命（no-burn + アクセス連動 TTL）
+            if now.saturating_sub(entry.refreshed_at) >= self.ttl_seconds / 2 {
+                let _ = self.insert_entry(&k, &entry.value);
+            }
+            out.push(entry.value);
+            if out.len() >= MAX_INDEX_ENTRIES {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// 期限切れエントリを削除する。戻り値は削除件数
