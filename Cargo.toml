@@ -35,6 +35,7 @@ rand = "0.8"
 # データ処理
 reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
 zstd = "0.13"
+subtle = "2.6"  # 定数時間比較
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
 
@@ -48,6 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 hex = "0.4"
 stun = "0.6"  # Added for STUN support
+socket2 = "0.5"  # デュアルスタック bind (v6only=false)
 
 # CLI用
 clap = { version = "4", features = ["derive"] }

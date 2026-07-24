@@ -22,7 +22,9 @@
 | 14 | [14_updated_dataflow.md](./14_updated_dataflow.md) | 更新されたデータフロー |
 | 15 | [15_remaining_issues.md](./15_remaining_issues.md) | 残課題 |
 | 16 | [16_next_actions.md](./16_next_actions.md) | 次のアクション |
-| **17** | [17_server_side.md](./17_server_side.md) | **サーバーサイド実装（Router/Mailbox/Gossip）** |
+| 17 | [17_server_side.md](./17_server_side.md) | サーバーサイド実装（Router/Mailbox/Gossip） |
+| **18** | [18_winny_successor_revision.md](./18_winny_successor_revision.md) | **Winny 後継アーキテクチャへの改訂 (2026-07-23) — Part 1-17 への差分** |
+| **19** | [19_unimplemented_inventory.md](./19_unimplemented_inventory.md) | **未実装の棚卸し — 設計とコードの差分、着手順** |
 
 ---
 

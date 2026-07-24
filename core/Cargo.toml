@@ -16,6 +16,7 @@ quinn.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
 stun.workspace = true
+socket2.workspace = true
 
 # 暗号
 ed25519-dalek.workspace = true
@@ -31,6 +32,7 @@ rand.workspace = true
 # データ処理
 reed-solomon-erasure.workspace = true
 zstd.workspace = true
+subtle.workspace = true
 bincode.workspace = true
 serde.workspace = true
 

@@ -30,6 +30,18 @@ impl Router {
         Ok(Self { identity, connection_pool })
     }
 
+    /// 待ち受けと同じエンドポイントから発信する Router
+    ///
+    /// **ノードはこちらを使うこと。** 別ソケットで発信すると、
+    /// 観測される送信元が広告アドレスと食い違い、
+    /// outbound が広告ポートの NAT マッピングを維持しなくなる。
+    pub fn with_endpoint(identity: Arc<Identity>, endpoint: quinn::Endpoint) -> Result<Self> {
+        Ok(Self {
+            identity,
+            connection_pool: ConnectionPool::from_endpoint(endpoint),
+        })
+    }
+
     /// 受信したOnion Packetを処理する
     /// 1. パケット先頭の一時公開鍵と自分の秘密鍵で共有鍵を導出
     /// 2. パケットを復号（皮剥き）
@@ -88,6 +100,58 @@ impl Router {
             .map_err(|e| AetherError::Protocol(format!("Invalid instruction: {}", e)))?;
 
         Ok((tunnel_id, shared_secret, instruction))
+    }
+
+    /// accept した接続をプールへ登録する
+    ///
+    /// **これを呼ばないと NAT 内の相手へ送り返せない。**
+    /// 相手が張った接続だけが、その相手への唯一の到達経路になる。
+    pub async fn register_inbound(&self, connection: quinn::Connection) {
+        self.connection_pool.register_inbound(connection).await;
+    }
+
+    /// **既存接続だけで**送る。無ければ失敗する
+    ///
+    /// 相手が NAT の内側にいる場合、ダイヤルは必ず失敗するので
+    /// 「相手が張った接続があるか」が到達可否そのものになる。
+    /// ダイヤルにフォールバックすると、届かない相手に対して
+    /// タイムアウトぶんの時間を無駄にする。
+    pub async fn send_packet_existing(
+        &self,
+        addr: SocketAddr,
+        packet_type: PacketType,
+        payload: &[u8],
+    ) -> Result<()> {
+        let conn = self
+            .connection_pool
+            .live_connection(addr)
+            .await
+            .ok_or_else(|| AetherError::Config(format!("No live connection to {}", addr)))?;
+
+        let mut stream = conn.open_uni().await.map_err(|e| AetherError::Quic(e.to_string()))?;
+        wire::write_packet(&mut stream, packet_type, payload).await?;
+        stream.finish().map_err(|e| AetherError::Quic(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 接続プールの掃除を走らせる
+    pub async fn maintain_connections(&self) {
+        self.connection_pool.maintain().await;
+    }
+
+    /// 生きた接続があるか（診断用）
+    pub async fn has_live_connection(&self, addr: SocketAddr) -> bool {
+        self.connection_pool.has_live_connection(addr).await
+    }
+
+    /// 新規 outbound 接続の通知を受け取る
+    pub fn subscribe_opened(&self) -> tokio::sync::mpsc::UnboundedReceiver<quinn::Connection> {
+        self.connection_pool.subscribe_opened()
+    }
+
+    /// 保持している inbound 接続の数（診断用）
+    pub async fn inbound_count(&self) -> usize {
+        self.connection_pool.inbound_count().await
     }
 
     /// 任意のパケットを指定した宛先に送信する

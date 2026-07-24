@@ -1,11 +1,20 @@
 use crate::{Config, Result, AetherError};
+use crate::net::shared_socket::{SharedSocket, SideChannelDatagram};
 use quinn::Endpoint;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 pub struct QuicServer {
     endpoint: Endpoint,
+    /// QUIC が使っているソケット
+    ///
+    /// STUN も punch もここから撃つ。別ソケットだと NAT マッピングが
+    /// 別物になり、得た外部アドレスも開けた穴も QUIC には使えない。
+    socket: Arc<SharedSocket>,
+    /// 横取りした STUN の受け口（1度だけ取り出せる）
+    side_rx: Mutex<Option<mpsc::UnboundedReceiver<SideChannelDatagram>>>,
 }
 
 impl QuicServer {
@@ -17,11 +26,70 @@ impl QuicServer {
             key,
         ).map_err(|e| AetherError::Quic(e.to_string()))?;
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], config.listen_port));
-        let endpoint = Endpoint::server(server_config, addr)
-             .map_err(AetherError::Network)?;
+        // **デュアルスタックで bind する。**
+        // IPv6 が使える環境では NAT が存在しないため、
+        // punch なしで到達可能になる（日本の IPoE 環境で効く）。
+        // v4 のピアは ::ffff:a.b.c.d として見えるので、
+        // アドレスをキーに使う箇所では addr::normalize を通すこと。
+        let raw = crate::net::addr::bind_dual_stack(config.listen_port)
+            .map_err(AetherError::Network)?;
 
-        Ok(Self { endpoint })
+        // **STUN と QUIC を同じソケットに同居させる。**
+        let runtime = quinn::TokioRuntime;
+        let (socket, side_rx) = SharedSocket::from_std(raw, &runtime)
+            .map_err(AetherError::Network)?;
+
+        let endpoint = Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket.clone(),
+            Arc::new(runtime),
+        ).map_err(AetherError::Network)?;
+
+        // **同じエンドポイントから発信もする。**
+        //
+        // 別ソケットで発信すると:
+        // - 観測される送信元が広告アドレスと食い違い、フィルタ判定が狂う
+        // - outbound が inbound 側の NAT マッピングを維持しない
+        //   （発信で穴が開くのは発信に使ったソケットの分だけ）
+        // - NAT のセッション表を2つ消費する
+        let mut endpoint = endpoint;
+        endpoint.set_default_client_config(QuicClient::skip_verify_config()?);
+
+        Ok(Self {
+            endpoint,
+            socket,
+            side_rx: Mutex::new(Some(side_rx)),
+        })
+    }
+
+    /// 発信にも使うエンドポイント
+    ///
+    /// **待ち受けと発信で同じソケットを使うこと。**
+    /// 別にすると NAT マッピングが2つになり、
+    /// 広告しているポートの穴を outbound が維持しなくなる。
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint.clone()
+    }
+
+    /// QUIC が使っているソケット（STUN / punch の送出に使う）
+    pub fn shared_socket(&self) -> Arc<SharedSocket> {
+        self.socket.clone()
+    }
+
+    /// 横取りした STUN の受け口を取り出す
+    ///
+    /// 1度しか取れない。受け取った側が全ての STUN を捌く責任を持つ。
+    pub fn take_side_channel(&self) -> Option<mpsc::UnboundedReceiver<SideChannelDatagram>> {
+        self.side_rx.lock().unwrap().take()
+    }
+
+    /// 取り出した受け口を返す
+    ///
+    /// **一時的に使ったら必ず返すこと。** 返さないと常時の消費者が
+    /// 立てられず、punch の応答もフィルタ判定もできなくなる。
+    pub fn restore_side_channel(&self, rx: mpsc::UnboundedReceiver<SideChannelDatagram>) {
+        *self.side_rx.lock().unwrap() = Some(rx);
     }
 
     /// 既存のUDPソケットを使用してサーバーを起動する (Hole Punching用)
@@ -33,14 +101,22 @@ impl QuicServer {
             key,
         ).map_err(|e| AetherError::Quic(e.to_string()))?;
 
-        let endpoint = Endpoint::new(
+        let runtime = quinn::TokioRuntime;
+        let (socket, side_rx) = SharedSocket::from_std(socket, &runtime)
+            .map_err(AetherError::Network)?;
+
+        let endpoint = Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             Some(server_config),
-            socket,
-            Arc::new(quinn::TokioRuntime),
+            socket.clone(),
+            Arc::new(runtime),
         ).map_err(AetherError::Network)?;
 
-        Ok(Self { endpoint })
+        Ok(Self {
+            endpoint,
+            socket,
+            side_rx: Mutex::new(Some(side_rx)),
+        })
     }
 
     fn generate_self_signed_cert() -> Result<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)> {
@@ -73,8 +149,18 @@ pub struct QuicClient {
 impl QuicClient {
     pub fn new() -> Result<Self> {
         let client_config = Self::skip_verify_config()?;
-        let mut endpoint = Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))
-            .map_err(AetherError::Network)?;
+
+        // クライアント側もデュアルスタック。
+        // v6 のリレーへ繋げなくなるのを防ぐ
+        let socket = crate::net::addr::bind_dual_stack(0).map_err(AetherError::Network)?;
+
+        let mut endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        ).map_err(AetherError::Network)?;
+
         endpoint.set_default_client_config(client_config);
         Ok(Self { endpoint })
     }
@@ -94,7 +180,7 @@ impl QuicClient {
         Ok(Self { endpoint })
     }
 
-    fn skip_verify_config() -> Result<quinn::ClientConfig> {
+    pub(crate) fn skip_verify_config() -> Result<quinn::ClientConfig> {
         let mut config = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();

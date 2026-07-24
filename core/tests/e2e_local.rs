@@ -1,13 +1,13 @@
-use aether_core::node::server::NodeServer;
 use aether_core::net::relay::RelayClient;
 use aether_core::crypto::identity::Identity;
 use aether_core::net::onion::OnionCircuit;
 use aether_core::crypto::key_exchange;
 use aether_core::mailbox::schrodinger::SchrodingerMailbox;
-use aether_core::protocol::wire::PacketType;
+use aether_core::protocol::wire::InnerPacketType;
 use aether_core::net::gossip::GossipClient;
-use std::time::Duration;
-use tokio::time::sleep;
+use aether_core::net::gossip_server::HintAction;
+
+mod common;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 
@@ -26,18 +26,7 @@ async fn test_local_e2e_mailbox_put() {
     let bob_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let server_db = tempfile::tempdir().unwrap();
 
-    let bob_server = Arc::new(NodeServer::new(port, bob_id, server_db.path()).unwrap());
-    let bob_server_clone = bob_server.clone();
-
-    // Run server in background
-    tokio::spawn(async move {
-        if let Err(e) = bob_server_clone.run().await {
-            eprintln!("Server Error: {}", e);
-        }
-    });
-
-    // Wait for server startup
-    sleep(Duration::from_millis(500)).await;
+    let bob_server = common::spawn_ready_node(port, bob_id, server_db.path()).await;
 
     // 2. Setup Alice's network client (RelayClient)
     let mut relay_client = RelayClient::new().unwrap();
@@ -77,8 +66,7 @@ async fn test_local_e2e_mailbox_put() {
     println!("Sending Onion Packet ({} bytes)...", payload.len());
     relay_client.send_onion_message(&payload, bob_addr).await.expect("Failed to send onion");
 
-    // Wait for processing
-    sleep(Duration::from_millis(500)).await;
+    common::wait_for_mailbox_entries(&bob_server, 1).await;
 
     // 6. Verify Bob received Mailbox Put
     // Key is first 32 bytes
@@ -94,19 +82,33 @@ async fn test_local_e2e_mailbox_put() {
 
     println!("E2E Mailbox PUT Test Passed!");
 
-    // 7. Send Gossip Hint
-    // broadcast uses send_raw_packet
+    // 7. Send Gossip Hint (Onion 経由)
+    // Hint を素で Entry Relay に投げると発信源 IP が割れるため、
+    // 必ず Onion で包んで送る。出口リレーが Gossip への投入点になる。
     let hint_bytes = bincode::serialize(&hint).unwrap();
-    println!("Sending Gossip Hint...");
-    relay_client.send_raw_packet(PacketType::GossipHint, &hint_bytes).await.expect("Failed send hint");
+    println!("Sending Gossip Hint via Onion...");
+    relay_client
+        .send_onion_inner(InnerPacketType::GossipHint, &hint_bytes)
+        .await
+        .expect("Failed send hint");
 
-    sleep(Duration::from_millis(500)).await;
+    // Hint が GossipServer に登録されるまで待つ
+    let seen = bob_server.gossip();
+    common::wait_until("Bob to register the Hint", common::DEFAULT_TIMEOUT, || {
+        let seen = seen.clone();
+        async move { seen.seen_count().await > 0 }
+    })
+    .await;
 
     // 8. Verify Bob received Gossip Hint
-    // Since handle_hint returns false if duplicate, we check if it returns false for the same hint.
-    // (If it was never received, it would return true)
-    let is_new = bob_server.gossip().handle_hint(&hint_bytes).await.unwrap();
-    assert!(!is_new, "Hint should be already seen by Bob (so now it's not new)");
+    // 受信済みなら同じ Hint は重複として Drop されるはず。
+    // 一度も届いていなければ Relay が返る。
+    let action = bob_server.gossip().handle_hint(&hint_bytes).await.unwrap();
+    assert_eq!(
+        action,
+        HintAction::Drop,
+        "Onion 経由で届いた Hint が GossipServer に登録されていない"
+    );
 
     println!("E2E Gossip Hint Test Passed!");
 }

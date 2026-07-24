@@ -227,6 +227,15 @@ impl TunnelRelay {
         }
     }
 
+    /// 登録済みトンネル数
+    pub fn len(&self) -> usize {
+        self.tunnels.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tunnels.is_empty()
+    }
+
     /// トンネルを登録する (Gateway がトンネル構築時に呼ばれる)
     pub fn register_tunnel(
         &mut self,

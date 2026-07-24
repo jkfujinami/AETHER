@@ -1,11 +1,9 @@
-use aether_core::node::server::NodeServer;
 use aether_core::net::relay::RelayClient;
 use aether_core::crypto::identity::Identity;
 use aether_core::net::tunnel::InboundTunnel;
 use aether_core::protocol::wire::PacketType;
-use std::time::Duration;
-use tokio::time::sleep;
-use std::sync::Arc;
+
+mod common;
 use std::net::SocketAddr;
 
 #[tokio::test]
@@ -31,11 +29,9 @@ async fn test_inbound_tunnel_e2e() {
     let relay_dir = tempfile::tempdir().unwrap();
     let alice_dir = tempfile::tempdir().unwrap();
 
-    let _gw_server = spawn_server(gw_port, gw_id, gw_dir.path()).await;
-    let _relay_server = spawn_server(relay_port, relay_id, relay_dir.path()).await;
-    let alice_server = spawn_server(alice_port, alice_id, alice_dir.path()).await;
-
-    sleep(Duration::from_millis(2000)).await;
+    let _gw_server = common::spawn_ready_node(gw_port, gw_id, gw_dir.path()).await;
+    let _relay_server = common::spawn_ready_node(relay_port, relay_id, relay_dir.path()).await;
+    let alice_server = common::spawn_ready_node(alice_port, alice_id, alice_dir.path()).await;
 
     // 2. Alice builds tunnel: Gateway -> Relay -> Alice
     // Alice acts as a client to set this up.
@@ -56,7 +52,13 @@ async fn test_inbound_tunnel_e2e() {
         println!("Alice: Build packet sent successfully to {}", addr);
     }
 
-    sleep(Duration::from_millis(1000)).await;
+    // 3本のトンネルが登録されるまで待つ
+    common::wait_until("all 3 hops to register the tunnel", common::DEFAULT_TIMEOUT, || async {
+        _gw_server.tunnel_count().await >= 1
+            && _relay_server.tunnel_count().await >= 1
+            && alice_server.tunnel_count().await >= 1
+    })
+    .await;
 
     // 3. Bob sends message to Alice via Inbound Tunnel (Gateway)
     let message = b"Hello Tunnel World!";
@@ -70,7 +72,7 @@ async fn test_inbound_tunnel_e2e() {
 
     bob_client.send_direct_packet(gw_addr, PacketType::TunnelData, &packet_payload).await.expect("Failed to send data to GW");
 
-    sleep(Duration::from_millis(3000)).await;
+    common::wait_for_mailbox_entries(&alice_server, 1).await;
 
     // 4. Alice checks mailbox
     println!("Alice: Checking Mailbox for Tunnel Message");
@@ -93,15 +95,4 @@ async fn test_inbound_tunnel_e2e() {
     assert_eq!(decrypted_msg, message, "Message should match after decryption");
 
     println!("Test Passed: Message decrypted successfully: {:?}", String::from_utf8_lossy(&decrypted_msg));
-}
-
-async fn spawn_server(port: u16, id: Identity, db_path: &std::path::Path) -> Arc<NodeServer> {
-    let server = Arc::new(NodeServer::new(port, id, db_path).unwrap());
-    let s = server.clone();
-    tokio::spawn(async move {
-        if let Err(e) = s.run().await {
-            eprintln!("Server {} error: {}", port, e);
-        }
-    });
-    server
 }

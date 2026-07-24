@@ -70,7 +70,11 @@ impl OnionCircuit {
     /// ペイロードをOnion暗号化する
     /// HeaderFlags: 0x01 = Relay, 0x00 = Final
     /// Structure: [One-Time-Pubkey(32)] + [Nonce(12)] + [Ciphertext]
-    pub fn wrap_packet(&self, final_payload: &[u8], _final_destination: SocketAddr) -> Result<Vec<u8>> {
+    ///
+    /// 最終宛先は Onion 層ではなく最内層のペイロード
+    /// (`InnerPacketType::MailboxForward`) が持つ。
+    /// 出口リレーだけがそれを読める。
+    pub fn wrap_packet(&self, final_payload: &[u8]) -> Result<Vec<u8>> {
         // 最深部 (Final Layer): Flag 0x00 + Payload
         let mut current_data = Vec::with_capacity(1 + final_payload.len());
         current_data.push(0x00);
@@ -184,9 +188,8 @@ mod tests {
 
         // 2. パケット作成
         let msg = b"Hello, Anonymous World!";
-        let final_dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
 
-        let wrapped_packet = circuit.wrap_packet(msg, final_dest).unwrap();
+        let wrapped_packet = circuit.wrap_packet(msg).unwrap();
         println!("Wrapped packet size: {} bytes", wrapped_packet.len());
 
         // 3. パケット転送 & 皮剥き

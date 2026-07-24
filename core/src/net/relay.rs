@@ -1,9 +1,11 @@
 use crate::error::{Result, AetherError};
 use crate::net::quic::{QuicClient, QuicConnection};
 use crate::net::connection_pool::ConnectionPool;
-use crate::protocol::wire::{self, PacketType};
+use crate::protocol::wire::{self, InnerPacketType, PacketType};
 use crate::net::onion::OnionCircuit;
+use crate::net::guard::{GuardCandidate, GuardSet, GUARD_SAMPLE_SIZE};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 
 
@@ -29,11 +31,59 @@ impl RelayClient {
     }
 
     /// 入口リレーに接続
+    ///
+    /// 入口の選択は本来 [`connect_guard`] に任せること。
+    /// 毎回ランダムな入口へ繋ぐと、攻撃者のリレー占有率 f に対して
+    /// 「生涯に一度でも敵の入口を引く」確率が 1 に収束する。
     pub async fn connect_entry(&mut self, addr: SocketAddr) -> Result<()> {
         // サーバー名は証明書検証をスキップしているので何でも良いが、将来的に重要
         let conn = self.quic_client.connect(addr, "aether-relay").await?;
         self.entry_connection = Some(conn);
         Ok(())
+    }
+
+    /// 永続化されたガードを入口として接続する
+    ///
+    /// `guards` は呼び出し側が [`GuardSet::load`] で復元したもの。
+    /// 標本が足りなければ `candidates` から補充し、結果を `path` へ書き戻す。
+    ///
+    /// **成否を必ず `GuardSet` に記録して永続化すること。**
+    /// 記録しないと起動のたびに実質再抽選となり、ガード方式が無意味になる。
+    pub async fn connect_guard(
+        &mut self,
+        guards: &mut GuardSet,
+        candidates: &[GuardCandidate],
+        path: &Path,
+    ) -> Result<SocketAddr> {
+        let now = crate::protocol::hint::current_timestamp();
+        guards.replenish(candidates, now);
+
+        let mut last_err = None;
+
+        // 標本を順に試す。1本目が落ちていても、すぐ再抽選はしない
+        for _ in 0..GUARD_SAMPLE_SIZE {
+            let Some(guard) = guards.current(now) else {
+                break;
+            };
+            let (node_id, addr) = (guard.node_id, guard.addr);
+
+            match self.connect_entry(addr).await {
+                Ok(()) => {
+                    guards.record_success(&node_id);
+                    guards.save(path)?;
+                    return Ok(addr);
+                }
+                Err(e) => {
+                    guards.record_failure(&node_id);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        guards.save(path)?;
+        Err(last_err.unwrap_or_else(|| {
+            AetherError::Config("No usable guard available".into())
+        }))
     }
 
     /// 回路を手動で設定（テスト用・デバッグ用）
@@ -70,17 +120,60 @@ impl RelayClient {
         Ok(())
     }
 
-    /// Onion Packet を送信 (Uni-directional Stream)
-    /// メッセージは Onion ルーティングされて final_dest に届く
-    pub async fn send_onion_message(&self, message: &[u8], final_dest: SocketAddr) -> Result<()> {
+    /// Mailbox へ本体を送る (Onion 経由)
+    ///
+    /// **出口リレーは `mailbox` へ転送するだけで、自分では保存しない。**
+    /// 出口と Mailbox が同一だと、Mailbox の位置が `H(mailbox_key ‖ K)` で
+    /// 決定論的に決まる以上、攻撃者は Sybil 配置で狙ったコンテンツの
+    /// 出口リレーになれてしまう（確率 f ではなく確定）。
+    pub async fn send_onion_message(&self, message: &[u8], mailbox: SocketAddr) -> Result<()> {
+        let inner = wire::build_mailbox_forward(mailbox, message)?;
+        self.send_onion_raw(&inner).await
+    }
+
+    /// 任意の PacketType を出口リレー経由で `dest` へ届ける
+    ///
+    /// 出口リレーは中身を解釈せず、そのまま `dest` へ転送する。
+    /// MailboxGet のように「Mailbox に届けたいが送信元を隠したい」要求に使う。
+    pub async fn send_onion_message_typed(
+        &self,
+        packet_type: PacketType,
+        message: &[u8],
+        dest: SocketAddr,
+    ) -> Result<()> {
+        // MailboxForward は MailboxPut を前提とするため、
+        // 他の種別は種別バイトを前置してから転送させる
+        let mut body = Vec::with_capacity(1 + message.len());
+        body.push(packet_type as u8);
+        body.extend_from_slice(message);
+
+        let inner = wire::build_typed_forward(dest, &body)?;
+        self.send_onion_raw(&inner).await
+    }
+
+    /// 種別を指定して Onion Packet を送信する
+    ///
+    /// 出口リレーは `inner_type` を見て転送先モジュールを決める。
+    pub async fn send_onion_inner(
+        &self,
+        inner_type: InnerPacketType,
+        message: &[u8],
+    ) -> Result<()> {
+        self.send_onion_raw(&wire::build_inner_packet(inner_type, message)).await
+    }
+
+    /// 組み立て済みの inner packet を Onion で包んで送る
+    async fn send_onion_raw(&self, inner: &[u8]) -> Result<()> {
         let circuit = self.circuit.as_ref()
             .ok_or(AetherError::Config("No circuit established".into()))?;
 
-        // Onion Packet 作成 (Wrap)
-        let packet = circuit.wrap_packet(message, final_dest)?;
-
-        // Raw Packet送信
+        let packet = circuit.wrap_packet(inner)?;
         self.send_raw_packet(PacketType::OnionPacket, &packet).await
+    }
+
+    /// Onion 回路が確立済みか
+    pub fn has_circuit(&self) -> bool {
+        self.circuit.is_some()
     }
 
     /// Entryへのコネクションを取得（テスト等で直接操作したい場合用）
