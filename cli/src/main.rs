@@ -71,21 +71,33 @@ enum Commands {
         /// 自分宛ての Hint を手元で拾って本文を表示する。
         #[arg(long = "contact")]
         contacts: Vec<String>,
-    },
-    /// メッセージを送る
-    ///
-    /// **共有秘密は事前共有が前提。** X3DH（鍵合意）は未実装なので、
-    /// 相手と別経路で取り決めた値を `--secret` で渡す。
-    Send {
-        /// 宛先の Node ID (hex 64文字)
-        #[arg(long)]
-        to: String,
 
-        /// 事前共有秘密 (hex 64文字)
+        /// 購読する公開キーワード（複数指定可）
+        ///
+        /// キーワードを知る全員が同じ鍵に到達する（公開モード / 19.3.1）。
+        /// 指定すると、そのキーワードで公開された投稿を拾って表示する。
+        #[arg(long = "subscribe")]
+        subscribe: Vec<String>,
+    },
+    /// メッセージを送る（私信 or 公開）
+    ///
+    /// 私信は `--to`＋`--secret`（事前共有）、公開は `--keyword`。
+    Send {
+        /// 宛先の Node ID (hex 64文字)。私信のとき指定
+        #[arg(long, requires = "secret")]
+        to: Option<String>,
+
+        /// 事前共有秘密 (hex 64文字)。私信のとき指定
         ///
         /// 相手と同じ値を使うこと。異なると相手は Hint を復号できない。
         #[arg(long)]
-        secret: String,
+        secret: Option<String>,
+
+        /// 公開キーワード。指定すると公開モードで投稿する
+        ///
+        /// キーワードを知る全員が受け取れる（`--to`/`--secret` とは排他）。
+        #[arg(long, conflicts_with_all = ["to", "secret"])]
+        keyword: Option<String>,
 
         /// 本文
         #[arg(long)]
@@ -127,6 +139,15 @@ fn parse_hex32(s: &str, what: &str) -> Result<[u8; 32], Box<dyn Error>> {
     bytes
         .try_into()
         .map_err(|_| format!("{} は 32 バイト (hex 64文字) である必要があります", what).into())
+}
+
+/// 公開鍵から contacts マップ用の合成 NodeId を作る
+///
+/// 公開モードには特定の宛先が無い。K_pub をローカルの contacts マップに
+/// 収めるための安定した鍵として、鍵のハッシュを NodeId 代わりに使う。
+/// （送信側・受信側で一致する必要はない。各自のマップの鍵にすぎない）
+fn keyword_target(k_pub: &[u8; 32]) -> aether_core::crypto::identity::NodeId {
+    aether_core::crypto::identity::NodeId(aether_core::crypto::keyword::subscription_id(k_pub))
 }
 
 fn identity_path(data_dir: &Path) -> PathBuf {
@@ -195,6 +216,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Commands::Send {
             to,
             secret,
+            keyword,
             message,
             connect,
             port,
@@ -202,6 +224,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         } => {
             use aether_core::crypto::identity::NodeId;
             use aether_core::crypto::key_exchange::EphemeralKey;
+            use aether_core::crypto::keyword as kw;
             use aether_core::mailbox::schrodinger::SchrodingerMailbox;
             use aether_core::net::gossip::GossipClient;
             use aether_core::net::onion::OnionCircuit;
@@ -209,8 +232,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             use std::collections::HashMap;
             use std::sync::Mutex;
 
-            let target = NodeId(parse_hex32(to, "--to")?);
-            let shared_secret = parse_hex32(secret, "--secret")?;
+            // 宛先と鍵を決める：私信(--to/--secret) か 公開(--keyword)
+            let (target, shared_secret): (NodeId, [u8; 32]) = match (to, secret, keyword) {
+                (Some(to), Some(secret), None) => {
+                    (NodeId(parse_hex32(to, "--to")?), parse_hex32(secret, "--secret")?)
+                }
+                (None, None, Some(keyword)) => {
+                    let k_pub = kw::derive_public_key(keyword)?;
+                    println!("公開モード: キーワード「{}」で投稿します", keyword.trim());
+                    (keyword_target(&k_pub), k_pub)
+                }
+                _ => {
+                    return Err(
+                        "私信は --to と --secret、公開は --keyword を指定してください".into(),
+                    )
+                }
+            };
 
             let identity = load_identity(&cli.data_dir)?;
             let config = Config {
@@ -259,27 +296,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let directory = node.directory();
             let hops = {
                 let dir = directory.read().await;
-                dir.random_path(1, &[node.descriptor.node_id])
+                dir.random_path(2, &[node.descriptor.node_id])
             };
 
-            let hop = hops
+            let body_hop = hops
                 .first()
                 .ok_or("到達可能なリレーが見つかりません")?
                 .clone();
 
+            // **本体 PUT と Hint 放流は別の出口を通す（回路分離 / 19.2.4）。**
+            // 同じ出口だと、その出口を取られた時点で「本体を置いた者と
+            // Hint を流した者は同一」が確定し、時間分離の意味が相殺される。
+            let hint_hop = match hops.get(1) {
+                Some(h) => h.clone(),
+                None => {
+                    eprintln!(
+                        "警告: リレーが1台しかないため本体と Hint が同じ出口を通ります（相関リスク）"
+                    );
+                    body_hop.clone()
+                }
+            };
+
             let mut body_client = RelayClient::new()?;
-            body_client.connect_entry(hop.addr).await?;
-            let mut circuit = OnionCircuit::new(1);
-            circuit.add_hop(hop.addr, hop.x25519_pub, EphemeralKey::generate())?;
-            body_client.set_circuit(circuit);
+            body_client.connect_entry(body_hop.addr).await?;
+            let mut body_circuit = OnionCircuit::new(1);
+            body_circuit.add_hop(body_hop.addr, body_hop.x25519_pub, EphemeralKey::generate())?;
+            body_client.set_circuit(body_circuit);
 
             let mut hint_client = RelayClient::new()?;
-            hint_client.connect_entry(hop.addr).await?;
+            hint_client.connect_entry(hint_hop.addr).await?;
             let mut hint_circuit = OnionCircuit::new(1);
-            hint_circuit.add_hop(hop.addr, hop.x25519_pub, EphemeralKey::generate())?;
+            hint_circuit.add_hop(hint_hop.addr, hint_hop.x25519_pub, EphemeralKey::generate())?;
             hint_client.set_circuit(hint_circuit);
 
-            println!("出口リレー: {}", hop.addr);
+            println!("本体の出口: {} ／ Hint の出口: {}", body_hop.addr, hint_hop.addr);
 
             let contacts = Arc::new(Mutex::new(HashMap::new()));
             contacts.lock().unwrap().insert(target, shared_secret);
@@ -289,7 +339,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 Arc::new(GossipClient::new(hint_client)),
                 contacts,
                 node.directory(),
-            );
+            )
+            // 放流網が要求する PoW を Hint に解かせる（受信側の検証と一致させる）
+            .with_pow_difficulty(config.pow_difficulty as u32);
 
             // --- 本体を配置 ---
             let (hint, mailbox_key, profile) =
@@ -339,11 +391,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
             allow_port_mapping,
             pow_difficulty,
             contacts,
+            subscribe,
         } => {
-            let contacts: Vec<_> = contacts
+            let mut contacts: Vec<_> = contacts
                 .iter()
                 .map(|c| parse_contact(c))
                 .collect::<Result<_, _>>()?;
+
+            // 公開キーワードの購読も同じ contacts マップに載せる（K_pub を秘密として扱う）
+            for keyword in subscribe {
+                let k_pub = aether_core::crypto::keyword::derive_public_key(keyword)?;
+                println!("公開キーワード「{}」を購読します", keyword.trim());
+                contacts.push((keyword_target(&k_pub), k_pub));
+            }
 
             let identity = load_identity(&cli.data_dir)?;
             println!("Node ID: {}", identity.public_id());

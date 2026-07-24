@@ -11,3 +11,5 @@ debug
 *.json
 .vscode/
 .idea/
+.docs/
+.sim/

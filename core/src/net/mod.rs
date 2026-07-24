@@ -4,6 +4,7 @@ pub mod onion;
 pub mod relay;
 pub mod gossip;
 pub mod gossip_server;
+pub mod hint_log;
 pub mod seen_cache;
 pub mod hint_batcher;
 pub mod guard;

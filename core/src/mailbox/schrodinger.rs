@@ -44,6 +44,11 @@ pub struct SchrodingerMailbox {
     directory: Arc<RwLock<RelayDirectory>>,
     /// 返信受信用の Inbound Tunnel
     inbound_tunnels: Arc<Mutex<Vec<InboundTunnel>>>,
+    /// 生成する Hint に課す PoW 難易度（19.2.1）
+    ///
+    /// 既定 0（テスト・私信の即時性優先）。実運用では
+    /// [`with_pow_difficulty`](Self::with_pow_difficulty) で網の値を入れる。
+    hint_pow_difficulty: u32,
 }
 
 impl SchrodingerMailbox {
@@ -67,7 +72,14 @@ impl SchrodingerMailbox {
             contacts,
             directory,
             inbound_tunnels: Arc::new(Mutex::new(Vec::new())),
+            hint_pow_difficulty: 0,
         }
+    }
+
+    /// 生成 Hint の PoW 難易度を設定する（放流網の要求値に合わせる）
+    pub fn with_pow_difficulty(mut self, difficulty: u32) -> Self {
+        self.hint_pow_difficulty = difficulty;
+        self
     }
 
     /// mailbox_key の担当リレーをローカル計算で決める
@@ -134,39 +146,49 @@ impl SchrodingerMailbox {
         payload.extend_from_slice(&msg_nonce);
         payload.extend_from_slice(&encrypted_message);
 
-        // 4. Hint 生成
+        // 4. Hint 生成（この nonce = mailbox_key の素）
+        let hint_packet = self.build_hint(&shared_secret, &nonce)?;
+
+        Ok((payload, hint_packet))
+    }
+
+    /// 既存の nonce（= mailbox_key の素）に対して Hint を1つ組み立てる
+    ///
+    /// timestamp を毎回**現在時刻**で入れるので、同じコンテンツに対して
+    /// 呼ぶたびに別の（新しい）Hint になる。これが再放流 (18.3-A) の核 ──
+    /// 保持者が nonce を知っていれば、鮮度を保った Hint を作り直せる。
+    fn build_hint(&self, shared_secret: &SharedSecret, nonce: &[u8; 32]) -> Result<HintPacket> {
         // Hint Payload: Nonce(32) || MsgID || Timestamp
         //
-        // timestamp は受信側の時刻ドリフト検査（リプレイ対策）に使われる。
-        // 固定値を入れると検査が無意味になるため、必ず実時刻を入れること。
+        // timestamp は受信側の鮮度検査に使う。必ず実時刻を入れること。
         let hint_payload = HintPayload {
-            nonce, // Mailbox Keyを決めるための32byte Nonce
+            nonce: *nonce,
             message_id: rand::random::<u64>(),
             timestamp: hint::current_timestamp(),
         };
         let hint_payload_bytes = bincode::serialize(&hint_payload)
             .map_err(|e| AetherError::Config(e.to_string()))?;
 
-        // Hint暗号化
-        let hint_key = self.derive_key(&shared_secret, b"aether_hint_v1");
-        // HintPacket用のNonce(12)を生成
+        let hint_key = self.derive_key(shared_secret, b"aether_hint_v1");
         let (hint_ciphertext, hint_encrypt_nonce) = cipher::encrypt(&hint_key, &hint_payload_bytes)?;
 
-        // Blind Tag 計算
-        let mut mac = HmacSha256::new_from_slice(&shared_secret)
+        // Blind Tag = HMAC(K, hint_nonce)[0..4]
+        let mut mac = HmacSha256::new_from_slice(shared_secret)
             .map_err(|_| AetherError::Crypto("HMAC init failed".into()))?;
         mac.update(&hint_encrypt_nonce);
         let mac_result = mac.finalize().into_bytes();
         let blind_tag: [u8; 4] = mac_result[0..4].try_into().unwrap();
 
-        let hint_packet = HintPacket::new(
+        let mut hint_packet = HintPacket::new(
             blind_tag,
             hint_encrypt_nonce,
             hint_ciphertext,
             gossip_server::DEFAULT_HINT_TTL,
         );
 
-        Ok((payload, hint_packet))
+        // 放流網が要求する PoW を解いておく（難易度 0 なら即座）。
+        hint_packet.seal_pow(self.hint_pow_difficulty)?;
+        Ok(hint_packet)
     }
 
     /// メッセージを送信
@@ -315,9 +337,10 @@ impl SchrodingerMailbox {
             if let Ok(payload_bytes) = cipher::decrypt(&hint_key, &hint.nonce, &hint.ciphertext)
                 && let Ok(payload) = bincode::deserialize::<HintPayload>(&payload_bytes)
             {
-                // 時刻ドリフト検査（リプレイ対策）。
-                // SeenCache の TTL を超えて過去のパケットを再投入する攻撃を弾く。
-                if !payload.is_fresh(now) {
+                // 受信者の取得判断は backlog 窓(24h)で見る。
+                // オフライン明けに拾った古い Hint も、本体がまだ生きていれば取りに行く
+                // (19.1.3)。それより古ければ本体も消えているので捨てる。
+                if !payload.is_fresh_within(now, crate::net::hint_log::RETENTION_WINDOW_SECS) {
                     continue;
                 }
 

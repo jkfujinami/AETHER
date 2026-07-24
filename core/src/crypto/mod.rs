@@ -1,6 +1,7 @@
 pub mod identity;
 pub mod cipher;
 pub mod key_exchange;
+pub mod keyword;
 pub mod pow;
 
 // 将来的にKyber (PQC) や Ratchet もここに追加

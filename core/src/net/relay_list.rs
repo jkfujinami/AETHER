@@ -152,6 +152,22 @@ impl RelayDirectory {
         self.k_nearest_reachable(ring::position_of_mailbox(mailbox_key, key), k)
     }
 
+    /// Hint backlog の担当ノードを決める (19.1.3)
+    ///
+    /// **全ノードから選ぶ**（到達性で絞らない）。担当割り当ては決定論的で、
+    /// 自ノードが含まれるかの判定にも使うため。Reversed 相手も Connection
+    /// Reversal で reconcile できるので保持者になれる。
+    pub fn hint_holders(&self, hint_id: &[u8; 32], k: usize) -> Vec<RelayDescriptor> {
+        self.k_nearest(ring::position_of_hint(hint_id, &self.epoch_seed), k)
+    }
+
+    /// 自ノードが `hint_id` の担当（K 最近接）かどうか
+    pub fn is_hint_holder(&self, hint_id: &[u8; 32], me: &NodeId, k: usize) -> bool {
+        self.hint_holders(hint_id, k)
+            .iter()
+            .any(|d| &d.node_id == me)
+    }
+
     /// シャードの担当リレーを決める (18.5.4)
     pub fn shard_targets(
         &self,

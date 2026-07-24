@@ -20,6 +20,11 @@ pub enum PacketType {
     GossipHint = 0x10,
     /// 複数 Hint を1パケットにまとめたもの (bincode Vec<HintPacket>)
     GossipHintBatch = 0x11,
+    /// 分散 Hint backlog の差分同期要求。自分が持つ id 集合 (bincode HintDigest)
+    HintDigest = 0x12,
+    /// 上記への応答。相手が欠けている Hint 群 (bincode Vec<HintPacket>)。
+    /// **live gossip とは違い再拡散しない** ── 追いつき用の一方向配送。
+    HintBacklog = 0x13,
 
     // Mailbox
     MailboxPut = 0x20,
@@ -213,6 +218,8 @@ pub async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Packet
         0x01 => PacketType::OnionPacket,
         0x10 => PacketType::GossipHint,
         0x11 => PacketType::GossipHintBatch,
+        0x12 => PacketType::HintDigest,
+        0x13 => PacketType::HintBacklog,
         0x20 => PacketType::MailboxPut,
         0x21 => PacketType::MailboxGet,
         0x22 => PacketType::MailboxResponse,

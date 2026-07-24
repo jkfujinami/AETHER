@@ -12,8 +12,9 @@ use std::time::Instant;
 
 /// Hint パケットの許容サイズ上限（バイト）
 ///
-/// 現状 90 バイト。ここを超える変更は、全ノードの常時帯域に直接効く。
-const HINT_SIZE_BUDGET: usize = 96;
+/// 90 バイト + PoW nonce 8 バイト（19.2.1）= 約 98 バイト。
+/// ここを超える変更は、全ノードの常時帯域に直接効く。
+const HINT_SIZE_BUDGET: usize = 104;
 
 #[test]
 fn hint_packet_stays_within_budget() {

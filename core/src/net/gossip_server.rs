@@ -38,14 +38,20 @@ pub struct GossipServer {
     /// 「これは自分宛てか」をネットワークへ問い合わせた時点で
     /// 受信者匿名性は消える。
     local: broadcast::Sender<HintPacket>,
+    /// 受信 Hint に要求する PoW 難易度（19.2.1）
+    ///
+    /// 全ノードが全 Hint を受け取る Broadcast Veil では、生成がタダだと
+    /// 安価なフラッドが網全体の帯域を焼く。これで生成にコストを課す。
+    pow_difficulty: u32,
 }
 
 impl GossipServer {
-    pub fn new(_config: &Config) -> Self {
+    pub fn new(config: &Config) -> Self {
         let (local, _) = broadcast::channel(LOCAL_HINT_BUFFER);
         Self {
             seen: Arc::new(Mutex::new(SeenCache::default())),
             local,
+            pow_difficulty: config.pow_difficulty as u32,
         }
     }
 
@@ -56,6 +62,30 @@ impl GossipServer {
     /// 取りこぼしを許す側に倒している。
     pub fn subscribe(&self) -> broadcast::Receiver<HintPacket> {
         self.local.subscribe()
+    }
+
+    /// 受信 Hint に要求する PoW 難易度（backlog 保存前の検証に使う）
+    pub fn pow_difficulty(&self) -> u32 {
+        self.pow_difficulty
+    }
+
+    /// backlog 経由で届いた Hint をローカル購読者へ配る（**再拡散しない**）
+    ///
+    /// オフライン明けの追いつき用。live gossip と違い TTL 減算も転送もせず、
+    /// 手元の受信者に見せるだけ。PoW と重複はここでも確認する
+    /// （backlog 経路にゴミや二重配送を通さない）。戻り値は「新規に配ったか」。
+    pub async fn deliver_local(&self, packet: HintPacket) -> bool {
+        if !packet.verify_pow(self.pow_difficulty) {
+            return false;
+        }
+        {
+            let mut seen = self.seen.lock().await;
+            if !seen.insert(packet.id()) {
+                return false;
+            }
+        }
+        let _ = self.local.send(packet);
+        true
     }
 
     /// Hint パケットを処理する
@@ -73,6 +103,15 @@ impl GossipServer {
 
     /// デシリアライズ済みの Hint を処理する（バッチ受信用）
     pub async fn handle_hint_packet(&self, mut packet: HintPacket) -> HintAction {
+        // PoW 検証を **seen 判定より前** に行う。
+        //
+        // 無効な Hint を SeenCache に入れてしまうと、攻撃者が偽 Hint で
+        // dedup 枠を食い潰せる。検証（1 SHA-256）を先に通した Hint だけを
+        // dedup・拡散の対象にする。
+        if !packet.verify_pow(self.pow_difficulty) {
+            return HintAction::Drop;
+        }
+
         // 重複チェック。ID は TTL を含まないため、
         // 中継で TTL が変化しても同一パケットとして認識できる
         {
@@ -148,8 +187,36 @@ mod tests {
         bincode::serialize(&p).unwrap()
     }
 
+    /// dedup / TTL ロジックを見るための、PoW 検証を無効化した（難易度0）サーバ
     fn server() -> GossipServer {
-        GossipServer::new(&Config::default())
+        GossipServer::new(&Config {
+            pow_difficulty: 0,
+            ..Config::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn unsolved_hint_is_dropped_when_pow_required() {
+        // PoW を要求する網では、未解決（pow_nonce=0）の Hint は seen に入る前に落とす
+        let s = GossipServer::new(&Config {
+            pow_difficulty: 12,
+            ..Config::default()
+        });
+
+        let unsolved = HintPacket::new([5; 4], [0u8; 12], vec![5; 48], 5);
+        assert_eq!(
+            s.handle_hint_packet(unsolved.clone()).await,
+            HintAction::Drop,
+            "PoW 未解決の Hint は拡散させない"
+        );
+
+        // 同じ Hint を解けば通る（＝落としたのは PoW 不足のためで、内容のせいではない）
+        let mut solved = unsolved;
+        solved.seal_pow(12).unwrap();
+        assert!(
+            matches!(s.handle_hint_packet(solved).await, HintAction::Relay(_)),
+            "解いた Hint は拡散される"
+        );
     }
 
     #[tokio::test]

@@ -91,6 +91,19 @@ pub fn position_of_shard(mailbox_key: &[u8; 32], key: &[u8; 32], shard_index: u8
     RingPosition::from_hash(&hasher.finalize().into())
 }
 
+/// Hint backlog の配置座標 (19.1.3)
+///
+/// `hint_id` は公開値。これを K 最近接に丸ごと複製し、24h 保持する。
+/// mailbox とは違い秘密は混ぜない ── Hint 自体が公開でブロードキャストされる以上、
+/// 位置を隠しても意味がなく、むしろ全ノードが同じ座標を計算できる必要がある。
+pub fn position_of_hint(hint_id: &[u8; 32], epoch_seed: &[u8; 32]) -> RingPosition {
+    let mut hasher = Sha256::new();
+    hasher.update(b"aether_ring_hint_v1");
+    hasher.update(hint_id);
+    hasher.update(epoch_seed);
+    RingPosition::from_hash(&hasher.finalize().into())
+}
+
 /// `target` に近い順に最大 `k` 個を返す
 ///
 /// **ネットワークへの問い合わせを一切行わない。**

@@ -17,12 +17,14 @@ const SIZE_CACHE_TTL_SECS: u64 = 30;
 
 /// 保存されるエントリ
 ///
-/// TTL 判定のために保存時刻を持つ。値だけを裸で入れると
-/// 期限切れ判定ができず、Mailbox が無制限に膨らむ。
+/// TTL 判定のために「最後に触られた時刻」を持つ。作成時とアクセス時に更新され、
+/// **参照されるほど寿命が延びる**（アクセス連動 TTL / 18.3-B）。
+/// これが無いと期限切れ判定ができず Mailbox が無制限に膨らむ。
 #[derive(Debug, Serialize, Deserialize)]
 struct MailboxEntry {
     value: Vec<u8>,
-    created_at: u64,
+    /// 作成 or 最終アクセス時刻 (UNIX秒)。TTL はここから測る。
+    refreshed_at: u64,
 }
 
 pub struct MailboxServer {
@@ -70,8 +72,13 @@ impl MailboxServer {
 
     /// Payload: [Key(32)]
     ///
-    /// シュレーディンガーMailbox の定義に従い、取得したエントリは削除する
-    /// (Burn-on-Read)。期限切れのエントリは存在しないものとして扱う。
+    /// **no-burn + アクセス連動 TTL（18.3-B / 19.1.2 解決）。**
+    /// 取得しても削除せず、代わりに寿命を延ばす。これにより:
+    /// - 公開コンテンツが「1回取得で消える／取りに行くだけで検閲される」を防ぐ
+    /// - 参照され続けるものは生き残り、放置されたものは TTL で自然消滅する
+    ///
+    /// 私信でも実害は無い（保持者は中身を読めないので、消しても得は小さい）。
+    /// 期限切れのエントリはその場で掃除して None を返す。
     pub async fn handle_get(&self, payload: &[u8]) -> Result<Option<Vec<u8>>> {
         if payload.len() < 32 {
             return Err(AetherError::Protocol("Mailbox GET payload too short".into()));
@@ -82,12 +89,19 @@ impl MailboxServer {
             return Ok(None);
         };
 
-        // 見つかった時点で削除する（期限切れでも同じ）
-        self.db.remove(key).map_err(|e| AetherError::Storage(e.to_string()))?;
-
         let entry = Self::decode_entry(&raw)?;
-        if self.is_expired(&entry, current_timestamp()) {
+        let now = current_timestamp();
+
+        if self.is_expired(&entry, now) {
+            // 死んでいるエントリは読んだついでに掃除する（no-burn は生きた値だけ）
+            let _ = self.db.remove(key);
             return Ok(None);
+        }
+
+        // アクセスで寿命を延ばす。ただし毎読み込みで書き戻すと書き込み増幅になるため、
+        // TTL の半分を過ぎた時だけ触り直す（読み頻度に依らず書き込みは TTL/2 に1回）。
+        if now.saturating_sub(entry.refreshed_at) >= self.ttl_seconds / 2 {
+            self.insert_entry(key, &entry.value)?;
         }
 
         Ok(Some(entry.value))
@@ -186,7 +200,7 @@ impl MailboxServer {
     fn insert_entry(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let entry = MailboxEntry {
             value: value.to_vec(),
-            created_at: current_timestamp(),
+            refreshed_at: current_timestamp(),
         };
         let encoded = bincode::serialize(&entry)
             .map_err(|e| AetherError::Serialization(e.to_string()))?;
@@ -201,7 +215,7 @@ impl MailboxServer {
     }
 
     fn is_expired(&self, entry: &MailboxEntry, now: u64) -> bool {
-        now.saturating_sub(entry.created_at) > self.ttl_seconds
+        now.saturating_sub(entry.refreshed_at) > self.ttl_seconds
     }
 
     /// 容量上限を超えていたら GC を試み、それでも超えていれば拒否する
@@ -260,12 +274,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_then_get_burns_the_entry() {
+    async fn get_does_not_burn_the_entry() {
+        // no-burn（18.3-B）：取得しても消えず、何度でも読める。
+        // 公開コンテンツの「1回取得で消える／取りに行くだけで検閲」を防ぐ核。
         let (s, _dir) = server_with(1);
-        s.handle_put(&put_payload(1, b"secret")).await.unwrap();
+        s.handle_put(&put_payload(1, b"public")).await.unwrap();
 
-        assert_eq!(s.handle_get(&[1u8; 32]).await.unwrap().as_deref(), Some(&b"secret"[..]));
-        assert_eq!(s.handle_get(&[1u8; 32]).await.unwrap(), None, "Burn-on-Read で消える");
+        assert_eq!(s.handle_get(&[1u8; 32]).await.unwrap().as_deref(), Some(&b"public"[..]));
+        assert_eq!(
+            s.handle_get(&[1u8; 32]).await.unwrap().as_deref(),
+            Some(&b"public"[..]),
+            "no-burn: 2回目も同じ値が読める"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_extends_the_ttl() {
+        // アクセス連動 TTL：期限ぎりぎりのエントリを読むと寿命が延びる。
+        let (s, _dir) = server_with(24);
+
+        // 作成から 20 時間経過（TTL 24h、半分=12h を超えているのでアクセスで touch される）
+        let stale = MailboxEntry {
+            value: b"popular".to_vec(),
+            refreshed_at: current_timestamp() - 20 * 3600,
+        };
+        s.db.insert([9u8; 32], bincode::serialize(&stale).unwrap()).unwrap();
+
+        // 読む → まだ生きているので値が返り、refreshed_at が現在時刻に更新される
+        assert_eq!(
+            s.handle_get(&[9u8; 32]).await.unwrap().as_deref(),
+            Some(&b"popular"[..])
+        );
+
+        // 更新後は「経過 0 時間」扱いなので、cleanup をかけても消えない
+        assert_eq!(s.cleanup_expired().unwrap(), 0, "アクセスで延命されたので消えない");
+        assert_eq!(s.len(), 1);
     }
 
     #[tokio::test]
@@ -282,8 +325,8 @@ mod tests {
     async fn expired_entry_is_not_returned() {
         let (s, _dir) = server_with(0);
 
-        // created_at を過去にずらして期限切れを再現
-        let entry = MailboxEntry { value: b"old".to_vec(), created_at: current_timestamp() - 10 };
+        // refreshed_at を過去にずらして期限切れを再現
+        let entry = MailboxEntry { value: b"old".to_vec(), refreshed_at: current_timestamp() - 10 };
         s.db.insert([3u8; 32], bincode::serialize(&entry).unwrap()).unwrap();
 
         assert_eq!(s.handle_get(&[3u8; 32]).await.unwrap(), None);
@@ -293,8 +336,8 @@ mod tests {
     async fn cleanup_removes_only_expired() {
         let (s, _dir) = server_with(0);
 
-        let fresh = MailboxEntry { value: b"fresh".to_vec(), created_at: current_timestamp() };
-        let stale = MailboxEntry { value: b"stale".to_vec(), created_at: current_timestamp() - 10 };
+        let fresh = MailboxEntry { value: b"fresh".to_vec(), refreshed_at: current_timestamp() };
+        let stale = MailboxEntry { value: b"stale".to_vec(), refreshed_at: current_timestamp() - 10 };
         s.db.insert([4u8; 32], bincode::serialize(&fresh).unwrap()).unwrap();
         s.db.insert([5u8; 32], bincode::serialize(&stale).unwrap()).unwrap();
 

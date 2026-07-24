@@ -56,6 +56,8 @@ where
 pub fn test_config() -> Config {
     Config {
         node_id_pow_difficulty: 0,
+        // Hint PoW もテストでは無効化（生成・検証の一致を保ちつつ即座に回す）
+        pow_difficulty: 0,
         ..Default::default()
     }
 }

@@ -3,8 +3,10 @@ use crate::net::quic::QuicServer;
 use crate::protocol::wire::{self, PacketType};
 use crate::node::router::{Router, RoutingAction};
 use crate::mailbox::server::MailboxServer;
-use crate::net::gossip_server::{GossipServer, HintAction};
+use crate::net::gossip_server::{self, GossipServer, HintAction};
 use crate::net::hint_batcher::{self, HintBatcher};
+use crate::net::hint_log::{HintDigest, HintLog};
+use crate::protocol::hint::current_timestamp;
 use crate::net::pex::{self, PexRequest, PexResponse};
 use crate::net::relay_list::{RelayDescriptor, RelayDirectory};
 use crate::net::reachability::{self, Reachability, Tier};
@@ -16,7 +18,7 @@ use crate::protocol::hint::HintPacket;
 use crate::net::tunnel::TunnelRelay;
 use crate::node::peer::PeerManager;
 use crate::crypto::identity::Identity;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tracing::{info, error, debug};
 use crate::Config;
@@ -26,6 +28,12 @@ use std::time::Duration;
 
 /// 1つの Hint を何ピアへ拡散するか
 const GOSSIP_FANOUT: usize = 3;
+
+/// Hint backlog の複製数（19.1.3）。本体シャードの K と揃える
+const HINT_REPLICAS: usize = 5;
+
+/// Hint backlog の差分同期間隔
+const HINT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// 期限切れデータの掃除間隔
 const GC_INTERVAL: Duration = Duration::from_secs(300);
@@ -67,6 +75,8 @@ pub struct NodeServer {
     filter_check_pending: Arc<AtomicBool>,
     /// フィルタ判定の結果
     filtering: Arc<RwLock<NatFiltering>>,
+    /// 分散 Hint backlog（19.1.3・オフライン受信）
+    hint_log: Arc<Mutex<HintLog>>,
 }
 
 
@@ -90,6 +100,8 @@ pub struct PacketContext {
     /// 申告値ではないので、フィルタ判定のプローブ先に使っても
     /// 第三者へ撃たせる踏み台にならない。
     pub remote_addr: Option<SocketAddr>,
+    /// 分散 Hint backlog（19.1.3）
+    pub hint_log: Arc<Mutex<HintLog>>,
 }
 
 impl NodeServer {
@@ -171,6 +183,7 @@ impl NodeServer {
             directory,
             filter_check_pending: Arc::new(AtomicBool::new(false)),
             filtering: Arc::new(RwLock::new(NatFiltering::Unknown)),
+            hint_log: Arc::new(Mutex::new(HintLog::default())),
         })
     }
 
@@ -275,6 +288,7 @@ impl NodeServer {
         self.spawn_batch_flusher();
         self.spawn_pex();
         self.spawn_side_channel();
+        self.spawn_hint_reconcile();
 
         // **自分がダイヤルした接続も受信を回す。**
         // Connection Reversal では相手がこの接続の上で押し返してくるので、
@@ -293,6 +307,7 @@ impl NodeServer {
                 socket: self.server.shared_socket(),
                 local_addr,
                 remote_addr: None,
+                hint_log: self.hint_log.clone(),
             };
 
             tokio::spawn(async move {
@@ -317,6 +332,7 @@ impl NodeServer {
             socket: self.server.shared_socket(),
             local_addr,
             remote_addr: None,
+            hint_log: self.hint_log.clone(),
         };
 
         while let Some(conn) = self.server.accept().await {
@@ -439,6 +455,37 @@ impl NodeServer {
             },
             PacketType::GossipHintBatch => {
                 Self::relay_hint_batch(&payload, &ctx).await?;
+            },
+            PacketType::HintDigest => {
+                // 差分同期の要求。相手が持つ id 集合に無い自分の Hint を返す（19.1.3）。
+                // id しか受け取らないので、どの Hint が誰宛てかは漏れない。
+                let digest = HintDigest::decode(&payload)?;
+                let response = {
+                    let log = ctx.hint_log.lock().unwrap();
+                    log.diff(&digest)
+                };
+                if let Some(dest) = ctx.remote_addr
+                    && !response.is_empty()
+                {
+                    let bytes = bincode::serialize(&response)
+                        .map_err(|e| crate::AetherError::Serialization(e.to_string()))?;
+                    ctx.router
+                        .send_packet(dest, PacketType::HintBacklog, &bytes)
+                        .await?;
+                }
+            },
+            PacketType::HintBacklog => {
+                // 追いつき応答。**再拡散しない** ── 手元へ配って、担当なら保存するだけ。
+                let packets: Vec<HintPacket> = bincode::deserialize(&payload)
+                    .map_err(|e| crate::AetherError::Protocol(format!("Invalid HintBacklog: {}", e)))?;
+                if packets.len() > gossip_server::MAX_HINTS_PER_BATCH {
+                    debug!("Oversized HintBacklog discarded: {}", packets.len());
+                    return Ok(());
+                }
+                for packet in packets {
+                    Self::persist_if_responsible(&ctx, &packet).await;
+                    ctx.gossip.deliver_local(packet).await;
+                }
             },
             PacketType::PexRequest => {
                 let request = PexRequest::decode(&payload)?;
@@ -683,28 +730,69 @@ impl NodeServer {
 
     /// 単発の Hint を処理して拡散キューに積む
     async fn relay_hint(hint_bytes: &[u8], ctx: &PacketContext) -> Result<()> {
-        match ctx.gossip.handle_hint(hint_bytes).await {
-            Ok(HintAction::Relay(packet)) => Self::enqueue_for_relay(vec![packet], ctx).await,
-            Ok(HintAction::Drop) => debug!("Hint dropped (duplicate or TTL exhausted)"),
-            // 壊れた Hint は落とすだけ。接続は切らない
-            Err(e) => debug!("Invalid Hint discarded: {}", e),
+        let packet: HintPacket = match bincode::deserialize(hint_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("Invalid Hint discarded: {}", e);
+                return Ok(());
+            }
+        };
+
+        // 自分が担当なら backlog に保存する（拡散/TTL とは独立、19.1.3）
+        Self::persist_if_responsible(ctx, &packet).await;
+
+        match ctx.gossip.handle_hint_packet(packet).await {
+            HintAction::Relay(p) => Self::enqueue_for_relay(vec![p], ctx).await,
+            HintAction::Drop => debug!("Hint dropped (duplicate / TTL / PoW)"),
         }
         Ok(())
     }
 
     /// バッチで届いた Hint 群を処理して拡散キューに積む
     async fn relay_hint_batch(payload: &[u8], ctx: &PacketContext) -> Result<()> {
-        match ctx.gossip.handle_hint_batch(payload).await {
-            Ok(packets) if packets.is_empty() => {
-                debug!("Hint batch fully deduplicated");
+        let packets: Vec<HintPacket> = match bincode::deserialize(payload) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("Invalid Hint batch discarded: {}", e);
+                return Ok(());
             }
-            Ok(packets) => {
-                debug!("Relaying {} of the batched Hints", packets.len());
-                Self::enqueue_for_relay(packets, ctx).await;
+        };
+        if packets.len() > gossip_server::MAX_HINTS_PER_BATCH {
+            debug!("Oversized Hint batch discarded: {}", packets.len());
+            return Ok(());
+        }
+
+        let mut relay = Vec::new();
+        for packet in packets {
+            Self::persist_if_responsible(ctx, &packet).await;
+            if let HintAction::Relay(p) = ctx.gossip.handle_hint_packet(packet).await {
+                relay.push(p);
             }
-            Err(e) => debug!("Invalid Hint batch discarded: {}", e),
+        }
+        if !relay.is_empty() {
+            debug!("Relaying {} of the batched Hints", relay.len());
+            Self::enqueue_for_relay(relay, ctx).await;
         }
         Ok(())
+    }
+
+    /// 自ノードが担当（`H(hint_id)` の K 最近接）なら Hint を backlog に保存する
+    ///
+    /// PoW を確認してから入れる（backlog にゴミを溜めさせない）。
+    /// 拡散するか・TTL が尽きたかとは無関係に、担当なら必ず持つ。
+    async fn persist_if_responsible(ctx: &PacketContext, packet: &HintPacket) {
+        if !packet.verify_pow(ctx.gossip.pow_difficulty()) {
+            return;
+        }
+        let responsible = {
+            let dir = ctx.directory.read().await;
+            dir.is_hint_holder(&packet.id(), &ctx.descriptor.node_id, HINT_REPLICAS)
+        };
+        if responsible
+            && let Ok(mut log) = ctx.hint_log.lock()
+        {
+            log.insert(packet.clone());
+        }
     }
 
     /// 拡散対象の Hint をピアごとの送信キューに積む
@@ -956,6 +1044,7 @@ impl NodeServer {
     fn spawn_gc(&self) {
         let mailbox = self.mailbox.clone();
         let gossip = self.gossip.clone();
+        let hint_log = self.hint_log.clone();
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(GC_INTERVAL);
@@ -972,6 +1061,65 @@ impl NodeServer {
                 }
 
                 gossip.cleanup().await;
+
+                // backlog の窓外エントリも掃除する
+                if let Ok(mut log) = hint_log.lock() {
+                    log.prune(current_timestamp());
+                }
+            }
+        });
+    }
+
+    /// Hint backlog の差分同期（19.1.3・オフライン受信）
+    ///
+    /// 定期的に隣（ディレクトリの一人）へ自分の digest を送り、
+    /// 取りこぼした Hint を引く。復帰したノードはこれで窓ぶんを埋める。
+    /// backlog 応答は再拡散されないので、これ自体が増幅にはならない。
+    fn spawn_hint_reconcile(&self) {
+        let directory = self.directory.clone();
+        let hint_log = self.hint_log.clone();
+        let router = self.router.clone();
+        let me = self.descriptor.node_id;
+
+        tokio::spawn(async move {
+            // 起動直後の追いつきを速めるため、最初だけ短く待つ
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            loop {
+                // 窓外を掃除してから digest を作る
+                let digest = {
+                    let mut log = hint_log.lock().unwrap();
+                    log.prune(current_timestamp());
+                    log.digest()
+                };
+
+                // 自分以外のノードを1つ選ぶ
+                let peer_addr = {
+                    let dir = directory.read().await;
+                    let mut addrs: Vec<SocketAddr> = dir
+                        .all()
+                        .into_iter()
+                        .filter(|d| d.node_id != me)
+                        .map(|d| d.addr)
+                        .collect();
+                    if addrs.is_empty() {
+                        None
+                    } else {
+                        use rand::seq::SliceRandom;
+                        addrs.shuffle(&mut rand::thread_rng());
+                        addrs.into_iter().next()
+                    }
+                };
+
+                if let Some(addr) = peer_addr
+                    && let Ok(bytes) = digest.encode()
+                {
+                    let _ = router
+                        .send_packet(addr, PacketType::HintDigest, &bytes)
+                        .await;
+                }
+
+                tokio::time::sleep(HINT_RECONCILE_INTERVAL).await;
             }
         });
     }
@@ -979,6 +1127,26 @@ impl NodeServer {
     /// 登録済みトンネル数（テスト・診断用）
     pub async fn tunnel_count(&self) -> usize {
         self.tunnel_relay.read().await.len()
+    }
+
+    /// backlog に保持している Hint 数（テスト・診断用）
+    pub fn backlog_len(&self) -> usize {
+        self.hint_log.lock().unwrap().len()
+    }
+
+    /// 指定ピアと backlog を差分同期する（自分の digest を送って引く）
+    ///
+    /// 通常は [`spawn_hint_reconcile`](Self::spawn_hint_reconcile) が定期実行する。
+    /// 復帰直後に明示的に回したい場合のために公開している。
+    pub async fn reconcile_backlog_with(&self, peer: SocketAddr) -> Result<()> {
+        let digest = {
+            let mut log = self.hint_log.lock().unwrap();
+            log.prune(current_timestamp());
+            log.digest()
+        };
+        self.router
+            .send_packet(peer, PacketType::HintDigest, &digest.encode()?)
+            .await
     }
 
     // Test accessors
