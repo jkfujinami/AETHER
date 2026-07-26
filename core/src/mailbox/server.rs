@@ -1,5 +1,6 @@
 use crate::error::{Result, AetherError};
 use crate::protocol::hint::current_timestamp;
+use crate::storage::at_rest;
 use serde::{Serialize, Deserialize};
 use sled::Db;
 use std::path::Path;
@@ -14,6 +15,10 @@ const TUNNEL_PREFIX: &[u8] = b"tunnel:";
 
 /// 索引エントリのキー接頭辞（19.7 / Phase 2-3）
 const INDEX_PREFIX: &[u8] = b"index:";
+
+/// 保存時暗号化のメタツリー・カナリア（KeyStore とは別の値 / 3-1）
+const META_TREE: &str = "aether_mailbox_meta";
+const CANARY_PLAINTEXT: &[u8] = b"aether-mailbox-canary-v1";
 
 /// 1索引につき返す記述子の上限（増幅・肥大対策。19.7）
 pub const MAX_INDEX_ENTRIES: usize = 256;
@@ -43,18 +48,48 @@ pub struct MailboxServer {
     cached_size: AtomicU64,
     /// 上記を測った時刻 (UNIX秒)
     size_checked_at: AtomicU64,
+    /// 保存時暗号化の鍵（`Some` なら値を暗号化して保存する / 押収対策・3-1）
+    cipher_key: Option<[u8; 32]>,
 }
 
 impl MailboxServer {
+    /// 平文で開く（テスト・暗号化しない場合）
     pub fn new(path: &Path, config: &Config) -> Result<Self> {
+        Self::open(path, config, None)
+    }
+
+    /// パスフレーズで**保存時暗号化**して開く（押収対策 / 3-1）
+    ///
+    /// 保持する Mailbox エントリ（送信者が既に封じたシャード・索引・トンネル本文）を
+    /// さらにローカル鍵で暗号化する。押収されてもパスフレーズ無しには読めない。
+    ///
+    /// **注意:** 既存の**平文** Mailbox をこのモードで開くと、古いエントリは復号できず
+    /// GC で掃除される。Mailbox はキャッシュ相当なので実害は小さいが、in-place 移行は非対応。
+    pub fn new_encrypted(path: &Path, config: &Config, passphrase: &str) -> Result<Self> {
         let db = sled::open(path).map_err(|e| AetherError::Storage(e.to_string()))?;
+        let key = at_rest::unlock_db(&db, passphrase, META_TREE, CANARY_PLAINTEXT)?;
+        Self::from_db(db, config, Some(key))
+    }
+
+    fn open(path: &Path, config: &Config, cipher_key: Option<[u8; 32]>) -> Result<Self> {
+        let db = sled::open(path).map_err(|e| AetherError::Storage(e.to_string()))?;
+        Self::from_db(db, config, cipher_key)
+    }
+
+    fn from_db(db: Db, config: &Config, cipher_key: Option<[u8; 32]>) -> Result<Self> {
         Ok(Self {
             db,
             ttl_seconds: config.message_ttl_hours * 3600,
             capacity_bytes: config.mailbox_capacity_mb * 1024 * 1024,
             cached_size: AtomicU64::new(0),
             size_checked_at: AtomicU64::new(0),
+            cipher_key,
         })
+    }
+
+    /// 保存時暗号化が有効か
+    pub fn is_encrypted(&self) -> bool {
+        self.cipher_key.is_some()
     }
 
     /// Payload: [Key(32)][Value(...)]
@@ -95,7 +130,7 @@ impl MailboxServer {
             return Ok(None);
         };
 
-        let entry = Self::decode_entry(&raw)?;
+        let entry = self.decode_entry(&raw)?;
         let now = current_timestamp();
 
         if self.is_expired(&entry, now) {
@@ -152,7 +187,7 @@ impl MailboxServer {
             let (k, v) = item.map_err(|e| AetherError::Storage(e.to_string()))?;
             self.db.remove(&k).map_err(|e| AetherError::Storage(e.to_string()))?;
 
-            let entry = Self::decode_entry(&v)?;
+            let entry = self.decode_entry(&v)?;
             if !self.is_expired(&entry, now) {
                 messages.push(entry.value);
             }
@@ -198,7 +233,7 @@ impl MailboxServer {
 
         for item in self.db.scan_prefix(&prefix) {
             let (k, v) = item.map_err(|e| AetherError::Storage(e.to_string()))?;
-            let Ok(entry) = Self::decode_entry(&v) else { continue };
+            let Ok(entry) = self.decode_entry(&v) else { continue };
             if self.is_expired(&entry, now) {
                 continue;
             }
@@ -226,7 +261,7 @@ impl MailboxServer {
             let (k, v) = item.map_err(|e| AetherError::Storage(e.to_string()))?;
 
             // 壊れたエントリも掃除対象にする
-            let expired = match Self::decode_entry(&v) {
+            let expired = match self.decode_entry(&v) {
                 Ok(entry) => self.is_expired(&entry, now),
                 Err(_) => true,
             };
@@ -264,12 +299,24 @@ impl MailboxServer {
         let encoded = bincode::serialize(&entry)
             .map_err(|e| AetherError::Serialization(e.to_string()))?;
 
-        self.db.insert(key, encoded).map_err(|e| AetherError::Storage(e.to_string()))?;
+        // 保存時暗号化が有効なら値ごと暗号化してから置く（押収対策 / 3-1）
+        let stored = match &self.cipher_key {
+            Some(k) => at_rest::encrypt_value(k, &encoded)?,
+            None => encoded,
+        };
+
+        self.db.insert(key, stored).map_err(|e| AetherError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    fn decode_entry(raw: &[u8]) -> Result<MailboxEntry> {
-        bincode::deserialize(raw)
+    fn decode_entry(&self, raw: &[u8]) -> Result<MailboxEntry> {
+        // 暗号化が有効なら先に復号する。正しい鍵は open 時にカナリアで検証済みなので、
+        // ここで復号に失敗するのは壊れたエントリ（＝ cleanup 対象）だけ。
+        let plain = match &self.cipher_key {
+            Some(k) => at_rest::decrypt_value(k, raw)?,
+            None => raw.to_vec(),
+        };
+        bincode::deserialize(&plain)
             .map_err(|e| AetherError::Storage(format!("Corrupt mailbox entry: {}", e)))
     }
 
@@ -411,6 +458,45 @@ mod tests {
 
         assert_eq!(s.cleanup_expired().unwrap(), 1);
         assert!(s.is_empty());
+    }
+
+    #[tokio::test]
+    async fn encrypted_mailbox_hides_values_on_disk_but_serves_them() {
+        // 保存時暗号化：ディスク上の値は暗号文だが、開けば正しく取り出せる（押収対策 / 3-1）
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { message_ttl_hours: 24, ..Default::default() };
+
+        {
+            let s = MailboxServer::new_encrypted(dir.path(), &config, "correct horse").unwrap();
+            assert!(s.is_encrypted());
+            s.handle_put(&put_payload(1, b"a-secret-shard")).await.unwrap();
+
+            // no-burn で読める
+            assert_eq!(
+                s.handle_get(&[1u8; 32]).await.unwrap().as_deref(),
+                Some(&b"a-secret-shard"[..])
+            );
+        }
+
+        // 生の sled を直接覗くと、平文のシャードは現れない（暗号化されている）
+        {
+            let raw = sled::open(dir.path()).unwrap();
+            let stored = raw.get([1u8; 32]).unwrap().unwrap();
+            assert!(
+                !stored.windows(14).any(|w| w == b"a-secret-shard"),
+                "値が平文で残ってはいけない"
+            );
+        }
+
+        // 同じパスフレーズで開き直せば読める
+        let s = MailboxServer::new_encrypted(dir.path(), &config, "correct horse").unwrap();
+        assert_eq!(
+            s.handle_get(&[1u8; 32]).await.unwrap().as_deref(),
+            Some(&b"a-secret-shard"[..])
+        );
+
+        // 誤ったパスフレーズは弾く（カナリア）
+        assert!(MailboxServer::new_encrypted(dir.path(), &config, "wrong").is_err());
     }
 
     #[tokio::test]

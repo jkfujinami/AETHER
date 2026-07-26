@@ -457,6 +457,68 @@ impl SchrodingerMailbox {
         Ok(count)
     }
 
+    /// プレキー束の配置座標と公開鍵を NodeId から導出する（X3DH / 3-1）
+    ///
+    /// どちらも **NodeId だけから計算できる**（公開値）ので、相手の NodeId を知る者は
+    /// 誰でも束の位置を特定して取得できる。束自体は署名済みなので、保持者や取得経路が
+    /// 改竄しても [`x3dh::initiate`](crate::crypto::x3dh::initiate) が弾く。
+    fn prekey_location(node_id: &NodeId) -> ([u8; 32], SharedSecret) {
+        use sha2::Digest;
+        let mut mk = Sha256::new();
+        mk.update(b"aether_prekey_v1");
+        mk.update(node_id.as_bytes());
+        let mailbox_key: [u8; 32] = mk.finalize().into();
+
+        let mut pk = Sha256::new();
+        pk.update(b"aether_prekey_pub_v1");
+        pk.update(node_id.as_bytes());
+        let pub_key: [u8; 32] = pk.finalize().into();
+
+        (mailbox_key, pub_key)
+    }
+
+    /// 自分のプレキー束を網へ公開する（X3DH の Bob 役 / 3-1）
+    ///
+    /// `H("aether_prekey_v1"‖NodeId)` の担当保持者へ、RS シャードに割って置く。
+    /// 束は公開情報（署名付き公開鍵の集まり）なので暗号化はしない ── 完全性は
+    /// シャードの HMAC 封と、束に載る Ed25519 署名が担う。
+    pub async fn publish_prekey_bundle(
+        &self,
+        bundle: &crate::crypto::x3dh::PreKeyBundle,
+    ) -> Result<()> {
+        let (mailbox_key, pub_key) = Self::prekey_location(&bundle.node_id);
+        let object =
+            bincode::serialize(bundle).map_err(|e| AetherError::Serialization(e.to_string()))?;
+        self.place_object(&mailbox_key, &pub_key, &object).await?;
+        Ok(())
+    }
+
+    /// 相手のプレキー束の取得要求を出す（返信は Inbound Tunnel 経由 / 3-1）
+    pub async fn request_prekey_bundle(&self, node_id: &NodeId) -> Result<()> {
+        let (mailbox_key, pub_key) = Self::prekey_location(node_id);
+        self.request_body(&mailbox_key, &pub_key).await
+    }
+
+    /// トンネルで回収したシャードから相手のプレキー束を復元する（3-1）
+    ///
+    /// 署名検証は呼び出し側の [`x3dh::initiate`](crate::crypto::x3dh::initiate) が行う
+    /// （意図した相手の NodeId で束を検証する）。
+    pub fn reassemble_prekey_bundle(
+        &self,
+        replies: &[Vec<u8>],
+        node_id: &NodeId,
+    ) -> Result<Option<crate::crypto::x3dh::PreKeyBundle>> {
+        let (mailbox_key, pub_key) = Self::prekey_location(node_id);
+        match self.reassemble_raw(replies, &mailbox_key, &pub_key)? {
+            Some(object) => {
+                let bundle = bincode::deserialize(&object)
+                    .map_err(|e| AetherError::Protocol(format!("Invalid prekey bundle: {}", e)))?;
+                Ok(Some(bundle))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// 索引に記述子を1件公開する (19.7 / Phase 2-3)
     ///
     /// キーワードの索引位置 `H(index_key ‖ K_pub)` の担当保持者へ、

@@ -112,6 +112,22 @@ impl RelayDirectory {
         ring::position_of_node(&descriptor.node_id, &self.epoch_seed)
     }
 
+    /// 現在のエポックシード
+    pub fn epoch_seed(&self) -> [u8; 32] {
+        self.epoch_seed
+    }
+
+    /// エポックシードを差し替える（エポックビーコンが日次で回転する / 3-4）
+    ///
+    /// ノードのリング座標 [`position_of`](Self::position_of) と Hint 保持位置に混ざる。
+    /// **全ノードが同じシードに到達している必要がある**（食い違うと保持者計算がずれる）。
+    /// 送信側・受信側は drand の同一ラウンドから独立に同じ値を導出する。
+    /// 回転で保持者集合が変わったコンテンツは、既存の republish ループ（保持者による
+    /// 定期再配置）が現在の K 最近接へ移すので、境界後しばらくで追従する。
+    pub fn set_epoch_seed(&mut self, seed: [u8; 32]) {
+        self.epoch_seed = seed;
+    }
+
     /// 指定座標に近い順に最大 k 台
     ///
     /// **問い合わせを一切行わない。** 送信側と受信側が独立に計算して
@@ -342,5 +358,21 @@ mod tests {
 
         assert_eq!(candidates.len(), 5);
         assert!(candidates.iter().any(|c| c.uptime_secs > 0));
+    }
+
+    #[test]
+    fn set_epoch_seed_rotates_node_positions() {
+        // エポックシードを回すとノードのリング座標が動く（グラインド無効化の核 / 3-4）。
+        // 位置は H(NodeId ‖ epoch_seed) なので、seed が変われば保持者集合も変わる。
+        let mut dir = RelayDirectory::new([0u8; 32], 0);
+        let d = descriptor(7);
+        dir.insert_unchecked(d.clone());
+
+        let before = dir.position_of(&d).value();
+        dir.set_epoch_seed([9u8; 32]);
+        let after = dir.position_of(&d).value();
+
+        assert_ne!(before, after, "シード回転で座標が動く");
+        assert_eq!(dir.epoch_seed(), [9u8; 32]);
     }
 }

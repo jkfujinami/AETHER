@@ -19,9 +19,10 @@ use crate::protocol::hint::HintPacket;
 use crate::net::tunnel::TunnelRelay;
 use crate::node::peer::PeerManager;
 use crate::crypto::identity::{Identity, NodeId};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::sync::RwLock;
-use tracing::{info, error, debug};
+use tokio::sync::{Notify, RwLock};
+use tracing::{info, error, debug, warn};
 use crate::Config;
 use std::path::Path;
 use std::net::SocketAddr;
@@ -41,6 +42,19 @@ const HINT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 /// stem した Hint がこの時間内に fluff で戻ってこなければ、自分で fluff する。
 /// stem 後継が黒穴でも配送を保証する。
 const DANDELION_STEM_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Dandelion++ stem の ACK 待ち時間 (3-2 echo 再送)
+///
+/// 後継へ [`StemHint`](PacketType::StemHint) を投げてからこの時間内に
+/// [`StemAck`](PacketType::StemAck) が返らなければ、その後継は黒穴とみなして
+/// **別の後継へ再送する**。[`DANDELION_STEM_TIMEOUT`] より十分短くする
+/// （fluff の最終フォールバックより先に代替経路を試したい）。
+const DANDELION_STEM_ACK_TIMEOUT: Duration = Duration::from_millis(700);
+
+/// 黒穴を避けて別の後継を試す最大回数 (3-2 echo 再送)
+///
+/// これを使い切っても ACK が得られなければ、自分で fluff して配送を保証する。
+const DANDELION_MAX_STEM_RETRIES: usize = 3;
 
 /// 期限切れデータの掃除間隔
 const GC_INTERVAL: Duration = Duration::from_secs(300);
@@ -86,6 +100,11 @@ pub struct NodeServer {
     hint_log: Arc<Mutex<HintLog>>,
     /// Dandelion++ の経路ポリシー（放流元秘匿 / 3-2）
     dandelion: Arc<Mutex<DandelionRouter>>,
+    /// stem 中の Hint ごとの ACK 待ち通知（3-2 echo 再送）。
+    /// key = hint_id。後継から [`StemAck`](PacketType::StemAck) が届いたら notify する。
+    stem_acks: Arc<Mutex<HashMap<[u8; 32], Arc<Notify>>>>,
+    /// エポックビーコン（drand 由来の日次シード）を回すか (3-4)
+    epoch_beacon: bool,
 }
 
 
@@ -113,6 +132,8 @@ pub struct PacketContext {
     pub hint_log: Arc<Mutex<HintLog>>,
     /// Dandelion++ の経路ポリシー（3-2）
     pub dandelion: Arc<Mutex<DandelionRouter>>,
+    /// stem 中の Hint ごとの ACK 待ち通知（3-2 echo 再送）
+    pub stem_acks: Arc<Mutex<HashMap<[u8; 32], Arc<Notify>>>>,
 }
 
 impl NodeServer {
@@ -130,6 +151,19 @@ impl NodeServer {
         db_path: &Path,
         config: &Config,
     ) -> Result<Self> {
+        Self::with_config_passphrase(port, identity, db_path, config, None)
+    }
+
+    /// 設定に加えて Mailbox の**保存時暗号化パスフレーズ**を指定して起動する (3-1)
+    ///
+    /// `passphrase` が `Some` なら mailbox.db を暗号化する（押収対策）。`None` は平文。
+    pub fn with_config_passphrase(
+        port: u16,
+        identity: Identity,
+        db_path: &Path,
+        config: &Config,
+        passphrase: Option<&str>,
+    ) -> Result<Self> {
         let config = Config { listen_port: port, ..config.clone() };
         let server = QuicServer::new(&config)?;
 
@@ -137,7 +171,10 @@ impl NodeServer {
         let identity = Arc::new(identity);
         // 待ち受けと同じソケットから発信する（NAT マッピングを共有）
         let router = Arc::new(Router::with_endpoint(identity.clone(), server.endpoint())?);
-        let mailbox = Arc::new(MailboxServer::new(db_path, &config)?);
+        let mailbox = Arc::new(match passphrase {
+            Some(p) => MailboxServer::new_encrypted(db_path, &config, p)?,
+            None => MailboxServer::new(db_path, &config)?,
+        });
         let gossip = Arc::new(GossipServer::new(&config));
         let tunnel_relay = Arc::new(RwLock::new(TunnelRelay::new()));
         let peers = Arc::new(PeerManager::new());
@@ -196,6 +233,8 @@ impl NodeServer {
             filtering: Arc::new(RwLock::new(NatFiltering::Unknown)),
             hint_log: Arc::new(Mutex::new(HintLog::default())),
             dandelion: Arc::new(Mutex::new(DandelionRouter::new())),
+            stem_acks: Arc::new(Mutex::new(HashMap::new())),
+            epoch_beacon: config.epoch_beacon,
         })
     }
 
@@ -301,6 +340,9 @@ impl NodeServer {
         self.spawn_pex();
         self.spawn_side_channel();
         self.spawn_hint_reconcile();
+        if self.epoch_beacon {
+            self.spawn_epoch_beacon();
+        }
 
         // **自分がダイヤルした接続も受信を回す。**
         // Connection Reversal では相手がこの接続の上で押し返してくるので、
@@ -321,6 +363,7 @@ impl NodeServer {
                 remote_addr: None,
                 hint_log: self.hint_log.clone(),
                 dandelion: self.dandelion.clone(),
+                stem_acks: self.stem_acks.clone(),
             };
 
             tokio::spawn(async move {
@@ -347,6 +390,7 @@ impl NodeServer {
             remote_addr: None,
             hint_log: self.hint_log.clone(),
             dandelion: self.dandelion.clone(),
+            stem_acks: self.stem_acks.clone(),
         };
 
         while let Some(conn) = self.server.accept().await {
@@ -469,7 +513,23 @@ impl NodeServer {
                 Self::relay_hint(&payload, &ctx).await?;
             },
             PacketType::StemHint => {
-                // Dandelion++ の stem 相。送り主を除外して次の判断（forward / fluff）へ。
+                // Dandelion++ の stem 相。まず送り主へ ACK を返す（黒穴検出 / 3-2 echo 再送）。
+                // ACK が返らなければ送り主はこの後継を黒穴とみなし別の後継へ再送する。
+                //
+                // **投げっぱなしにする（await しない）。** 送り主が到達不能でも ACK の送出で
+                // Hint 処理（下の inject_hint）を塞いではならない。ACK は最適化であって、
+                // 配送保証は inject_hint 側の fluff フォールバックが担う。
+                if let Ok(packet) = bincode::deserialize::<HintPacket>(&payload)
+                    && let Some(addr) = ctx.remote_addr
+                {
+                    let router = ctx.router.clone();
+                    let id = packet.id();
+                    tokio::spawn(async move {
+                        let _ = router.send_packet(addr, PacketType::StemAck, &id).await;
+                    });
+                }
+
+                // 送り主を除外して次の判断（forward / fluff）へ。
                 let sender = match ctx.remote_addr {
                     Some(addr) => {
                         let want = crate::net::addr::normalize(addr);
@@ -482,6 +542,16 @@ impl NodeServer {
                     None => None,
                 };
                 Self::inject_hint(&payload, sender, &ctx).await;
+            },
+            PacketType::StemAck => {
+                // 後継が stem を受け取った合図。待っている再送タスクを起こす（3-2）。
+                if payload.len() == 32 {
+                    let id: [u8; 32] = payload[..32].try_into().expect("長さ確認済み");
+                    let waiter = ctx.stem_acks.lock().unwrap().get(&id).cloned();
+                    if let Some(notify) = waiter {
+                        notify.notify_one();
+                    }
+                }
             },
             PacketType::GossipHintBatch => {
                 Self::relay_hint_batch(&payload, &ctx).await?;
@@ -786,12 +856,10 @@ impl NodeServer {
 
     /// Dandelion++ の注入点 ── stem（1本道）で運ぶか fluff（放流）するか決める (3-2)
     ///
-    /// onion 出口での投入と、stem 相の中継の両方から呼ぶ。stem なら単一の後継へ
-    /// [`StemHint`](PacketType::StemHint) を送る。fluff なら通常の gossip 放流
-    /// ([`relay_hint`](Self::relay_hint)) に落とす。
-    ///
-    /// **フェイルセーフ:** stem した Hint が [`DANDELION_STEM_TIMEOUT`] 内に fluff で
-    /// 戻ってこなければ自分で fluff する。stem 後継が黒穴でも配送を保証する。
+    /// onion 出口での投入と、stem 相の中継の両方から呼ぶ。fluff なら通常の gossip 放流
+    /// ([`relay_hint`](Self::relay_hint)) に落とす。stem なら
+    /// [`stem_forward_with_retry`](Self::stem_forward_with_retry) に委ね、
+    /// **ACK が返らない黒穴後継は別の後継へ echo 再送**する。
     async fn inject_hint(hint_bytes: &[u8], sender: Option<NodeId>, ctx: &PacketContext) {
         let packet: HintPacket = match bincode::deserialize(hint_bytes) {
             Ok(p) => p,
@@ -826,37 +894,131 @@ impl NodeServer {
 
         match route {
             Route::Forward(target) => {
-                let target_addr = {
-                    let dir = ctx.directory.read().await;
-                    dir.get(&target).map(|d| d.addr)
-                };
-                let Some(addr) = target_addr else {
-                    // 後継が引けない → 即 fluff
-                    let _ = Self::relay_hint(hint_bytes, ctx).await;
-                    return;
-                };
-
-                let _ = ctx
-                    .router
-                    .send_packet(addr, PacketType::StemHint, hint_bytes)
-                    .await;
-
-                // フェイルセーフ: 一定時間 fluff が観測できなければ自分で fluff する
+                // 再送ループは ACK 待ちで時間がかかるので、投入経路を塞がないよう独立タスクへ。
                 let id = packet.id();
                 let ctx2 = ctx.clone();
                 let bytes = hint_bytes.to_vec();
                 tokio::spawn(async move {
-                    tokio::time::sleep(DANDELION_STEM_TIMEOUT).await;
-                    if !ctx2.gossip.has_seen(&id).await {
-                        debug!("Dandelion fail-safe: fluffing a stemmed hint");
-                        let _ = Self::relay_hint(&bytes, &ctx2).await;
-                    }
+                    Self::stem_forward_with_retry(bytes, id, target, sender_id, neighbors, ctx2)
+                        .await;
                 });
             }
             Route::Fluff => {
                 let _ = Self::relay_hint(hint_bytes, ctx).await;
             }
         }
+    }
+
+    /// stem を後継へ送り、ACK が返らなければ別の後継へ echo 再送する (3-2)
+    ///
+    /// 後継へ [`StemHint`](PacketType::StemHint) を投げ、[`DANDELION_STEM_ACK_TIMEOUT`]
+    /// 内に [`StemAck`](PacketType::StemAck) が返るか待つ。返れば後継は生きているので
+    /// stem を託し、悪意ある drop に備えて [`spawn_stem_failsafe`](Self::spawn_stem_failsafe)
+    /// だけ残す。返らなければ黒穴とみなし、その後継を除外して別の後継へ再送する
+    /// （[`DANDELION_MAX_STEM_RETRIES`] 回まで）。生きた後継が尽きたら自分で fluff して
+    /// **配送を必ず保証する**。ACK は最適化であって、配送保証は fluff フォールバックが担う。
+    async fn stem_forward_with_retry(
+        hint_bytes: Vec<u8>,
+        id: [u8; 32],
+        first_target: NodeId,
+        sender_id: NodeId,
+        neighbors: Vec<NodeId>,
+        ctx: PacketContext,
+    ) {
+        // 送り主へは戻さない。ACK が返らなかった後継も順に積んで除外していく。
+        let mut excluded: Vec<NodeId> = vec![sender_id];
+        let mut target = first_target;
+
+        for _ in 0..DANDELION_MAX_STEM_RETRIES {
+            let addr = {
+                let dir = ctx.directory.read().await;
+                dir.get(&target).map(|d| d.addr)
+            };
+
+            let Some(addr) = addr else {
+                // 後継の記述子が引けない → 別の後継へ
+                excluded.push(target);
+                match Self::next_stem_successor(&ctx, &neighbors, &excluded) {
+                    Some(t) => {
+                        target = t;
+                        continue;
+                    }
+                    None => break,
+                }
+            };
+
+            // ACK 待ちを登録してから送る（速い ACK を取りこぼさない）
+            let notify = Arc::new(Notify::new());
+            ctx.stem_acks.lock().unwrap().insert(id, notify.clone());
+
+            // **送信自体も時間で括る。** 後継が黒穴だと QUIC のダイヤルがそこで刺さり、
+            // await したままだと再送ループごと止まる（＝黒穴で放流が落ちる）。送信が
+            // 時間内に返らなければ、その後継は死んでいるとみなして次へ回す。
+            let acked = match tokio::time::timeout(
+                DANDELION_STEM_ACK_TIMEOUT,
+                ctx.router
+                    .send_packet(addr, PacketType::StemHint, &hint_bytes),
+            )
+            .await
+            {
+                // 送れた → 残り時間で ACK を待つ
+                Ok(_) => tokio::select! {
+                    _ = notify.notified() => true,
+                    _ = tokio::time::sleep(DANDELION_STEM_ACK_TIMEOUT) => false,
+                },
+                // 送信が時間内に返らない = 黒穴
+                Err(_) => false,
+            };
+            ctx.stem_acks.lock().unwrap().remove(&id);
+
+            if acked {
+                // 後継は生きて受け取った。悪意ある drop に備え gossip タイムアウトの
+                // フェイルセーフだけ残す（黒穴でも最終的に配送を保証する）。
+                Self::spawn_stem_failsafe(id, hint_bytes, ctx);
+                return;
+            }
+
+            // ACK が来ない = 黒穴。除外して別の後継へ。
+            debug!("Dandelion: stem successor did not ACK; trying another");
+            excluded.push(target);
+            match Self::next_stem_successor(&ctx, &neighbors, &excluded) {
+                Some(t) => target = t,
+                None => break,
+            }
+        }
+
+        // 生きた後継が尽きた → 自分で fluff して配送を保証する
+        if !ctx.gossip.has_seen(&id).await {
+            debug!("Dandelion: no live stem successor; fluffing");
+            let _ = Self::relay_hint(&hint_bytes, &ctx).await;
+        }
+    }
+
+    /// 除外集合を避けて次のステム後継を引く（3-2 echo 再送）
+    fn next_stem_successor(
+        ctx: &PacketContext,
+        neighbors: &[NodeId],
+        excluded: &[NodeId],
+    ) -> Option<NodeId> {
+        ctx.dandelion.lock().unwrap().choose_successor(
+            neighbors,
+            excluded,
+            std::time::Instant::now(),
+            &mut rand::thread_rng(),
+        )
+    }
+
+    /// stem した Hint が [`DANDELION_STEM_TIMEOUT`] 内に fluff で戻らなければ自分で fluff する
+    ///
+    /// 後継が ACK を返してから握りつぶす（悪意ある黒穴）ケースの最終フォールバック (3-2)。
+    fn spawn_stem_failsafe(id: [u8; 32], hint_bytes: Vec<u8>, ctx: PacketContext) {
+        tokio::spawn(async move {
+            tokio::time::sleep(DANDELION_STEM_TIMEOUT).await;
+            if !ctx.gossip.has_seen(&id).await {
+                debug!("Dandelion fail-safe: fluffing a stemmed hint");
+                let _ = Self::relay_hint(&hint_bytes, &ctx).await;
+            }
+        });
     }
 
     /// 単発の Hint を処理して拡散キューに積む（fluff 相）
@@ -1210,6 +1372,62 @@ impl NodeServer {
                 if let Ok(mut log) = hint_log.lock() {
                     log.prune(current_timestamp());
                 }
+            }
+        });
+    }
+
+    /// エポックビーコン（drand 由来の日次シード）を回す (3-4)
+    ///
+    /// 起動時と各エポック境界で drand から seed を取得し、ディレクトリへ反映する。
+    /// これでリング座標 `H(NodeId ‖ epoch_seed)` が日次で回転し、位置グラインディングした
+    /// NodeId が1日で無効化される。
+    ///
+    /// **取得に失敗しても placeholder に戻さない。** 戻すと drand を引けた他ノードと
+    /// シードが食い違い、保持者計算がずれて網が分裂する。失敗時は現在のシードを据え置き、
+    /// 短い間隔で再試行する（drand の一時障害・起動直後のオフラインを吸収する）。
+    fn spawn_epoch_beacon(&self) {
+        let directory = self.directory.clone();
+
+        tokio::spawn(async move {
+            /// 失敗時の再試行間隔
+            const RETRY_SECS: u64 = 300;
+
+            loop {
+                let epoch = crate::net::epoch::epoch_index(current_timestamp());
+
+                // ブロッキング HTTP なので blocking プールへ逃がす
+                let fetched =
+                    tokio::task::spawn_blocking(move || crate::net::epoch::fetch_epoch_seed(epoch))
+                        .await;
+
+                let succeeded = match fetched {
+                    Ok(Ok(seed)) => {
+                        directory.write().await.set_epoch_seed(seed);
+                        info!(
+                            "Epoch beacon: epoch {} seed set ({}...)",
+                            epoch,
+                            hex::encode(&seed[..8])
+                        );
+                        true
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Epoch beacon fetch failed ({}); keeping current seed", e);
+                        false
+                    }
+                    Err(e) => {
+                        warn!("Epoch beacon task panicked: {}", e);
+                        false
+                    }
+                };
+
+                // 成功したら次のエポック境界（+60s 猶予）まで、失敗したら短く再試行
+                let sleep_secs = if succeeded {
+                    let into_epoch = current_timestamp() % crate::net::epoch::EPOCH_SECS;
+                    (crate::net::epoch::EPOCH_SECS - into_epoch) + 60
+                } else {
+                    RETRY_SECS
+                };
+                tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
             }
         });
     }

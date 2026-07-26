@@ -70,6 +70,8 @@ pub struct PreKeySecrets {
 /// Alice が最初のメッセージに添える鍵情報
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitialMessage {
+    /// Alice の NodeId（Ed25519）。Bob が差出人を特定し ID 鍵の整合を検証する
+    pub initiator_node_id: NodeId,
     /// Alice の恒久 ID 鍵（X25519 公開）
     pub identity_key: [u8; 32],
     /// Alice の一時鍵（X25519 公開）
@@ -202,6 +204,7 @@ pub fn initiate(
     let sk = kdf_sk(&secrets);
 
     let msg = InitialMessage {
+        initiator_node_id: alice.public_id(),
         identity_key: identity_x25519_public(alice),
         ephemeral_key: ek_public,
         used_one_time_prekey: bundle.one_time_prekey,
@@ -211,7 +214,18 @@ pub fn initiate(
 }
 
 /// Bob 役：Alice の最初のメッセージから同じ `SK` を復元する
+///
+/// Alice の恒久 ID 鍵（X25519）が自称 NodeId から導出したものと一致するか検証する
+/// （NodeId と ID 鍵の食い違いを弾く）。DH2/DH4 に入るのはこの `identity_key` なので、
+/// MITM が差し替えても最終的に SK が食い違い Bob の復号は失敗する ── ここで先に弾く。
 pub fn respond(bob: &Identity, secrets: &PreKeySecrets, msg: &InitialMessage) -> Result<[u8; 32]> {
+    let claimed_ik = crate::crypto::identity::x25519_public_from_node_id(&msg.initiator_node_id)?;
+    if claimed_ik != msg.identity_key {
+        return Err(AetherError::Crypto(
+            "X3DH: initiator identity key does not match its NodeId".into(),
+        ));
+    }
+
     let ik_b_secret = bob.x25519_secret().to_bytes();
 
     // Alice と同じ DH を対称に計算する
@@ -241,6 +255,56 @@ pub fn respond(bob: &Identity, secrets: &PreKeySecrets, msg: &InitialMessage) ->
 /// Identity の X25519 公開鍵
 fn identity_x25519_public(identity: &Identity) -> [u8; 32] {
     PublicKey::from(&identity.x25519_secret()).to_bytes()
+}
+
+/// 私信本体のフレーム tag：初回接触（X3DH の InitialMessage を同梱）
+const FRAME_INITIAL: u8 = 0x01;
+/// 私信本体のフレーム tag：継続（ラチェットのみ）
+const FRAME_CONTINUATION: u8 = 0x00;
+
+/// 初回接触の本体をフレーム化する: `[0x01][InitialMessage][sealed]`
+///
+/// mailbox が運ぶ本体の先頭に、受信者が `SK` を復元するための [`InitialMessage`] を前置する。
+/// `sealed` は [`Session::seal`](crate::crypto::session::Session::seal) の出力。
+pub fn frame_initial(init: &InitialMessage, sealed: &[u8]) -> Result<Vec<u8>> {
+    let init_bytes =
+        bincode::serialize(init).map_err(|e| AetherError::Serialization(e.to_string()))?;
+    let mut out = Vec::with_capacity(1 + init_bytes.len() + sealed.len());
+    out.push(FRAME_INITIAL);
+    out.extend_from_slice(&init_bytes);
+    out.extend_from_slice(sealed);
+    Ok(out)
+}
+
+/// 継続の本体をフレーム化する: `[0x00][sealed]`
+pub fn frame_continuation(sealed: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + sealed.len());
+    out.push(FRAME_CONTINUATION);
+    out.extend_from_slice(sealed);
+    out
+}
+
+/// 私信本体のフレームを分解する
+///
+/// 返り値は `(初回接触なら Some(InitialMessage), sealed 本体)`。継続なら `None`。
+pub fn parse_frame(body: &[u8]) -> Result<(Option<InitialMessage>, &[u8])> {
+    let (&tag, rest) = body
+        .split_first()
+        .ok_or_else(|| AetherError::Protocol("empty private body frame".into()))?;
+    match tag {
+        FRAME_CONTINUATION => Ok((None, rest)),
+        FRAME_INITIAL => {
+            let mut cursor = std::io::Cursor::new(rest);
+            let init: InitialMessage = bincode::deserialize_from(&mut cursor)
+                .map_err(|e| AetherError::Protocol(format!("invalid InitialMessage: {}", e)))?;
+            let consumed = cursor.position() as usize;
+            Ok((Some(init), &rest[consumed..]))
+        }
+        other => Err(AetherError::Protocol(format!(
+            "unknown private body frame tag 0x{:02x}",
+            other
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -336,6 +400,25 @@ mod tests {
     }
 
     #[test]
+    fn respond_rejects_a_mismatched_initiator_node_id() {
+        // init_msg の NodeId と ID 鍵が食い違えば弾く（NodeId と鍵の付け替え対策）
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let mallory = Identity::generate();
+
+        let (bundle, secrets) = generate_prekeys(&bob, true);
+        let (_sk, mut msg) = initiate(&alice, &bob.public_id(), &bundle).unwrap();
+
+        // NodeId だけ別人にすり替える（ID 鍵はそのまま）
+        msg.initiator_node_id = mallory.public_id();
+
+        assert!(
+            respond(&bob, &secrets, &msg).is_err(),
+            "NodeId と ID 鍵が食い違う初回メッセージは拒否する"
+        );
+    }
+
+    #[test]
     fn bundle_survives_wire_roundtrip() {
         let bob = Identity::generate();
         let (bundle, _) = generate_prekeys(&bob, true);
@@ -377,6 +460,59 @@ mod tests {
         let (bundle, _) = generate_prekeys(&bob, true);
         // Kyber768 公開鍵は 1184 バイト
         assert_eq!(bundle.kem_public.len(), 1184, "Kyber768 公開鍵のサイズ");
+    }
+
+    #[test]
+    fn private_body_frames_roundtrip() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let (bundle, _) = generate_prekeys(&bob, false);
+        let (_sk, init) = initiate(&alice, &bob.public_id(), &bundle).unwrap();
+
+        // 初回接触フレーム: InitialMessage と sealed 本体が分離して戻る
+        let sealed = b"sealed ratchet body";
+        let framed = frame_initial(&init, sealed).unwrap();
+        let (got_init, got_sealed) = parse_frame(&framed).unwrap();
+        assert!(got_init.is_some(), "初回接触は InitialMessage を含む");
+        assert_eq!(got_init.unwrap().initiator_node_id, alice.public_id());
+        assert_eq!(got_sealed, sealed);
+
+        // 継続フレーム: InitialMessage 無し
+        let cont = frame_continuation(sealed);
+        let (none_init, cont_sealed) = parse_frame(&cont).unwrap();
+        assert!(none_init.is_none(), "継続は InitialMessage を含まない");
+        assert_eq!(cont_sealed, sealed);
+    }
+
+    #[test]
+    fn full_x3dh_over_frames_establishes_a_forward_secret_session() {
+        // 送信〜受信の丸ごと：X3DH → SK → Session::bootstrap(SK) → frame → 相手が復元
+        use crate::crypto::session::Session;
+
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let (bundle, secrets) = generate_prekeys(&bob, false);
+
+        // Alice: initiate → SK → Session、初回本文をフレーム化
+        let (sk_a, init) = initiate(&alice, &bob.public_id(), &bundle).unwrap();
+        let mut alice_session = Session::bootstrap(&sk_a, &alice.public_id(), &bob.public_id());
+        let sealed1 = alice_session.seal(b"hello via x3dh", b"").unwrap();
+        let framed1 = frame_initial(&init, &sealed1).unwrap();
+
+        // Bob: フレームを分解 → respond で SK → Session → 復元
+        let (got_init, got_sealed) = parse_frame(&framed1).unwrap();
+        let init = got_init.unwrap();
+        let sk_b = respond(&bob, &secrets, &init).unwrap();
+        assert_eq!(sk_a, sk_b, "両者が同じ X3DH SK に到達");
+        let mut bob_session = Session::bootstrap(&sk_b, &bob.public_id(), &alice.public_id());
+        assert_eq!(bob_session.open(got_sealed, b"").unwrap(), b"hello via x3dh");
+
+        // 継続（2 通目）は Bob→Alice も含めて双方向に流れる
+        let sealed2 = bob_session.seal(b"reply", b"").unwrap();
+        let framed2 = frame_continuation(&sealed2);
+        let (none, s2) = parse_frame(&framed2).unwrap();
+        assert!(none.is_none());
+        assert_eq!(alice_session.open(s2, b"").unwrap(), b"reply");
     }
 
     #[test]

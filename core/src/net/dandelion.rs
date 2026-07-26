@@ -74,13 +74,14 @@ impl DandelionRouter {
         }
     }
 
-    /// エポック内で固定のステム後継を返す（`exclude` を除いた候補から）
+    /// エポック内で固定のステム後継を返す（`exclude` の全 NodeId を除いた候補から）
     ///
-    /// 期限切れ・候補に居ない・`exclude` と一致 のいずれかなら引き直す。
+    /// 期限切れ・候補に居ない・`exclude` に含まれる のいずれかなら引き直す。
+    /// `exclude` には送り主に加え、**ACK が来ず黒穴と判明した後継**も渡す（3-2 再送）。
     fn stem_target<R: Rng>(
         &mut self,
         candidates: &[NodeId],
-        exclude: Option<&NodeId>,
+        exclude: &[NodeId],
         now: Instant,
         rng: &mut R,
     ) -> Option<NodeId> {
@@ -88,7 +89,7 @@ impl DandelionRouter {
         if let (Some(t), Some(exp)) = (self.stem_target, self.expiry)
             && now < exp
             && candidates.contains(&t)
-            && exclude != Some(&t)
+            && !exclude.contains(&t)
         {
             return Some(t);
         }
@@ -96,7 +97,7 @@ impl DandelionRouter {
         // 除外を反映した候補から新しく引く
         let pool: Vec<NodeId> = candidates
             .iter()
-            .filter(|c| exclude != Some(*c))
+            .filter(|c| !exclude.contains(c))
             .copied()
             .collect();
         if pool.is_empty() {
@@ -117,7 +118,22 @@ impl DandelionRouter {
         now: Instant,
         rng: &mut R,
     ) -> Option<NodeId> {
-        self.stem_target(neighbors, None, now, rng)
+        self.stem_target(neighbors, &[], now, rng)
+    }
+
+    /// 黒穴と判明した後継を除いて、代わりのステム後継を選ぶ（3-2 echo 再送）
+    ///
+    /// ACK が返らなかった後継を `exclude` に積んで呼ぶ。エポック固定の後継が
+    /// `exclude` に入っていれば引き直す（死んだ相手に投げ続けない）。候補が尽きれば
+    /// `None`（＝呼び出し側は fluff にフォールバックして配送を保証する）。
+    pub fn choose_successor<R: Rng>(
+        &mut self,
+        neighbors: &[NodeId],
+        exclude: &[NodeId],
+        now: Instant,
+        rng: &mut R,
+    ) -> Option<NodeId> {
+        self.stem_target(neighbors, exclude, now, rng)
     }
 
     /// 受信したステムパケットをどう中継するか決める
@@ -135,7 +151,7 @@ impl DandelionRouter {
         if !has_candidate || rng.gen_range(0.0f64..1.0) < self.fluff_probability {
             return Route::Fluff;
         }
-        match self.stem_target(neighbors, Some(sender), now, rng) {
+        match self.stem_target(neighbors, std::slice::from_ref(sender), now, rng) {
             Some(target) => Route::Forward(target),
             None => Route::Fluff,
         }
@@ -244,6 +260,43 @@ mod tests {
         let after = expiry + Duration::from_secs(1);
         let _second = r.route(&node(9), &neighbors, after, &mut g);
         assert!(r.expiry.unwrap() > expiry, "エポック満了で後継が引き直される");
+    }
+
+    #[test]
+    fn choose_successor_avoids_the_dead_one() {
+        // ACK が来ず黒穴と判明した後継を除いて別の後継を選ぶ（3-2 echo 再送）
+        let mut r = DandelionRouter::with_config(0.0, DEFAULT_EPOCH);
+        let mut g = rng();
+        let neighbors = [node(1), node(2), node(3), node(4)];
+        let now = Instant::now();
+
+        // まず1本引く（エポック固定される）
+        let first = r.stem_origin(&neighbors, now, &mut g).unwrap();
+
+        // その後継を黒穴として除外 → 別の（生きた）後継が返る
+        let second = r
+            .choose_successor(&neighbors, &[first], now, &mut g)
+            .expect("代わりの後継が居る");
+        assert_ne!(second, first, "死んだ後継は再選しない");
+        assert!(neighbors.contains(&second));
+
+        // 除外後は新しい後継がエポック固定される（死んだ相手へ戻らない）
+        let again = r.choose_successor(&neighbors, &[first], now, &mut g).unwrap();
+        assert_eq!(again, second, "引き直した後継はエポック内で固定される");
+    }
+
+    #[test]
+    fn choose_successor_fluffs_when_all_dead() {
+        // 全後継が黒穴なら候補が尽きて None（＝呼び出し側は fluff にフォールバック）
+        let mut r = DandelionRouter::with_config(0.0, DEFAULT_EPOCH);
+        let mut g = rng();
+        let neighbors = [node(1), node(2)];
+        let now = Instant::now();
+        assert!(
+            r.choose_successor(&neighbors, &[node(1), node(2)], now, &mut g)
+                .is_none(),
+            "生きた後継が居なければ None"
+        );
     }
 
     #[test]

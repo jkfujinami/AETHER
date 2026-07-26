@@ -28,6 +28,9 @@ pub enum PacketType {
     /// Dandelion++ の stem（茎）相 Hint (3-2)。単一の後継へ1本道で中継する。
     /// 中身は `GossipHint` と同じ HintPacket。fluff 相へ移ると `GossipHintBatch` になる。
     StemHint = 0x14,
+    /// Dandelion++ stem の受領確認 (3-2)。後継→送り主へ「stem <hint_id> を受け取った」。
+    /// ペイロードは `hint_id`(32)。ACK が来なければ後継は黒穴とみなし別の後継へ再送する。
+    StemAck = 0x15,
 
     // Mailbox
     MailboxPut = 0x20,
@@ -232,6 +235,7 @@ pub async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Packet
         0x12 => PacketType::HintDigest,
         0x13 => PacketType::HintBacklog,
         0x14 => PacketType::StemHint,
+        0x15 => PacketType::StemAck,
         0x20 => PacketType::MailboxPut,
         0x21 => PacketType::MailboxGet,
         0x22 => PacketType::MailboxResponse,

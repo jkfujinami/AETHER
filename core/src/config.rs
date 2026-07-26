@@ -32,6 +32,18 @@ pub struct Config {
     // Traffic Shaping
     pub enable_cover_traffic: bool,
     pub target_fps: u32,
+
+    /// エポックビーコン（drand 由来の日次シード）を有効にするか (3-4)
+    ///
+    /// 位置グラインディング対策。リング座標に日次の公開乱数を混ぜ、グラインドした
+    /// NodeId を1日で無効化する。**シードは全ノードで一致していなければならない**
+    /// （食い違うと保持者計算がずれて網が分裂する）ため、これは事実上
+    /// **網全体で揃える protocol フラグ**であり、個別 opt-in はできない。
+    /// 既定オフ（＝固定 placeholder シード・現状の挙動）。
+    ///
+    /// 有効時は各ノードが日次で drand へ HTTPS 取得する（弱いフィンガープリント。
+    /// 将来 exit/Tor 経由に差し替え可能）。
+    pub epoch_beacon: bool,
 }
 
 impl Default for Config {
@@ -54,6 +66,8 @@ impl Default for Config {
 
             enable_cover_traffic: false,
             target_fps: 30,
+
+            epoch_beacon: false,
         }
     }
 }

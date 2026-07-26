@@ -17,8 +17,10 @@
 
 mod common;
 
-use aether_core::crypto::identity::Identity;
+use aether_core::crypto::identity::{Identity, NodeId};
+use aether_core::net::reachability::Tier;
 use aether_core::net::relay::RelayClient;
+use aether_core::net::relay_list::RelayDescriptor;
 use aether_core::node::server::NodeServer;
 use aether_core::protocol::hint::HintPacket;
 use aether_core::protocol::wire::PacketType;
@@ -100,6 +102,87 @@ async fn hint_reaches_subscribers_that_are_not_the_exit_relay() {
     let got_b = tokio::time::timeout(common::DEFAULT_TIMEOUT, rx_b.recv())
         .await
         .expect("B が Hint を受信しなかった（拡散が全ノードに広がっていない）")
+        .expect("B の gossip チャネルが閉じている");
+    assert_eq!(got_b.id(), expected_id, "B に届いた Hint が注入したものと一致しない");
+}
+
+/// Dandelion++ stem に**黒穴の後継が混じっても配送は保証される** (3-2 echo 再送の回帰)
+///
+/// # 何を守るか
+///
+/// stem 相で選ばれた後継が死んでいる（ACK を返さない）と、そこで Hint が消えれば
+/// 放流が黙って落ちる。修正: ACK が返らない後継は黒穴とみなし別の後継へ echo 再送し、
+/// 生きた後継が尽きれば自分で fluff する。**どの分岐でも購読者へ必ず届く**こと。
+///
+/// A の**ディレクトリに死んだリレー D を注入**して stem 後継の候補に混ぜ、A へ
+/// `StemHint` を撃つ（＝ A の `inject_hint` / 再送ループを起動する）。出口でない
+/// 購読者 B が、黒穴 D が候補に居ても Hint を受け取ることを確認する。
+#[tokio::test]
+async fn stem_delivery_survives_a_black_hole_successor() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+
+    let a = Arc::new(
+        NodeServer::with_config(0, Identity::generate(), dir_a.path(), &common::test_config())
+            .unwrap(),
+    );
+    let b = Arc::new(
+        NodeServer::with_config(0, Identity::generate(), dir_b.path(), &common::test_config())
+            .unwrap(),
+    );
+    let a_addr = a.descriptor.addr;
+    let b_addr = b.descriptor.addr;
+
+    for node in [&a, &b] {
+        let node = node.clone();
+        tokio::spawn(async move {
+            let _ = node.run().await;
+        });
+    }
+    common::wait_for_listener(a_addr).await;
+    common::wait_for_listener(b_addr).await;
+
+    // B が A を種に参加。PexRequest の吸収で A も B を学ぶ（相互に知り合う）
+    b.bootstrap(a_addr).await.unwrap();
+    common::wait_until("A and B know each other", common::DEFAULT_TIMEOUT, || async {
+        a.directory_size().await >= 2 && b.directory_size().await >= 2
+    })
+    .await;
+
+    // **死んだリレー D を A のディレクトリへ注入する。** 何も listen していない
+    // アドレスなので stem を撃っても ACK は返らない（黒穴）。stem 後継の候補に混ざる。
+    {
+        let dead = RelayDescriptor {
+            node_id: NodeId([0xDD; 32]),
+            addr: "127.0.0.1:9".parse().unwrap(), // discard port: 誰も受けない
+            x25519_pub: [0u8; 32],
+            pow_nonce: 0,
+            uptime_secs: 0,
+            tier: Tier::Open,
+        };
+        a.directory().write().await.insert_unchecked(dead);
+    }
+
+    // 注入より前に購読する（broadcast は既存の受信者にだけ配る）
+    let mut rx_b = b.gossip().subscribe();
+
+    // A へ StemHint を撃つ ── A が stem 相の中継ノードになった状況。
+    // A は後継（B か 死んだ D）へ forward し、D なら ACK が来ず B へ再送 / fluff する。
+    let mut hint = HintPacket::new([0x3B; 4], [0x55; 12], vec![0x66; 48], 5);
+    hint.seal_pow(0).unwrap();
+    let expected_id = hint.id();
+
+    let sender = RelayClient::new().unwrap();
+    sender
+        .send_direct_packet(a_addr, PacketType::StemHint, &hint.encode().unwrap())
+        .await
+        .unwrap();
+
+    // 黒穴 D が候補に居ても B は Hint を受け取る（再送 or fail-safe fluff で配送保証）。
+    // 最悪ケース（stem→D で ACK 待ち + 再送、または fail-safe 3s）を吸収する余裕を持たせる。
+    let got_b = tokio::time::timeout(Duration::from_secs(8), rx_b.recv())
+        .await
+        .expect("B が Hint を受信しなかった（黒穴後継で放流が落ちた）")
         .expect("B の gossip チャネルが閉じている");
     assert_eq!(got_b.id(), expected_id, "B に届いた Hint が注入したものと一致しない");
 }

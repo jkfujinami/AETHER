@@ -99,6 +99,14 @@ enum Commands {
         /// 指定すると、そのキーワードで公開された投稿を拾って表示する。
         #[arg(long = "subscribe")]
         subscribe: Vec<String>,
+
+        /// エポックビーコン（drand 由来の日次シード）を有効にする (3-4)
+        ///
+        /// 位置グラインディング対策。**網全体で揃える必要がある**（一部だけ有効にすると
+        /// 保持者計算がずれて分裂する）。有効時は日次で drand へ HTTPS 取得する
+        /// （弱いフィンガープリント）。
+        #[arg(long)]
+        epoch_beacon: bool,
     },
     /// メッセージを送る（私信 or 公開）
     ///
@@ -413,7 +421,13 @@ async fn join_network(
         ..Default::default()
     };
     let db_path = data_dir.join("mailbox.db");
-    let node = Arc::new(NodeServer::with_config(port, identity, &db_path, &config)?);
+    let node = Arc::new(NodeServer::with_config_passphrase(
+        port,
+        identity,
+        &db_path,
+        &config,
+        env_passphrase().as_deref(),
+    )?);
 
     // run() が受信を回してから参加する（Connection Reversal の応答を取りこぼさない）
     let running = node.clone();
@@ -464,6 +478,174 @@ async fn fetch_object(
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
     Ok(None)
+}
+
+/// 相手のプレキー束を網から取得する（X3DH 初回接触 / 3-1）
+///
+/// Pull セッションを張り、`H("aether_prekey_v1"‖NodeId)` の担当保持者から束を集めて復元する。
+/// 相手が束を公開していない／オフラインなら timeout でエラー。
+async fn fetch_prekey_bundle(
+    node: &Arc<NodeServer>,
+    target: &aether_core::crypto::identity::NodeId,
+) -> Result<aether_core::crypto::x3dh::PreKeyBundle, BoxErr> {
+    let session = establish_pull_session(node, std::collections::HashMap::new(), 4).await?;
+    session.mailbox.request_prekey_bundle(target).await?;
+
+    let mut collected: Vec<Vec<u8>> = Vec::new();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < until {
+        let raw = node
+            .mailbox()
+            .fetch_tunnel_messages(&session.receive_tunnel_id)
+            .await?;
+        if !raw.is_empty() {
+            collected.extend(session.mailbox.decrypt_replies(&raw));
+            if let Some(bundle) = session.mailbox.reassemble_prekey_bundle(&collected, target)? {
+                return Ok(bundle);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    Err(format!("プレキー束を取得できません（相手 {} が公開していない/オフライン）", target).into())
+}
+
+/// 受信した私信フレームを開く（X3DH 初回接触 or 継続ラチェット / 3-1）
+///
+/// フレーム tag を見て、初回接触なら Bob のプレキー秘密で respond して `SK` を復元し
+/// [`Session::bootstrap`] で立てる。継続なら保存済み Session を読む。開けたら Session を
+/// 保存（ラチェット前進）して平文を返す。
+///
+/// [`Session::bootstrap`]: aether_core::crypto::session::Session::bootstrap
+fn open_private_body(
+    keystore: &aether_core::storage::keystore::KeyStore,
+    bob_identity: &Identity,
+    prekeys: Option<&aether_core::crypto::x3dh::PreKeySecrets>,
+    me: &aether_core::crypto::identity::NodeId,
+    contact: &aether_core::crypto::identity::NodeId,
+    body: &[u8],
+) -> Result<Option<Vec<u8>>, BoxErr> {
+    use aether_core::crypto::session::Session;
+    use aether_core::crypto::x3dh;
+
+    let (initial, sealed) = match x3dh::parse_frame(body) {
+        Ok(v) => v,
+        Err(_) => return Ok(None), // 壊れたフレームは黙って捨てる
+    };
+
+    let mut session = match initial {
+        Some(init) => {
+            // 初回接触：認識で特定した contact と init_msg の差出人が一致すること
+            if init.initiator_node_id != *contact {
+                return Ok(None);
+            }
+            let Some(secrets) = prekeys else { return Ok(None) }; // 束未生成なら開けない
+            match x3dh::respond(bob_identity, secrets, &init) {
+                Ok(sk) => Session::bootstrap(&sk, me, contact),
+                Err(_) => return Ok(None),
+            }
+        }
+        None => match keystore.load(contact)? {
+            Some(s) => s,
+            None => return Ok(None), // 継続だが Session 未確立（初回を取りこぼした）
+        },
+    };
+
+    match session.open(sealed, &[]) {
+        Ok(pt) => {
+            keystore.save(contact, &session)?; // 受信ラチェットを前進
+            Ok(Some(pt))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// 自分のプレキー束を網へ公開し続ける（X3DH の受信側 / 3-1）
+///
+/// 初回接触を受けるには束を網へ置いておく必要がある。束と秘密を KeyStore に永続化して
+/// 再起動を跨いで再利用し（Kyber 公開鍵は秘密から再導出できないため束も持つ）、
+/// 保持者 churn / TTL に抗って定期再公開する。
+fn spawn_prekey_publisher(
+    node: Arc<NodeServer>,
+    keystore: Arc<aether_core::storage::keystore::KeyStore>,
+    data_dir: PathBuf,
+) {
+    /// 束の再公開間隔
+    const REPUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+    tokio::spawn(async move {
+        if let Err(e) = run(node, keystore, data_dir).await {
+            eprintln!("プレキー公開を継続できません: {}", e);
+        }
+    });
+
+    async fn run(
+        node: Arc<NodeServer>,
+        ks: Arc<aether_core::storage::keystore::KeyStore>,
+        data_dir: PathBuf,
+    ) -> Result<(), BoxErr> {
+        use aether_core::crypto::x3dh;
+
+        // 束＋秘密を用意（無ければ生成して永続化・以後再利用）
+        let bundle = match ks.load_prekeys()? {
+            Some((b, _s)) => b,
+            None => {
+                let identity = load_identity_shared(&data_dir)?;
+                let (b, s) = x3dh::generate_prekeys(&identity, false);
+                ks.save_prekeys(&b, &s)?;
+                b
+            }
+        };
+
+        // ディレクトリ収束を待つ（公開には出口リレーが要る）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while node.directory_size().await < 2 {
+            if std::time::Instant::now() > deadline {
+                return Err("プレキー公開に足るリレーが見つかりません".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        loop {
+            match publish_once(&node, &bundle).await {
+                Ok(()) => println!("プレキー束を公開しました（初回接触を受信できます）"),
+                Err(e) => eprintln!("プレキー公開に失敗: {}", e),
+            }
+            tokio::time::sleep(REPUBLISH_INTERVAL).await;
+        }
+    }
+
+    async fn publish_once(
+        node: &Arc<NodeServer>,
+        bundle: &aether_core::crypto::x3dh::PreKeyBundle,
+    ) -> Result<(), BoxErr> {
+        use aether_core::crypto::key_exchange::EphemeralKey;
+        use aether_core::mailbox::schrodinger::SchrodingerMailbox;
+        use aether_core::net::gossip::GossipClient;
+        use aether_core::net::onion::OnionCircuit;
+        use aether_core::net::relay::RelayClient;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        // 本体配置と同じく、生きた出口リレーを1台引いて onion 回路を張る
+        let (hop, mut client) = connect_live_exit(node, &[], 4).await?;
+        let mut circuit = OnionCircuit::new(1);
+        circuit.add_hop(hop.addr, hop.x25519_pub, EphemeralKey::generate())?;
+        client.set_circuit(circuit);
+
+        let mailbox = SchrodingerMailbox::with_directory(
+            Arc::new(client),
+            Arc::new(GossipClient::new(RelayClient::new()?)),
+            Arc::new(Mutex::new(HashMap::new())),
+            node.directory(),
+        );
+        mailbox.publish_prekey_bundle(bundle).await?;
+
+        // **接続を即閉じない。** onion パケットは entry へ書いた直後で、QUIC がまだ
+        // 送出しきっていない。ここで mailbox（＝RelayClient）を drop すると接続が閉じて
+        // 書いたシャードが失われる。少し待ってフラッシュさせる（送信コマンドと同じ）。
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        Ok(())
+    }
 }
 
 /// 掲示板の索引結果をスレッド DAG として表示する（2-5 / 2-7）
@@ -543,6 +725,16 @@ fn print_board(
     }
 }
 
+/// 保存時暗号化のパスフレーズ（環境変数 `AETHER_PASSPHRASE`）。空・未設定なら `None`
+///
+/// これ 1 つで identity.key・KeyStore・mailbox.db をまとめて解錠する（押収対策 / 3-1）。
+fn env_passphrase() -> Option<String> {
+    match std::env::var("AETHER_PASSPHRASE") {
+        Ok(p) if !p.is_empty() => Some(p),
+        _ => None,
+    }
+}
+
 /// 私信の前方秘匿セッションを保存する KeyStore を開く
 ///
 /// 環境変数 `AETHER_PASSPHRASE` があれば**保存時暗号化**する（押収対策 / 3-1）。
@@ -550,9 +742,9 @@ fn print_board(
 fn open_keystore(data_dir: &Path) -> aether_core::Result<aether_core::storage::keystore::KeyStore> {
     use aether_core::storage::keystore::KeyStore;
     let path = data_dir.join("keystore.db");
-    match std::env::var("AETHER_PASSPHRASE") {
-        Ok(pass) if !pass.is_empty() => KeyStore::open_encrypted(&path, &pass),
-        _ => {
+    match env_passphrase() {
+        Some(pass) => KeyStore::open_encrypted(&path, &pass),
+        None => {
             eprintln!(
                 "警告: AETHER_PASSPHRASE 未設定 ── KeyStore を平文で保存します（押収対策には設定推奨）"
             );
@@ -565,23 +757,38 @@ fn identity_path(data_dir: &Path) -> PathBuf {
     data_dir.join("identity.key")
 }
 
-fn load_identity(data_dir: &Path) -> Result<Identity, Box<dyn Error>> {
+/// `Send + Sync` なエラーで返す版（`tokio::spawn` の中でも使える / 受信・公開タスク用）
+fn load_identity_shared(data_dir: &Path) -> Result<Identity, BoxErr> {
     let path = identity_path(data_dir);
 
-    let bytes = std::fs::read(&path).map_err(|e| {
+    let bytes = std::fs::read(&path).map_err(|e| -> BoxErr {
         format!(
             "鍵を読み込めません ({}): {}\n先に `aether init` を実行してください",
             path.display(),
             e
         )
+        .into()
     })?;
 
-    Ok(Identity::from_bytes(&bytes)?)
+    // 暗号化された identity.key（マジック付き）はパスフレーズが要る。平文はそのまま。
+    if Identity::is_encrypted_bytes(&bytes) {
+        let pass = env_passphrase().ok_or_else(|| -> BoxErr {
+            "identity.key は暗号化されています。AETHER_PASSPHRASE を設定してください".into()
+        })?;
+        Ok(Identity::from_encrypted_bytes(&bytes, &pass)?)
+    } else {
+        Ok(Identity::from_bytes(&bytes)?)
+    }
+}
+
+fn load_identity(data_dir: &Path) -> Result<Identity, Box<dyn Error>> {
+    load_identity_shared(data_dir).map_err(box_err)
 }
 
 /// 鍵を保存する
 ///
 /// **所有者以外が読めないようにする。** 同じマシンの他ユーザからも守る。
+/// `AETHER_PASSPHRASE` があれば**保存時暗号化**する（押収されても成りすませない / 3-1）。
 fn save_identity(data_dir: &Path, identity: &Identity, force: bool) -> Result<(), Box<dyn Error>> {
     let path = identity_path(data_dir);
 
@@ -595,7 +802,19 @@ fn save_identity(data_dir: &Path, identity: &Identity, force: bool) -> Result<()
     }
 
     std::fs::create_dir_all(data_dir)?;
-    std::fs::write(&path, identity.to_bytes())?;
+
+    match env_passphrase() {
+        Some(pass) => {
+            std::fs::write(&path, identity.to_encrypted_bytes(&pass)?)?;
+            println!("  暗号化: AETHER_PASSPHRASE で保存時暗号化しました（押収対策）");
+        }
+        None => {
+            std::fs::write(&path, identity.to_bytes())?;
+            eprintln!(
+                "警告: AETHER_PASSPHRASE 未設定 ── identity.key を平文で保存します（押収対策には設定推奨）"
+            );
+        }
+    }
 
     #[cfg(unix)]
     {
@@ -785,15 +1004,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     mailbox.place_body_profiled(&target, &content).await?
                 } else {
                     use aether_core::crypto::session::Session;
+                    use aether_core::crypto::x3dh;
 
                     let ks = open_keystore(&cli.data_dir)?;
                     let me = node.descriptor.node_id;
-                    let mut session = ks
-                        .load(&target)?
-                        .unwrap_or_else(|| Session::bootstrap(&shared_secret, &me, &target));
+
+                    // 既存 Session があれば継続。無ければ **X3DH で初回接触**：相手の署名付き
+                    // プレキー束を取得し、ephemeral＋耐量子KEM を含む初期秘密 SK を立てる
+                    // （静的 agree より初回の前方秘匿が強い）。SK をラチェットの種にする。
+                    // 認識（blind_tag / mailbox 位置）は従来どおり agree 秘密のまま（分離）。
+                    let (mut session, initial): (Session, Option<x3dh::InitialMessage>) =
+                        match ks.load(&target)? {
+                            Some(s) => (s, None),
+                            None => {
+                                println!("初回接触: {} のプレキー束を取得して X3DH 鍵合意します", target);
+                                let bundle = fetch_prekey_bundle(&node, &target).await.map_err(box_err)?;
+                                let identity = load_identity(&cli.data_dir)?;
+                                let (sk, init) = x3dh::initiate(&identity, &target, &bundle)?;
+                                println!("X3DH 成立（前方秘匿＋耐量子ハイブリッド）。ラチェットを開始します");
+                                (Session::bootstrap(&sk, &me, &target), Some(init))
+                            }
+                        };
 
                     let sealed = session.seal(&content, &[])?;
-                    let placed = mailbox.place_ratchet_body(&target, &sealed).await?;
+
+                    // フレーム: 初回は [0x01][InitialMessage][sealed]、継続は [0x00][sealed]
+                    let body = match &initial {
+                        Some(init) => x3dh::frame_initial(init, &sealed)?,
+                        None => x3dh::frame_continuation(&sealed),
+                    };
+
+                    let placed = mailbox.place_ratchet_body(&target, &body).await?;
                     ks.save(&target, &session)?; // ラチェットを前進させて永続化
                     println!("前方秘匿でラチェット封じしました（Session を更新）");
                     placed
@@ -1023,6 +1264,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             pow_difficulty,
             contacts,
             subscribe,
+            epoch_beacon,
         } => {
             let identity = load_identity(&cli.data_dir)?;
             println!("Node ID: {}", identity.public_id());
@@ -1059,8 +1301,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 listen_port: *port,
                 node_id_pow_difficulty: *pow_difficulty,
                 enable_port_mapping: *allow_port_mapping,
+                epoch_beacon: *epoch_beacon,
                 ..Default::default()
             };
+
+            if *epoch_beacon {
+                println!("エポックビーコン: 有効（drand から日次シードを取得します）");
+            }
 
             if *pow_difficulty > 0 {
                 println!(
@@ -1070,7 +1317,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             let db_path = cli.data_dir.join("mailbox.db");
-            let mut node = NodeServer::with_config(*port, identity, &db_path, &config)?;
+            let mut node = NodeServer::with_config_passphrase(
+                *port,
+                identity,
+                &db_path,
+                &config,
+                env_passphrase().as_deref(),
+            )?;
 
             // --- 到達性を確定させる ---
             //
@@ -1117,9 +1370,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("種ノードが未指定です (--connect)。単独で待ち受けます");
             }
 
-            if !contacts.is_empty() {
-                spawn_receiver(node.clone(), contacts, public_secrets, cli.data_dir.clone());
+            // **KeyStore は1プロセスに1ハンドルだけ。** sled は DB ディレクトリを排他
+            // ロックするので、受信タスクと公開タスクが別々に開くと衝突する。1つ開いて
+            // Arc で共有する。
+            let keystore = Arc::new(open_keystore(&cli.data_dir)?);
+
+            // **X3DH プレキーを、受信・公開タスクを spawn する前に確定させる。**
+            // 両タスクは起動時に prekeys を読む。ここで生成・永続化しておかないと、
+            // 受信タスクが「まだ未生成」を掴んで初回接触を respond できない（競合）。
+            if keystore.load_prekeys()?.is_none() {
+                let id = load_identity(&cli.data_dir)?;
+                let (bundle, secrets) = aether_core::crypto::x3dh::generate_prekeys(&id, false);
+                keystore.save_prekeys(&bundle, &secrets)?;
+                println!("X3DH プレキーを生成しました（初回接触を受信できます）");
             }
+
+            if !contacts.is_empty() {
+                spawn_receiver(
+                    node.clone(),
+                    contacts,
+                    public_secrets,
+                    keystore.clone(),
+                    cli.data_dir.clone(),
+                );
+            }
+
+            // X3DH の受信側：プレキー束を網へ公開しておく（誰からでも初回接触を受けられる）。
+            // 束と秘密は KeyStore に永続化して再起動を跨いで再利用する。
+            spawn_prekey_publisher(node.clone(), keystore.clone(), cli.data_dir.clone());
 
             // フィルタ判定はリレーが2台以上必要なので、収束を待ってから走らせる。
             // EIM + EIF と判明すると punch 不要の Tier 0 に上がる
@@ -1178,6 +1456,7 @@ fn spawn_receiver(
     node: Arc<NodeServer>,
     contacts: Vec<(aether_core::crypto::identity::NodeId, [u8; 32])>,
     public_secrets: std::collections::HashSet<[u8; 32]>,
+    keystore: Arc<aether_core::storage::keystore::KeyStore>,
     data_dir: PathBuf,
 ) {
     use std::collections::HashMap;
@@ -1186,7 +1465,7 @@ fn spawn_receiver(
     const REPUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
     tokio::spawn(async move {
-        if let Err(e) = receive_loop(node, contacts, public_secrets, data_dir).await {
+        if let Err(e) = receive_loop(node, contacts, public_secrets, keystore, data_dir).await {
             eprintln!("受信を継続できません: {}", e);
         }
     });
@@ -1195,17 +1474,17 @@ fn spawn_receiver(
         node: Arc<NodeServer>,
         contacts: Vec<(aether_core::crypto::identity::NodeId, [u8; 32])>,
         public_secrets: std::collections::HashSet<[u8; 32]>,
+        keystore: Arc<aether_core::storage::keystore::KeyStore>,
         data_dir: PathBuf,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        use aether_core::crypto::session::Session;
-
         // Mailbox に載せる購読秘密。復元時に「どの秘密で開いたか」の照合にも使う。
         let secrets: HashMap<_, _> = contacts.iter().copied().collect();
-
-        // 私信の前方秘匿セッション（連絡先ごとのラチェット）を永続化する KeyStore
-        // （AETHER_PASSPHRASE があれば保存時暗号化）
-        let keystore = open_keystore(&data_dir)?;
         let me = node.descriptor.node_id;
+
+        // X3DH の受信側：自分の Identity と、公開済みプレキーの秘密。
+        // 初回接触（InitialMessage 付き）を respond して SK を復元するのに要る。
+        let identity = load_identity_shared(&data_dir)?;
+        let prekeys = keystore.load_prekeys()?.map(|(_, s)| s);
 
         // Gateway を確立する。リレーリストの収束を待ちつつ、死んだ gateway を引いても
         // ディレクトリから外して別候補を試す（establish_pull_session / eviction）。
@@ -1309,21 +1588,18 @@ fn spawn_receiver(
                 } else if let Ok(Some(body)) =
                     mailbox.reassemble_raw(&p.shards, mailbox_key, &secret)
                 {
-                    // 私信：生本体を復元し、連絡先の Session で開く（**前方秘匿**）
+                    // 私信：生本体を復元し、フレームを開く（**前方秘匿**）。
+                    // 初回接触なら InitialMessage を respond して X3DH SK でラチェットを立て、
+                    // 継続なら保存済み Session で開く（[`open_private_body`]）。
                     match secrets.iter().find(|(_, s)| **s == secret).map(|(id, _)| *id) {
-                        Some(contact) => {
-                            let mut session = keystore
-                                .load(&contact)?
-                                .unwrap_or_else(|| Session::bootstrap(&secret, &me, &contact));
-                            match session.open(&body, &[]) {
-                                Ok(pt) => {
-                                    keystore.save(&contact, &session)?; // 受信ラチェットを前進
-                                    Some(pt)
-                                }
-                                // 開けない＝自分宛てでない or 状態不一致。ラチェットを進めない
-                                Err(_) => None,
-                            }
-                        }
+                        Some(contact) => open_private_body(
+                            &keystore,
+                            &identity,
+                            prekeys.as_ref(),
+                            &me,
+                            &contact,
+                            &body,
+                        )?,
                         None => None,
                     }
                 } else {

@@ -98,7 +98,50 @@ impl Identity {
         h.update(shared.to_bytes());
         Ok(h.finalize().into())
     }
+
+    /// 秘密鍵をパスフレーズで暗号化してファイル用バイト列にする（押収対策 / 3-1）
+    ///
+    /// identity.key＝**ID そのもの**。押収されれば成りすまし＋全コンテンツ紐付けが可能。
+    /// Argon2id でパスフレーズを伸ばし ChaCha20-Poly1305 で秘密鍵を暗号化する。
+    ///
+    /// 形式: `[MAGIC(4)][salt(16)][nonce(12)][ciphertext(48)]` = 80 バイト。
+    /// 平文（ちょうど 32 バイト）とは長さとマジックで区別できる。
+    pub fn to_encrypted_bytes(&self, passphrase: &str) -> Result<Vec<u8>> {
+        use rand::RngCore;
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let key = crate::storage::at_rest::derive_key(passphrase, &salt)?;
+        let enc = crate::storage::at_rest::encrypt_value(&key, &self.keypair.to_bytes())?;
+
+        let mut out = Vec::with_capacity(4 + 16 + enc.len());
+        out.extend_from_slice(ENCRYPTED_IDENTITY_MAGIC);
+        out.extend_from_slice(&salt);
+        out.extend_from_slice(&enc);
+        Ok(out)
+    }
+
+    /// 暗号化された identity.key バイト列から復元する（3-1）
+    pub fn from_encrypted_bytes(raw: &[u8], passphrase: &str) -> Result<Self> {
+        if !Self::is_encrypted_bytes(raw) || raw.len() < 4 + 16 + 12 {
+            return Err(AetherError::Crypto("暗号化 identity.key の形式が不正です".into()));
+        }
+        let salt = &raw[4..20];
+        let key = crate::storage::at_rest::derive_key(passphrase, salt)?;
+        let secret = crate::storage::at_rest::decrypt_value(&key, &raw[20..])
+            .map_err(|_| AetherError::Crypto("identity.key: 誤ったパスフレーズです".into()))?;
+        Self::from_bytes(&secret)
+    }
+
+    /// バイト列が暗号化された identity.key か（マジック判定）
+    ///
+    /// 平文は**ちょうど 32 バイト**なので、80 バイト＋マジックの暗号化形式と衝突しない。
+    pub fn is_encrypted_bytes(raw: &[u8]) -> bool {
+        raw.len() >= 4 && &raw[0..4] == ENCRYPTED_IDENTITY_MAGIC
+    }
 }
+
+/// 暗号化 identity.key の先頭マジック（平文＝ちょうど32バイトと区別する）
+pub const ENCRYPTED_IDENTITY_MAGIC: &[u8; 4] = b"AEIK";
 
 /// NodeId (Ed25519 公開鍵) から X25519 公開鍵を導出する（Montgomery 変換）
 ///
@@ -139,6 +182,31 @@ mod tests {
 
         let carol = Identity::generate();
         assert_ne!(s1, alice.agree(&carol.public_id()).unwrap(), "相手が違えば秘密も違う");
+    }
+
+    #[test]
+    fn identity_key_encrypts_and_decrypts_with_the_passphrase() {
+        let id = Identity::generate();
+        let enc = id.to_encrypted_bytes("correct horse").unwrap();
+
+        // ディスク上に生の秘密鍵は現れない（平文32バイトとは別物・80バイト）
+        assert!(Identity::is_encrypted_bytes(&enc), "マジックが立っている");
+        assert_eq!(enc.len(), 4 + 16 + 12 + 32 + 16, "MAGIC+salt+nonce+ct+tag");
+        assert!(!enc.windows(32).any(|w| w == id.to_bytes()), "秘密鍵が平文で残らない");
+
+        // 同じパスフレーズで復元でき、同じ NodeId に戻る
+        let restored = Identity::from_encrypted_bytes(&enc, "correct horse").unwrap();
+        assert_eq!(restored.public_id(), id.public_id());
+
+        // 誤ったパスフレーズは拒否
+        assert!(Identity::from_encrypted_bytes(&enc, "wrong").is_err());
+    }
+
+    #[test]
+    fn plaintext_identity_is_not_mistaken_for_encrypted() {
+        // 平文の秘密鍵（32バイト）は暗号化形式と誤認されない
+        let id = Identity::generate();
+        assert!(!Identity::is_encrypted_bytes(&id.to_bytes()));
     }
 
     #[test]

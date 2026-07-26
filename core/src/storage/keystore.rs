@@ -11,20 +11,21 @@
 //! 「これから使う鍵（現在のチェーン鍵）」だけ。将来的にはこの DB 自体を
 //! パスフレーズ由来鍵で暗号化する（未実装）。
 
-use crate::crypto::cipher;
 use crate::crypto::identity::NodeId;
 use crate::crypto::session::Session;
+use crate::crypto::x3dh::{PreKeyBundle, PreKeySecrets};
 use crate::error::{AetherError, Result};
-use argon2::{Algorithm, Argon2, Params, Version};
-use rand::RngCore;
+use crate::storage::at_rest;
 use sled::Db;
 use std::path::Path;
 
 /// メタ情報（ソルト・カナリア）を置く別ツリー。main ツリーの `len()` に混ざらない
 const META_TREE: &str = "aether_keystore_meta";
-const SALT_KEY: &[u8] = b"salt";
-const CANARY_KEY: &[u8] = b"canary";
 const CANARY_PLAINTEXT: &[u8] = b"aether-keystore-canary-v1";
+
+/// 自分のプレキー秘密（X3DH の Bob 役）を置く別ツリー
+const PREKEY_TREE: &str = "aether_keystore_prekeys";
+const PREKEY_SELF_KEY: &[u8] = b"self";
 
 /// 連絡先 NodeId → 前方秘匿セッション（方向別 Double Ratchet）
 ///
@@ -49,40 +50,7 @@ impl KeyStore {
     /// カナリアで**誤ったパスフレーズを検出**して拒否する。
     pub fn open_encrypted(path: &Path, passphrase: &str) -> Result<Self> {
         let db = sled::open(path).map_err(|e| AetherError::Storage(e.to_string()))?;
-        let meta = db
-            .open_tree(META_TREE)
-            .map_err(|e| AetherError::Storage(e.to_string()))?;
-
-        // ソルト（初回生成・以降は再利用）
-        let salt = match meta.get(SALT_KEY).map_err(|e| AetherError::Storage(e.to_string()))? {
-            Some(s) => s.to_vec(),
-            None => {
-                let mut s = [0u8; 16];
-                rand::rngs::OsRng.fill_bytes(&mut s);
-                meta.insert(SALT_KEY, &s[..])
-                    .map_err(|e| AetherError::Storage(e.to_string()))?;
-                s.to_vec()
-            }
-        };
-
-        let key = derive_key(passphrase, &salt)?;
-
-        // カナリアでパスフレーズを検証する
-        match meta.get(CANARY_KEY).map_err(|e| AetherError::Storage(e.to_string()))? {
-            Some(enc) => {
-                let dec = decrypt_value(&key, &enc)
-                    .map_err(|_| AetherError::Crypto("KeyStore: 誤ったパスフレーズです".into()))?;
-                if dec != CANARY_PLAINTEXT {
-                    return Err(AetherError::Crypto("KeyStore: 誤ったパスフレーズです".into()));
-                }
-            }
-            None => {
-                let enc = encrypt_value(&key, CANARY_PLAINTEXT)?;
-                meta.insert(CANARY_KEY, enc)
-                    .map_err(|e| AetherError::Storage(e.to_string()))?;
-            }
-        }
-
+        let key = at_rest::unlock_db(&db, passphrase, META_TREE, CANARY_PLAINTEXT)?;
         Ok(Self {
             db,
             cipher_key: Some(key),
@@ -96,14 +64,14 @@ impl KeyStore {
 
     fn encode(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         match &self.cipher_key {
-            Some(k) => encrypt_value(k, plaintext),
+            Some(k) => at_rest::encrypt_value(k, plaintext),
             None => Ok(plaintext.to_vec()),
         }
     }
 
     fn decode(&self, raw: &[u8]) -> Result<Vec<u8>> {
         match &self.cipher_key {
-            Some(k) => decrypt_value(k, raw),
+            Some(k) => at_rest::decrypt_value(k, raw),
             None => Ok(raw.to_vec()),
         }
     }
@@ -134,6 +102,45 @@ impl KeyStore {
         Ok(Some(session))
     }
 
+    /// 自分のプレキー束と秘密（X3DH の Bob 役）を保存する（暗号化有効なら暗号化して保存）
+    ///
+    /// Bob は `start` 時に1回だけ生成し、これを**永続化して再起動を跨いで再利用**する。
+    /// 束（公開部）も一緒に持つ ── Kyber 公開鍵は秘密鍵から再導出できないため、再公開に要る。
+    /// 鍵を毎回作り直すと、束を取得済みの initiator の初回メッセージが復元できなくなる。
+    /// initiator が初回メッセージに添える [`InitialMessage`] をこの秘密で開いて同じ `SK` を得る。
+    ///
+    /// [`InitialMessage`]: crate::crypto::x3dh::InitialMessage
+    pub fn save_prekeys(&self, bundle: &PreKeyBundle, secrets: &PreKeySecrets) -> Result<()> {
+        let tree = self
+            .db
+            .open_tree(PREKEY_TREE)
+            .map_err(|e| AetherError::Storage(e.to_string()))?;
+        let bytes = bincode::serialize(&(bundle, secrets))
+            .map_err(|e| AetherError::Serialization(e.to_string()))?;
+        let stored = self.encode(&bytes)?;
+        tree.insert(PREKEY_SELF_KEY, stored)
+            .map_err(|e| AetherError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 自分のプレキー束と秘密を読む。無ければ `None`（初回生成が必要）
+    pub fn load_prekeys(&self) -> Result<Option<(PreKeyBundle, PreKeySecrets)>> {
+        let tree = self
+            .db
+            .open_tree(PREKEY_TREE)
+            .map_err(|e| AetherError::Storage(e.to_string()))?;
+        let Some(raw) = tree
+            .get(PREKEY_SELF_KEY)
+            .map_err(|e| AetherError::Storage(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let bytes = self.decode(&raw)?;
+        let pair = bincode::deserialize(&bytes)
+            .map_err(|e| AetherError::Storage(format!("Corrupt prekey state: {}", e)))?;
+        Ok(Some(pair))
+    }
+
     /// 連絡先が登録済みか
     pub fn contains(&self, contact: &NodeId) -> bool {
         self.db
@@ -158,37 +165,6 @@ impl KeyStore {
     pub fn is_empty(&self) -> bool {
         self.db.is_empty()
     }
-}
-
-/// パスフレーズ + ソルトから 32B 鍵を導出する（Argon2id）
-fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
-    // 32MiB / 3 パス。起動時に1回だけ払う。
-    let params = Params::new(32 * 1024, 3, 1, Some(32))
-        .map_err(|e| AetherError::Crypto(format!("Invalid Argon2 params: {}", e)))?;
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = [0u8; 32];
-    argon
-        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
-        .map_err(|e| AetherError::Crypto(format!("Argon2 failed: {}", e)))?;
-    Ok(key)
-}
-
-/// 値を暗号化して `[nonce(12)][ciphertext]` にする
-fn encrypt_value(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
-    let (ciphertext, nonce) = cipher::encrypt(key, plaintext)?;
-    let mut out = Vec::with_capacity(12 + ciphertext.len());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
-}
-
-/// `[nonce(12)][ciphertext]` を復号する
-fn decrypt_value(key: &[u8; 32], raw: &[u8]) -> Result<Vec<u8>> {
-    if raw.len() < 12 {
-        return Err(AetherError::Crypto("KeyStore value too short".into()));
-    }
-    let nonce: [u8; 12] = raw[0..12].try_into().expect("長さ確認済み");
-    cipher::decrypt(key, &nonce, &raw[12..])
 }
 
 #[cfg(test)]
@@ -231,6 +207,30 @@ mod tests {
         let (ks, _dir) = store();
         assert!(ks.load(&NodeId([1; 32])).unwrap().is_none());
         assert!(!ks.contains(&NodeId([1; 32])));
+    }
+
+    #[test]
+    fn prekeys_persist_and_survive_restart() {
+        use crate::crypto::identity::Identity;
+        use crate::crypto::x3dh;
+
+        let bob = Identity::generate();
+        let (bundle, secrets) = x3dh::generate_prekeys(&bob, false);
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let ks = KeyStore::open(dir.path()).unwrap();
+            assert!(ks.load_prekeys().unwrap().is_none(), "初回は未設定");
+            ks.save_prekeys(&bundle, &secrets).unwrap();
+        }
+
+        // 再起動して読み直す（束＋秘密の両方）
+        let ks = KeyStore::open(dir.path()).unwrap();
+        let (rb, rs) = ks.load_prekeys().unwrap().expect("保存したプレキーが読める");
+        assert_eq!(rs.signed_prekey_secret, secrets.signed_prekey_secret);
+        assert_eq!(rs.kem_secret, secrets.kem_secret);
+        assert_eq!(rb.signed_prekey, bundle.signed_prekey);
+        assert_eq!(rb.kem_public, bundle.kem_public);
     }
 
     #[test]
