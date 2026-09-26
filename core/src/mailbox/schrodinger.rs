@@ -740,6 +740,14 @@ impl SchrodingerMailbox {
     }
 
     /// 返信受信用の Inbound Tunnel を登録する
+    /// 認識に使う連絡先（共有秘密）を丸ごと差し替える
+    ///
+    /// 受信の途中で秘密が増える・変わる（会話が立って Hint 鍵チェーンが加わる、日付が
+    /// 変わる、友だちが増える）ときに使う。返信トンネルは秘密に依存しないので張り直さない。
+    pub fn replace_contacts(&self, contacts: HashMap<NodeId, SharedSecret>) {
+        *self.contacts.lock().unwrap() = contacts;
+    }
+
     pub fn register_inbound_tunnel(&self, tunnel: InboundTunnel) {
         self.inbound_tunnels.lock().unwrap().push(tunnel);
     }

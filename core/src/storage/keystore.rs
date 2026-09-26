@@ -33,6 +33,8 @@ const CANARY_PLAINTEXT: &[u8] = b"aether-keystore-canary-v1";
 /// 自分のプレキー秘密（X3DH の Bob 役）を置く別ツリー
 const PREKEY_TREE: &str = "aether_keystore_prekeys";
 const PREKEY_SELF_KEY: &[u8] = b"self";
+/// プレキー束を最後に置いた期間番号
+const PREKEY_PERIOD_KEY: &[u8] = b"published_period";
 
 /// 処理済みメッセージの目印を置く別ツリー（再配送・リプレイで同じ私信を二度開かないため）
 const SEEN_TREE: &str = "aether_keystore_seen";
@@ -214,6 +216,33 @@ impl KeyStore {
         let pair = bincode::deserialize(&bytes)
             .map_err(|e| AetherError::Storage(format!("Corrupt prekey state: {}", e)))?;
         Ok(Some(pair))
+    }
+
+    /// プレキー束を最後に置いた期間番号を記録する
+    pub fn save_prekey_period(&self, period: u64) -> Result<()> {
+        let tree = self
+            .db
+            .open_tree(PREKEY_TREE)
+            .map_err(|e| AetherError::Storage(e.to_string()))?;
+        tree.insert(PREKEY_PERIOD_KEY, self.encode(&period.to_be_bytes())?)
+            .map_err(|e| AetherError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// プレキー束を最後に置いた期間番号（一度も置いていなければ `None`）
+    pub fn load_prekey_period(&self) -> Result<Option<u64>> {
+        let tree = self
+            .db
+            .open_tree(PREKEY_TREE)
+            .map_err(|e| AetherError::Storage(e.to_string()))?;
+        let Some(raw) = tree
+            .get(PREKEY_PERIOD_KEY)
+            .map_err(|e| AetherError::Storage(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let bytes = self.decode(&raw)?;
+        Ok(<[u8; 8]>::try_from(bytes.as_slice()).ok().map(u64::from_be_bytes))
     }
 
     /// 連絡先が登録済みか

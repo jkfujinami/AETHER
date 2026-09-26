@@ -21,6 +21,43 @@ pub struct ClientConfig {
     pub mode: NodeMode,
     /// 網全体で揃える値。**既定値のまま使うこと**（テスト網だけが下げる）
     pub network: NetworkParams,
+    /// 匿名性のために入れる遅延の切り替え（使いやすさとの兼ね合い）
+    pub privacy: PrivacyOptions,
+}
+
+/// 匿名性のために入れる遅延の切り替え
+///
+/// どれも「いつ」を観測者から隠すための遅延で、切ると速くなる代わりに守りが弱まる。
+#[derive(Debug, Clone)]
+pub struct PrivacyOptions {
+    /// 自分宛ての Hint を見つけてから本体を取りに行くまで 0〜60 秒ずらす（既定: 有効）
+    ///
+    /// 切るとすぐ届く。代わりに、Hint を放流した送信者（や送信者と組んだ者）が
+    /// 「放流の直後に取得が出たか」をガードや回線の照会と突き合わせて、受信者を
+    /// 特定しやすくなる。
+    pub delay_fetch: bool,
+    /// 本体を置いてから Hint を放流するまで、網の Hint の流量に応じて遅らせる（既定: 有効）
+    ///
+    /// 大きな本体ほど長く待つ（最大 6 時間）。切るとすぐ放流する。代わりに、
+    /// 「大きな送信の直後に Hint が出た」ことから送信と Hint を結びつけやすくなる。
+    pub delay_release: bool,
+    /// 在席を隠す：起動後に最初にプレキー束を置くのを 0〜5 分ずらす（既定: 無効）
+    ///
+    /// 束の置き場所は NodeId から誰でも計算できるので、その保持者は置かれた時刻から
+    /// 「この人が今起動した」を知れる（公開のリレー一覧の出入りと突き合わせると IP の
+    /// 絞り込みに使える）。有効にすると起動直後の数分は初回接触を受けられないことがある。
+    /// どちらでも、今の期間にも前の期間にも束を置いていなければすぐに置く。
+    pub hide_presence: bool,
+}
+
+impl Default for PrivacyOptions {
+    fn default() -> Self {
+        Self {
+            delay_fetch: true,
+            delay_release: true,
+            hide_presence: false,
+        }
+    }
 }
 
 /// 網全体で揃える値

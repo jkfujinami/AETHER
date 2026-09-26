@@ -7,7 +7,7 @@
 //! ```
 
 use aether_client::{
-    AetherClient, Board, ClientConfig, ClientEvent, Contact, KeyFiles, MessageSource, NodeMode,
+    AetherClient, Board, ClientConfig, PrivacyOptions, ClientEvent, Contact, KeyFiles, MessageSource, NodeMode,
     PublicPost, RelayOptions, event_channel, parse_hex32,
 };
 use clap::{Parser, Subcommand};
@@ -44,6 +44,18 @@ struct Cli {
     /// データディレクトリ（鍵・Mailbox・ガード情報）
     #[arg(long, default_value = "./aether-data", global = true)]
     data_dir: PathBuf,
+
+    /// 受信した Hint の本体をすぐ取りに行く（0〜60 秒のずらしをしない）
+    ///
+    /// 速く届く代わりに、送信者が「放流の直後に取得が出たか」から受信者を特定しやすくなる。
+    #[arg(long, global = true)]
+    no_fetch_delay: bool,
+
+    /// 本体を置いたらすぐ Hint を放流する（流量に応じた待ちをしない）
+    ///
+    /// 速く届く代わりに、大きな送信と Hint を結びつけやすくなる。
+    #[arg(long, global = true)]
+    no_release_delay: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -109,6 +121,13 @@ enum Commands {
         /// （弱いフィンガープリント）。
         #[arg(long)]
         epoch_beacon: bool,
+
+        /// 在席を隠す：起動後に最初にプレキー束を置くのを 0〜5 分ランダムに遅らせる
+        ///
+        /// 束の保持者に「今起動した」を悟られにくくなる代わりに、起動直後の数分は
+        /// 初回接触を受けられないことがある（既定は無効）。
+        #[arg(long)]
+        hide_presence: bool,
     },
     /// メッセージを送る（私信 or 公開）
     ///
@@ -231,8 +250,18 @@ fn env_passphrase() -> Option<String> {
     std::env::var("AETHER_PASSPHRASE").ok().filter(|p| !p.is_empty())
 }
 
+/// 全体のフラグから匿名性の遅延の切り替えを作る（在席を隠すかは `start` だけ）
+fn privacy_of(cli: &Cli) -> PrivacyOptions {
+    PrivacyOptions {
+        delay_fetch: !cli.no_fetch_delay,
+        delay_release: !cli.no_release_delay,
+        ..Default::default()
+    }
+}
+
 /// 一回限りのクライアントとして網に参加する（送信・検索・取得）
 async fn join_ephemeral(
+    privacy: PrivacyOptions,
     data_dir: PathBuf,
     port: u16,
     connect: &str,
@@ -250,6 +279,7 @@ async fn join_ephemeral(
             min_relays,
             mode: NodeMode::Ephemeral,
             network: Default::default(),
+            privacy,
         },
         events,
     )
@@ -370,7 +400,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     if secret.is_none() {
                         println!("相手の NodeId から鍵を自動合意します（--secret 不要）");
                     }
-                    let client = join_ephemeral(cli.data_dir.clone(), *port, connect, *min_relays).await?;
+                    let client = join_ephemeral(privacy_of(&cli), cli.data_dir.clone(), *port, connect, *min_relays).await?;
                     let r = client.send_private(target, secret, &content).await?;
                     // 書き出し終える前に終了すると、置いたはずのシャードが失われる
                     client.flush().await;
@@ -387,7 +417,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         None => Vec::new(),
                     };
                     println!("板 #{} に書き込みます", board_id.fingerprint());
-                    let client = join_ephemeral(cli.data_dir.clone(), *port, connect, *min_relays).await?;
+                    let client = join_ephemeral(privacy_of(&cli), cli.data_dir.clone(), *port, connect, *min_relays).await?;
                     let r = client
                         .publish(PublicPost {
                             board: board_id,
@@ -414,7 +444,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             port,
             min_relays,
         } => {
-            let client = join_ephemeral(cli.data_dir.clone(), *port, connect, *min_relays).await?;
+            let client = join_ephemeral(privacy_of(&cli), cli.data_dir.clone(), *port, connect, *min_relays).await?;
             let found = client.search(&aether_client::resolve_board(board)?).await?;
             if found.is_empty() {
                 println!("該当なし（まだ公開されていないか、保持者に届いていません）");
@@ -432,7 +462,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             min_relays,
         } => {
             let content_ref = parse_hex32(r#ref, "--ref")?;
-            let client = join_ephemeral(cli.data_dir.clone(), *port, connect, *min_relays).await?;
+            let client = join_ephemeral(privacy_of(&cli), cli.data_dir.clone(), *port, connect, *min_relays).await?;
             match client.get(&aether_client::resolve_board(board)?, content_ref).await? {
                 Some(fetched) => match out {
                     Some(path) => {
@@ -455,6 +485,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             contacts,
             subscribe,
             epoch_beacon,
+            hide_presence,
         } => {
             println!("Node ID: {}", keys.load_identity()?.public_id());
             let contacts = contacts
@@ -478,6 +509,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         epoch_beacon: *epoch_beacon,
                     }),
                     network: Default::default(),
+                    privacy: PrivacyOptions {
+                        hide_presence: *hide_presence,
+                        ..privacy_of(&cli)
+                    },
                 },
                 events,
             )

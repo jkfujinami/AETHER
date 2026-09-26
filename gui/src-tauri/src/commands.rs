@@ -84,6 +84,19 @@ pub struct ConnectParams {
     relay: bool,
     /// リレーとして到達可能と宣言するアドレス（空なら STUN で判定）
     advertise: Option<String>,
+    /// 在席を隠す（起動後のプレキー束の公開を遅らせる。既定は無効）
+    #[serde(default)]
+    hide_presence: bool,
+    /// 受信した本体を取りに行くのを 0〜60 秒ずらす（既定は有効）
+    #[serde(default = "yes")]
+    delay_fetch: bool,
+    /// Hint の放流を流量に応じて遅らせる（既定は有効）
+    #[serde(default = "yes")]
+    delay_release: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Serialize)]
@@ -151,6 +164,11 @@ pub async fn connect(
             min_relays: 3,
             mode,
             network: Default::default(),
+            privacy: aether_client::PrivacyOptions {
+                delay_fetch: params.delay_fetch,
+                delay_release: params.delay_release,
+                hide_presence: params.relay && params.hide_presence,
+            },
         },
         events,
     )

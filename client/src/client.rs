@@ -27,6 +27,8 @@ pub struct AetherClient {
     pub(crate) events: EventSender,
     pub(crate) min_relays: usize,
     pub(crate) relay_mode: bool,
+    /// 匿名性のための遅延の切り替え
+    pub(crate) privacy: crate::config::PrivacyOptions,
     /// 1 プロセス 1 ハンドル（sled の排他ロック）。私信を使うときに開く
     keystore: std::sync::Mutex<Option<Arc<KeyStore>>>,
     /// 書き出し待ちの送信回路（[`AetherClient::flush`] で待つ）
@@ -220,6 +222,7 @@ impl AetherClient {
             events,
             min_relays: config.min_relays,
             relay_mode,
+            privacy: config.privacy.clone(),
             keystore: std::sync::Mutex::new(None),
             pending_flush: std::sync::Mutex::new(Vec::new()),
             receiver: std::sync::Mutex::new(None),

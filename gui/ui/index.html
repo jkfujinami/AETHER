@@ -64,6 +64,16 @@
               <input id="advertise" placeholder="例: 127.0.0.1:19010" spellcheck="false">
             </label>
 
+            <fieldset>
+              <legend>匿名性のための遅延（切ると速くなる代わりに守りが弱まります）</legend>
+              <label class="choice"><input type="checkbox" id="delay-fetch" checked>
+                <span>受け取りをずらす ── 届いたトークを取りに行くのを 0〜60 秒ずらします（送り主に受け取った人を特定されにくくなります）</span></label>
+              <label class="choice"><input type="checkbox" id="delay-release" checked>
+                <span>送信の告知を遅らせる ── 大きなファイルほど、告知（Hint）を流すまで待ちます（送信と告知を結びつけられにくくなります）</span></label>
+              <label class="choice" id="presence-row"><input type="checkbox" id="hide-presence">
+                <span>在席を隠す ── 起動直後の数分はトークの初回接触を受けられないことがあります（参加したことを悟られにくくなります）</span></label>
+            </fieldset>
+
             <button class="primary" type="submit" id="btn-connect">参加する</button>
           </form>
         </div>

@@ -24,6 +24,7 @@
 //!         min_relays: 3,
 //!         mode: NodeMode::Ephemeral,
 //!         network: Default::default(),
+//!         privacy: Default::default(),
 //!     },
 //!     event_channel(),
 //! )
@@ -51,7 +52,7 @@ pub mod talks;
 pub use board::{Board, Post, Thread};
 pub use boards::{BoardId, BoardInfo, builtin_boards, resolve_board};
 pub use client::{AetherClient, Status};
-pub use config::{ClientConfig, NetworkParams, NodeMode, RelayOptions};
+pub use config::{ClientConfig, NetworkParams, NodeMode, PrivacyOptions, RelayOptions};
 pub use error::{ClientError, Result};
 pub use events::{ClientEvent, EventSender, MessageSource, SendState, event_channel};
 pub use fetch::Fetched;

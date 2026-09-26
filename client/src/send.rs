@@ -112,6 +112,7 @@ impl AetherClient {
                 Session::initiator(&sk, &bundle.signed_prekey, init)
             }
         };
+        let new_conversation = !ks.contains(&to);
         // Hint（宛先の認識・本体の置き場所）の秘密。会話が立っていれば日ごとの鍵チェーン、
         // 初回接触の間は静的な DH（相手はまだ SK を持っていない）
         let hint_secret = session
@@ -123,6 +124,10 @@ impl AetherClient {
         // シャードが残っていれば、二つの暗号文から平文の差が漏れる。受け取る側は
         // 飛んだ番号を取りこぼしとして扱えるので、進めすぎても会話は壊れない
         ks.save(&to, &session)?;
+        if new_conversation {
+            // 相手の返事は Hint 鍵チェーンで届く。受信中なら認識できるよう知らせる
+            self.subscriptions_changed();
+        }
 
         // フレーム: 相手から返事が来るまでは初回メッセージを添える [0x01][InitialMessage][sealed]。
         // 最初の 1 通を取りこぼされても、後の 1 通で相手はセッションを立てられる。
@@ -299,7 +304,12 @@ impl AetherClient {
             other => events::progress(&self.events, format!("Hint 放流: {:?}", other)),
         }
 
-        let delay = policy.delay_for(profile);
+        // 切り替えで無効なら待たない（PrivacyOptions::delay_release）
+        let delay = if self.privacy.delay_release {
+            policy.delay_for(profile)
+        } else {
+            Duration::ZERO
+        };
         if !delay.is_zero() {
             events::progress(&self.events, format!("{:?} 待機してから放流します", delay));
             self.send_status(ticket, SendState::Delayed { seconds: delay.as_secs().max(1) });

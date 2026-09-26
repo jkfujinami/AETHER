@@ -115,7 +115,9 @@ listen("aether-event", ({ payload }) => {
 
 document.querySelectorAll('input[name="mode"]').forEach((r) =>
   r.addEventListener("change", () => {
-    $("advertise-row").hidden = document.querySelector('input[name="mode"]:checked').value !== "relay";
+    const relay = document.querySelector('input[name="mode"]:checked').value === "relay";
+    $("advertise-row").hidden = !relay;
+    $("presence-row").hidden = !relay;
   }),
 );
 
@@ -146,6 +148,9 @@ $("connect-form").addEventListener("submit", async (ev) => {
     passphrase: passphrase || null,
     relay,
     advertise: relay ? $("advertise").value || null : null,
+    hide_presence: relay && $("hide-presence").checked,
+    delay_fetch: $("delay-fetch").checked,
+    delay_release: $("delay-release").checked,
   };
   const res = await busy("網に参加しています…", () => invoke("connect", { params }));
   if (!res) return;

@@ -27,8 +27,14 @@ const SESSION_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const SESSION_GRACE: Duration = Duration::from_secs(3 * 60);
 /// 起動直後、最初のトンネルが張れるまで粘る時間
 const FIRST_SESSION_WAIT: Duration = Duration::from_secs(60);
-/// シャードが揃わないまま待つ上限（揃わない＝保持者が落ちた）。取りに行った時点から数える
-const PENDING_TIMEOUT: Duration = Duration::from_secs(120);
+/// 取りに行ってからシャードが揃うまで待つ時間。過ぎたら受信トンネルを張り直して取り寄せ直す
+///
+/// 返信トンネルの途中のリレーが再起動すると、トンネルの登録（メモリにしか無い）が消えて
+/// 返信が黙って捨てられる。定期の張り替え（10 分）まで待つと、その間に取りに行った本体は
+/// 失われる（配送済みの Hint は二度と届かない）。
+const PENDING_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// 1 通の本体を取りに行く回数の上限（揃わなければ保持者が落ちたとみなして諦める）
+const MAX_FETCH_ATTEMPTS: u32 = 3;
 /// 公開コンテンツを保持者として置き直す間隔（18.3-C）
 ///
 /// 保持者は取得のたびに TTL（既定 1 週間）を延ばすので、置き直しは保持者の入れ替わりに
@@ -37,13 +43,16 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(120);
 /// Hint の再放流（18.3-A）はしない。発見は索引（pull）が担い、再放流すると取得した人の数
 /// だけ同じ投稿の Hint が網全体に流れ続ける。
 const RESEED_INTERVAL: Duration = Duration::from_secs(6 * 3600);
-/// 起動後、最初にプレキー束を置くまでの最大の遅れ
+/// 在席を隠す設定のとき、起動後に最初にプレキー束を置くまでの最大の遅れ
 ///
 /// 束の置き場所は NodeId から誰でも計算できるので、その保持者は「いつ置き直されたか」を
 /// 見られる。以前は 10 分ごとに置き直していて、保持者に在席を 10 分刻みで知らせていた
 /// （公開リレー一覧の出入りと突き合わせると IP を絞り込める）。いまは起動時に一度、
 /// 以後は置き場所が変わる期間ごとに一度、期間内のランダムな時刻に置く。
+/// 起動時の遅れは [`crate::PrivacyOptions::hide_presence`] で有効にする（既定は無効）。
 const PREKEY_FIRST_DELAY_MAX: Duration = Duration::from_secs(300);
+/// 起動後の 1 回目のあと、リレー一覧が揃ってから置き直すまでの最短の待ち（最長はこの 3 倍）
+const PREKEY_SETTLE_MIN: Duration = Duration::from_secs(60);
 /// プレキー束を置けなかったときの再試行間隔
 const PREKEY_RETRY: Duration = Duration::from_secs(300);
 
@@ -102,7 +111,8 @@ pub(crate) struct Subscriptions {
 /// 受信ループと共有する状態
 pub(crate) struct Receiver {
     subs: std::sync::Mutex<Subscriptions>,
-    /// 購読が変わった。次の周回でトンネルを張り替える（新しい秘密で Hint を拾うため）
+    /// 認識に使う秘密が変わった（友だちの追加・会話の成立・日付の変化）。
+    /// 次の周回で、受信中の Mailbox の連絡先を差し替える
     changed: std::sync::atomic::AtomicBool,
 }
 
@@ -121,7 +131,10 @@ struct PendingBody {
     /// mailbox_key の素。再放流 (18.3-A) に要る
     nonce: [u8; 32],
     shards: Vec<Vec<u8>>,
-    since: Instant,
+    /// 取りに行った回数
+    attempts: u32,
+    /// この時刻までに揃わなければ取り寄せ直す
+    retry_at: Instant,
 }
 
 impl AetherClient {
@@ -176,6 +189,15 @@ impl AetherClient {
     /// 受信中に私信の相手を増やす（友だち追加）
     ///
     /// 受信していなければ何もしない。次の周回で受信トンネルを張り替えて反映する。
+    /// 認識に使う秘密が変わったことを受信ループへ知らせる（送信で会話を始めたときなど）
+    pub(crate) fn subscriptions_changed(&self) {
+        if let Some(receiver) = self.receiver.lock().unwrap().as_ref() {
+            receiver
+                .changed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     pub fn add_contact(&self, contact: Contact) -> Result<()> {
         let Some(receiver) = self.receiver.lock().unwrap().clone() else {
             return Ok(());
@@ -193,13 +215,33 @@ impl AetherClient {
         self.ensure_prekeys()?;
         let this = self.clone();
         tokio::spawn(async move {
-            // 起動直後に置くと「この人が今起動した」が保持者に見えるので、少しずらす
-            tokio::time::sleep(random_below(PREKEY_FIRST_DELAY_MAX)).await;
+            // 在席を隠す設定なら、起動直後に置かず少しずらす（「この人が今起動した」が
+            // 保持者に見えるため）。ただし今の期間にも前の期間にも束を置いていなければ
+            // （初めての起動・長く離れていた）、置くまで誰からも初回接触を受けられない
+            // ので、設定に関わらずすぐに置く
+            let period = SchrodingerMailbox::prekey_period(aether_core::protocol::hint::current_timestamp());
+            let reachable = this
+                .keystore()
+                .and_then(|ks| Ok(ks.load_prekey_period()?))
+                .ok()
+                .flatten()
+                .is_some_and(|last| last + 1 >= period);
+            if this.privacy.hide_presence && reachable {
+                tokio::time::sleep(random_below(PREKEY_FIRST_DELAY_MAX)).await;
+            }
+            // 起動直後の 1 回目は、リレー一覧が出揃う前に置くことがある（保持者の計算が
+            // 取りに来る側とずれる）。1 回目の後、一覧が揃ってからもう一度だけ早めに置き直す
+            let mut settled = false;
             loop {
                 let wait = match this.publish_prekeys_once().await {
                     Ok(()) => {
                         events::progress(&this.events, "プレキー束を公開しました");
-                        until_random_point_in_next_period(aether_core::protocol::hint::current_timestamp())
+                        if settled {
+                            until_random_point_in_next_period(aether_core::protocol::hint::current_timestamp())
+                        } else {
+                            settled = true;
+                            PREKEY_SETTLE_MIN + random_below(PREKEY_SETTLE_MIN * 2)
+                        }
                     }
                     Err(e) => {
                         events::warning(&this.events, format!("プレキー公開に失敗: {}", e));
@@ -210,6 +252,15 @@ impl AetherClient {
             }
         });
         Ok(())
+    }
+
+    /// 自分のプレキー束をいますぐ 1 回置く（試験・初回設定用）
+    ///
+    /// 通常は [`start_prekey_publisher`](Self::start_prekey_publisher) が、在席を悟られない
+    /// よう遅らせて置く。すぐに初回接触を受けたい場合に使う。
+    pub async fn publish_prekeys_now(&self) -> Result<()> {
+        self.ensure_prekeys()?;
+        self.publish_prekeys_once().await
     }
 
     async fn publish_prekeys_once(&self) -> Result<()> {
@@ -231,6 +282,7 @@ impl AetherClient {
         );
         let period = SchrodingerMailbox::prekey_period(aether_core::protocol::hint::current_timestamp());
         mailbox.publish_prekey_bundle(&bundle, period).await?;
+        self.keystore()?.save_prekey_period(period)?;
         // 書いた直後に接続を閉じるとシャードが失われる
         tokio::time::sleep(Duration::from_secs(2)).await;
         Ok(())
@@ -303,7 +355,7 @@ impl AetherClient {
                         {
                             // **すぐには取りに行かない。** Hint の放流直後に取得が出ると、
                             // 放流時刻とガードの観測を突き合わせて受信者を特定できる
-                            let delay = fetch_jitter();
+                            let delay = if self.privacy.delay_fetch { fetch_jitter() } else { Duration::ZERO };
                             events::progress(
                                 &self.events,
                                 format!("自分宛ての Hint を検出。{} 秒後に本体を取り寄せます", delay.as_secs()),
@@ -312,7 +364,8 @@ impl AetherClient {
                                 secret,
                                 nonce,
                                 shards: Vec::new(),
-                                since: Instant::now() + delay,
+                                attempts: 1,
+                                retry_at: Instant::now() + delay + PENDING_RETRY_AFTER,
                             });
                             tokio::spawn(async move {
                                 tokio::time::sleep(delay).await;
@@ -344,10 +397,18 @@ impl AetherClient {
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             }
 
-            // --- トンネルの張り替え（定期、または友だちが増えたとき）---
-            if sessions[0].opened.elapsed() > SESSION_LIFETIME
-                || receiver.changed.swap(false, Ordering::SeqCst)
-            {
+            // --- 認識に使う秘密の差し替え（友だちの追加・会話の成立・日付の変化）---
+            // トンネルを張り直すまで待つと、その間に届いた Hint を認識できずに取りこぼす
+            // （配送済みの Hint は二度と届かない）。張り直さずにその場で差し替える
+            if receiver.changed.swap(false, Ordering::SeqCst) {
+                let secrets = secrets_now();
+                for s in &sessions {
+                    s.mailbox.replace_contacts(secrets.clone());
+                }
+            }
+
+            // --- トンネルの張り替え（定期）---
+            if sessions[0].opened.elapsed() > SESSION_LIFETIME {
                 match self.open_receive_session(&secrets_now()).await {
                     Ok(s) => sessions.insert(0, s),
                     Err(e) => events::warning(&self.events, format!("受信トンネルの張り替えに失敗: {}", e)),
@@ -358,6 +419,31 @@ impl AetherClient {
                 .take_while(|s| s.opened.elapsed() < SESSION_LIFETIME + SESSION_GRACE)
                 .count());
 
+            // --- 揃わない本体の取り寄せ直し（返信トンネルが死んでいるとみなして張り直す）---
+            let now = Instant::now();
+            let due: Vec<([u8; 32], [u8; 32])> = pending
+                .iter()
+                .filter(|(_, p)| now >= p.retry_at && p.attempts < MAX_FETCH_ATTEMPTS)
+                .map(|(k, p)| (*k, p.secret))
+                .collect();
+            if !due.is_empty() {
+                events::progress(&self.events, "本体が届かないので、受信トンネルを張り直して取り寄せ直します");
+                match self.open_receive_session(&secrets_now()).await {
+                    Ok(s) => sessions.insert(0, s),
+                    Err(e) => events::warning(&self.events, format!("受信トンネルの張り替えに失敗: {}", e)),
+                }
+                for (key, secret) in due {
+                    if let Some(p) = pending.get_mut(&key) {
+                        p.attempts += 1;
+                        p.retry_at = Instant::now() + PENDING_RETRY_AFTER;
+                    }
+                    let current = sessions[0].mailbox.clone();
+                    tokio::spawn(async move {
+                        let _ = current.request_object(&key, &secret).await;
+                    });
+                }
+            }
+
             // --- 届いた返信を集める ---
             let mut decrypted = Vec::new();
             for s in &sessions {
@@ -366,7 +452,7 @@ impl AetherClient {
                     decrypted.extend(s.mailbox.decrypt_replies(&raw));
                 }
             }
-            pending.retain(|_, p| p.since.elapsed() < PENDING_TIMEOUT);
+            pending.retain(|_, p| p.attempts < MAX_FETCH_ATTEMPTS || Instant::now() < p.retry_at);
             if decrypted.is_empty() {
                 continue;
             }
