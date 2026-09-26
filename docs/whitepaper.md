@@ -235,12 +235,14 @@ content.
   a static pre-shared secret means one seizure decrypts *all* past
   messages; forward secrecy bounds that to messages after the last ratchet
   step. The X3DH implementation additionally combines X25519 with a Kyber768
-  (ML-KEM) key encapsulation, i.e. a hybrid classical/post-quantum initial
+  key encapsulation (round-3 Kyber via the `pqcrypto-kyber` crate, not the
+  final ML-KEM / FIPS 203), i.e. a hybrid classical/post-quantum initial
   key agreement: the X25519 DH outputs and the KEM shared secret are
   concatenated after a 32-byte `0xFF` prefix (as in Signal's X3DH) and fed
-  to HKDF-SHA256 (`kdf_sk` in `core/src/crypto/x3dh.rs`). This is similar
-  in spirit to Signal's PQXDH but is not PQXDH, and it has not been
-  reviewed; it is a priority for cryptographic review.
+  to HKDF-SHA256 (`kdf_sk` in `core/src/crypto/x3dh.rs`). Only this initial
+  agreement is hybrid; the Double Ratchet that follows uses classical
+  X25519. This is similar in spirit to Signal's PQXDH but is not PQXDH,
+  and it has not been reviewed; it is a priority for cryptographic review.
 - **Epoch beacon** (`core/src/net/epoch.rs`, **opt-in, off by default**):
   when enabled, ring positions mix in a seed rotated daily, drawn from the public drand ("League of Entropy")
   randomness beacon, specifically to stop an adversary from grinding

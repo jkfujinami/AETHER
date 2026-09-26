@@ -28,7 +28,7 @@ rcgen = "0.13"  # 自己署名証明書生成
 # 暗号系
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-pqcrypto-kyber = "0.8"  # Kyber (ML-KEM)
+pqcrypto-kyber = "0.8"  # Kyber768（Round 3。最終規格の ML-KEM / FIPS 203 ではない）
 pqcrypto-traits = "0.3"  # KEM の as_bytes/from_bytes トレイト
 chacha20poly1305 = "0.10"
 chacha20 = "0.9"  # 長さを変えないストリーム暗号（Onion の固定長化）
