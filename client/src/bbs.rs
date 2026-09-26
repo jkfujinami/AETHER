@@ -8,8 +8,20 @@
 //!   導出した署名鍵で書き込みに署名し、その公開鍵の短縮を ID として見せる。
 //!   他人は同じ ID を騙れない（署名が通らない）。
 //!
-//! 押収で端末の秘密（bbs.key）を読まれると「このスレのこの ID はこの端末」と再計算できる。
-//! ID を持つ以上避けられないので、パスフレーズで暗号化して置く。
+//! # スレごとの秘密・日替わり ID
+//!
+//! 以前は端末に 1 つの秘密（bbs.key）から全スレの ID 鍵を導いていた。押収で
+//! その 1 つを読まれると、全スレの自分の ID を計算し直せて、署名でどの投稿も
+//! 「この端末が書いた」と証明できてしまう（過去の全投稿の作者性が一括で割れる）。
+//!
+//! 今はスレごとに**ランダムな**秘密を作り、`(thread → secret)` を暗号化して保存する。
+//! ID の署名鍵はさらに**日替わり**（`H(domain ‖ thread_secret ‖ day)`）にする。
+//! 同じスレ・同じ日なら同じ ID、日をまたぐと変わる（2ch の「トリップ」と同じ発想）。
+//! これで押収されても、割れるのは「そのスレを最近使ったこと」までで、
+//! 過去の投稿すべての作者性が一括で証明されることはない。
+//!
+//! [`BBS_THREAD_SECRET_TTL`] を過ぎて書き込みの無いスレの秘密は掃除する。
+//! 消えた後にまた書けば新しい ID になる。
 
 use crate::board::build_board;
 use crate::boards::BoardId;
@@ -35,6 +47,14 @@ const ANCHOR_REF_HEX: usize = 16;
 
 /// 1 レスの本文の上限（文字）。長文はチャンク化されて「スレを開く」で取れなくなる
 pub const MAX_BODY_CHARS: usize = 4000;
+
+/// これだけ書き込みが無いスレの秘密は消す（押収時に割れる範囲を狭める）
+///
+/// 消えた後にまた書けば、新しい秘密から新しい ID が始まる。
+pub const BBS_THREAD_SECRET_TTL: u64 = 7 * 86_400;
+
+/// 1 日の秒数（ID を日替わりにする単位）
+const DAY_SECS: u64 = 86_400;
 
 /// 名前欄（名無しさんだけ）
 pub const ANONYMOUS_NAME: &str = "名無しさん";
@@ -107,34 +127,94 @@ pub struct ReplyContext {
     pub refs: Vec<String>,
 }
 
+/// スレごとの秘密 1 件（`bbs_threads.bin` に保存する）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ThreadSecretEntry {
+    secret: [u8; 32],
+    /// 最後に書き込んだ時刻 (UNIX 秒)。[`BBS_THREAD_SECRET_TTL`] を過ぎたら掃除する
+    last_used: u64,
+}
+
+/// 保存形式（スレの識別子 → 秘密）
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ThreadSecrets {
+    threads: HashMap<[u8; 32], ThreadSecretEntry>,
+}
+
 impl KeyFiles {
-    fn bbs_key_path(&self) -> std::path::PathBuf {
+    /// 廃止した「端末単位の掲示板秘密」（読んだら消す）
+    ///
+    /// これ 1 つから全スレの ID を導いていたため、押収されると全投稿の作者性が
+    /// 一括で割れた。読み直す必要は無い（ID の導出方式ごと変えたため）ので、
+    /// 見つけたら消すだけでよい。
+    fn legacy_bbs_key_path(&self) -> std::path::PathBuf {
         self.data_dir().join("bbs.key")
     }
 
-    /// 掲示板 ID の元になる端末の秘密（無ければ作る）
-    fn load_or_create_bbs_secret(&self) -> Result<[u8; 32]> {
-        let path = self.bbs_key_path();
-        let key = if path.exists() {
-            self.read_key(&path)?
-        } else {
-            let k = Identity::generate();
-            self.write_key(&path, &k)?;
-            k
+    fn bbs_threads_path(&self) -> std::path::PathBuf {
+        self.data_dir().join("bbs_threads.bin")
+    }
+
+    fn load_thread_secrets(&self) -> Result<ThreadSecrets> {
+        let _ = std::fs::remove_file(self.legacy_bbs_key_path());
+        match self.read_secure(&self.bbs_threads_path())? {
+            Some(bytes) => Ok(bincode::deserialize(&bytes).unwrap_or_default()),
+            None => Ok(ThreadSecrets::default()),
+        }
+    }
+
+    fn save_thread_secrets(&self, secrets: &ThreadSecrets) -> Result<()> {
+        let bytes = bincode::serialize(secrets)
+            .map_err(|e| ClientError::invalid(format!("スレの秘密を保存できません: {}", e)))?;
+        self.write_secure(&self.bbs_threads_path(), &bytes)
+    }
+
+    /// スレの ID 鍵の元になる秘密を得る（無ければランダムに作る）
+    ///
+    /// 呼ぶたびに `last_used` を更新して延命する。同時に、
+    /// [`BBS_THREAD_SECRET_TTL`] を過ぎて書き込みの無い他スレの秘密を掃除する
+    /// （書き込み時・読み込み時どちらでも掃除されるよう、ここで一括して行う）。
+    fn thread_secret(&self, thread: &[u8; 32]) -> Result<[u8; 32]> {
+        let now = aether_core::protocol::hint::current_timestamp();
+        let mut secrets = self.load_thread_secrets()?;
+        secrets
+            .threads
+            .retain(|_, e| now.saturating_sub(e.last_used) < BBS_THREAD_SECRET_TTL);
+
+        let secret = match secrets.threads.get_mut(thread) {
+            Some(entry) => {
+                entry.last_used = now;
+                entry.secret
+            }
+            None => {
+                let secret: [u8; 32] = rand::random();
+                secrets.threads.insert(*thread, ThreadSecretEntry { secret, last_used: now });
+                secret
+            }
         };
-        Ok(key.to_bytes())
+        self.save_thread_secrets(&secrets)?;
+        Ok(secret)
     }
 }
 
-/// スレ内 ID の署名鍵（端末の秘密 × スレ）
-fn thread_key(secret: &[u8; 32], thread: &[u8; 32]) -> Identity {
+/// スレ内 ID の署名鍵（スレの秘密 × 日）
+///
+/// 日をまたぐと変わる（2ch のトリップと同じ発想）。`day` は
+/// `UNIX 秒 / 86400`。読む側は署名の検証しかしない（[`open`]）ので、
+/// この導出が必要なのは書き込む本人だけ。
+fn thread_key(secret: &[u8; 32], day: u64) -> Identity {
     let seed: [u8; 32] = Sha256::new()
         .chain_update(ID_KEY_DOMAIN)
         .chain_update(secret)
-        .chain_update(thread)
+        .chain_update(day.to_le_bytes())
         .finalize()
         .into();
     Identity::from_bytes(&seed).expect("32 バイトの種")
+}
+
+/// 現在の「日」（UNIX 秒 / 86400）
+fn current_day() -> u64 {
+    aether_core::protocol::hint::current_timestamp() / DAY_SECS
 }
 
 fn signing_message(thread: &[u8; 32], body: &str) -> Vec<u8> {
@@ -155,7 +235,7 @@ fn display_id(id_pub: &[u8; 32]) -> String {
 }
 
 fn seal(secret: &[u8; 32], thread: [u8; 32], body: String) -> Vec<u8> {
-    let key = thread_key(secret, &thread);
+    let key = thread_key(secret, current_day());
     let sig = key.sign(&signing_message(&thread, &body));
     let env = Envelope {
         thread,
@@ -375,8 +455,8 @@ impl AetherClient {
             return Err(ClientError::invalid("スレタイを入れてください"));
         }
         check_body(body)?;
-        let secret = self.keys.load_or_create_bbs_secret()?;
         let thread: [u8; 32] = rand::random();
+        let secret = self.keys.thread_secret(&thread)?;
         let report = self
             .publish(PublicPost {
                 board: *board,
@@ -390,7 +470,7 @@ impl AetherClient {
             .ok_or_else(|| ClientError::invalid("スレの ref を得られませんでした"))?;
 
         let refs = vec![root_ref.clone()];
-        let first = own_res(1, &root_ref, &secret, &thread, body, &refs);
+        let first = own_res(1, &root_ref, &secret, body, &refs);
         Ok(ThreadView {
             root_ref: root_ref.clone(),
             title: title.to_string(),
@@ -420,7 +500,7 @@ impl AetherClient {
             .map(|r| crate::parse_hex32(r, "返信先の ref"))
             .collect::<Result<Vec<_>>>()?;
 
-        let secret = self.keys.load_or_create_bbs_secret()?;
+        let secret = self.keys.thread_secret(&thread)?;
         let report = self
             .publish(PublicPost {
                 board: *board,
@@ -435,7 +515,7 @@ impl AetherClient {
 
         let mut refs = ctx.refs.clone();
         refs.push(content_ref.clone());
-        Ok(own_res(refs.len(), &content_ref, &secret, &thread, &stored, &refs))
+        Ok(own_res(refs.len(), &content_ref, &secret, &stored, &refs))
     }
 }
 
@@ -444,7 +524,6 @@ fn own_res(
     no: usize,
     content_ref: &str,
     secret: &[u8; 32],
-    thread: &[u8; 32],
     stored_body: &str,
     refs: &[String],
 ) -> Res {
@@ -452,7 +531,7 @@ fn own_res(
         no,
         content_ref: content_ref.to_string(),
         name: ANONYMOUS_NAME.to_string(),
-        id: Some(display_id(thread_key(secret, thread).public_id().as_bytes())),
+        id: Some(display_id(thread_key(secret, current_day()).public_id().as_bytes())),
         timestamp: aether_core::protocol::hint::current_timestamp(),
         body: render_body(stored_body, refs),
         missing: false,
@@ -485,13 +564,33 @@ mod tests {
     }
 
     #[test]
-    fn id_is_stable_in_a_thread_and_differs_across_threads() {
+    fn id_is_stable_within_a_day_and_differs_across_bodies() {
+        // 同じスレの秘密・同じ日なら、本文が違っても ID は同じ
         let secret = [1u8; 32];
-        let (t1, t2) = ([10u8; 32], [20u8; 32]);
-        let id = |t: [u8; 32], body: &str| open(&seal(&secret, t, body.into())).2.unwrap();
-        assert_eq!(id(t1, "a"), id(t1, "b"), "同じスレでは同じ ID");
-        assert_ne!(id(t1, "a"), id(t2, "a"), "別スレでは別の ID");
-        assert_eq!(id(t1, "a").len(), 8);
+        let thread = [10u8; 32];
+        let id = |body: &str| open(&seal(&secret, thread, body.into())).2.unwrap();
+        assert_eq!(id("a"), id("b"), "同じ日・同じスレでは同じ ID");
+        assert_eq!(id("a").len(), 8);
+    }
+
+    #[test]
+    fn id_differs_across_threads() {
+        // 実際にはスレごとに別の乱数秘密を持つ（[`KeyFiles::thread_secret`]）ので、
+        // 秘密が違えば同じ日でも別の ID になる
+        let (secret1, secret2) = ([1u8; 32], [2u8; 32]);
+        let thread = [10u8; 32];
+        let id1 = open(&seal(&secret1, thread, "a".into())).2.unwrap();
+        let id2 = open(&seal(&secret2, thread, "a".into())).2.unwrap();
+        assert_ne!(id1, id2, "別スレ（別の秘密）では別の ID");
+    }
+
+    #[test]
+    fn id_changes_across_days() {
+        // 日をまたぐと ID が変わる（2ch のトリップと同じ発想）
+        let secret = [7u8; 32];
+        let today = display_id(thread_key(&secret, 100).public_id().as_bytes());
+        let tomorrow = display_id(thread_key(&secret, 101).public_id().as_bytes());
+        assert_ne!(today, tomorrow, "日が変わっても ID が同じ");
     }
 
     #[test]
@@ -512,7 +611,7 @@ mod tests {
         // 手元で組み立てたレスの ID と、網から読んだ人が計算する ID が一致すること
         let (secret, thread) = ([3u8; 32], [4u8; 32]);
         let seen_by_others = open(&seal(&secret, thread, "x".into())).2.unwrap();
-        let mine = own_res(1, "ab", &secret, &thread, "x", &["ab".into()]);
+        let mine = own_res(1, "ab", &secret, "x", &["ab".into()]);
         assert_eq!(mine.id.unwrap(), seen_by_others);
     }
 
@@ -521,5 +620,66 @@ mod tests {
         let (thread, body, id) = open("CLI からの投稿 >>1".as_bytes());
         assert!(thread.is_none() && id.is_none());
         assert_eq!(body, "CLI からの投稿 >>1");
+    }
+
+    fn keys(passphrase: Option<&str>) -> (tempfile::TempDir, KeyFiles) {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyFiles::new(dir.path(), passphrase.map(str::to_owned));
+        (dir, keys)
+    }
+
+    #[test]
+    fn thread_secret_is_stable_across_calls() {
+        let (_dir, keys) = keys(None);
+        let thread = [1u8; 32];
+        let a = keys.thread_secret(&thread).unwrap();
+        let b = keys.thread_secret(&thread).unwrap();
+        assert_eq!(a, b, "同じスレなら同じ秘密が返る");
+    }
+
+    #[test]
+    fn thread_secret_differs_per_thread() {
+        let (_dir, keys) = keys(None);
+        let a = keys.thread_secret(&[1u8; 32]).unwrap();
+        let b = keys.thread_secret(&[2u8; 32]).unwrap();
+        assert_ne!(a, b, "スレが違えば別の秘密");
+    }
+
+    #[test]
+    fn thread_secret_is_forgotten_after_the_ttl() {
+        let (_dir, keys) = keys(None);
+        let thread = [9u8; 32];
+        let original = keys.thread_secret(&thread).unwrap();
+
+        // 7 日間書き込みが無かったことにする
+        let mut secrets = keys.load_thread_secrets().unwrap();
+        secrets.threads.get_mut(&thread).unwrap().last_used -= BBS_THREAD_SECRET_TTL + 1;
+        keys.save_thread_secrets(&secrets).unwrap();
+
+        let after = keys.thread_secret(&thread).unwrap();
+        assert_ne!(original, after, "TTL を過ぎたら秘密が入れ替わり、ID も変わる");
+    }
+
+    #[test]
+    fn thread_secrets_are_encrypted_with_a_passphrase() {
+        let (_dir, keys) = keys(Some("hunter2"));
+        keys.thread_secret(&[1u8; 32]).unwrap();
+
+        let raw = std::fs::read(keys.bbs_threads_path()).unwrap();
+        assert!(raw.starts_with(b"AESF"), "パスフレーズ設定時は平文で保存されている");
+
+        // パスフレーズ無しでは読めない
+        let locked = KeyFiles::new(keys.data_dir(), None);
+        assert!(locked.load_thread_secrets().is_err());
+    }
+
+    #[test]
+    fn legacy_bbs_key_is_removed_on_load() {
+        let (_dir, keys) = keys(None);
+        std::fs::write(keys.legacy_bbs_key_path(), b"old terminal-wide secret").unwrap();
+
+        keys.thread_secret(&[1u8; 32]).unwrap();
+
+        assert!(!keys.legacy_bbs_key_path().exists(), "廃止した端末単位の秘密を消していない");
     }
 }
