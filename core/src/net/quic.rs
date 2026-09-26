@@ -6,6 +6,29 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
+/// ALPN（一般的な HTTP/3 と同じ値。空の ALPN もそれ自体が目印になる）
+const ALPN: &[u8] = b"h3";
+
+/// 証明書に入れる名前（起動ごとの乱数。固定名は能動的な調査で一覧化される）
+fn random_host_name() -> String {
+    use rand::Rng;
+    const TLDS: &[&str] = &["com", "net", "org", "io", "jp"];
+    let mut rng = rand::thread_rng();
+    let len = rng.gen_range(6..=12);
+    let label: String = (0..len)
+        .map(|_| (b'a' + rng.gen_range(0..26)) as char)
+        .collect();
+    format!("{}.{}", label, TLDS[rng.gen_range(0..TLDS.len())])
+}
+
+/// 接続先の名前（SNI）
+///
+/// **IP アドレスを名前にすると rustls は SNI を送らない。** 固定名（旧 `aether-node`）は
+/// 暗号化されない ClientHello に載り、ISP が DPI をかけるだけで利用者を一覧化できた。
+pub(crate) fn server_name_for(addr: &SocketAddr) -> String {
+    addr.ip().to_string()
+}
+
 /// 保ち続ける接続の keepalive 間隔（quinn の既定アイドル上限 30 秒より十分短く）
 const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -22,12 +45,7 @@ pub struct QuicServer {
 
 impl QuicServer {
     pub fn new(config: &Config) -> Result<Self> {
-        let (cert, key) = Self::generate_self_signed_cert()?;
-
-        let server_config = quinn::ServerConfig::with_single_cert(
-            vec![cert],
-            key,
-        ).map_err(|e| AetherError::Quic(e.to_string()))?;
+        let server_config = Self::server_config()?;
 
         // **デュアルスタックで bind する。**
         // IPv6 が使える環境では NAT が存在しないため、
@@ -97,12 +115,7 @@ impl QuicServer {
 
     /// 既存のUDPソケットを使用してサーバーを起動する (Hole Punching用)
     pub fn new_with_socket(socket: std::net::UdpSocket) -> Result<Self> {
-        let (cert, key) = Self::generate_self_signed_cert()?;
-
-        let server_config = quinn::ServerConfig::with_single_cert(
-            vec![cert],
-            key,
-        ).map_err(|e| AetherError::Quic(e.to_string()))?;
+        let server_config = Self::server_config()?;
 
         let runtime = quinn::TokioRuntime;
         let (socket, side_rx) = SharedSocket::from_std(socket, &runtime)
@@ -122,8 +135,26 @@ impl QuicServer {
         })
     }
 
+    /// 待ち受けの TLS 設定
+    ///
+    /// **目印を残さない。** 証明書の名前は起動ごとの乱数、ALPN は一般的な HTTP/3 と同じ `h3`。
+    /// 固定名（旧 `aether-node`）だと、能動的に繋いで証明書を見るだけで AETHER と分かる。
+    /// 自己署名である以上、正規のサイトと完全には見分けがつかなくならないが、
+    /// 名前一つで一覧化される状態は避ける。
+    fn server_config() -> Result<quinn::ServerConfig> {
+        let (cert, key) = Self::generate_self_signed_cert()?;
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .map_err(|e| AetherError::Quic(e.to_string()))?;
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+            .map_err(|e| AetherError::Config(format!("Failed to convert rustls config: {:?}", e)))?;
+        Ok(quinn::ServerConfig::with_crypto(Arc::new(crypto)))
+    }
+
     fn generate_self_signed_cert() -> Result<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)> {
-        let cert = rcgen::generate_simple_self_signed(vec!["aether-node".into()])
+        let cert = rcgen::generate_simple_self_signed(vec![random_host_name()])
             .map_err(|e| AetherError::Crypto(e.to_string()))?;
 
         let key_der = cert.key_pair.serialize_der();
@@ -189,6 +220,7 @@ impl QuicClient {
             .with_no_client_auth();
 
         config.dangerous().set_certificate_verifier(Arc::new(SkipServerVerification));
+        config.alpn_protocols = vec![ALPN.to_vec()];
 
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(config)
              .map_err(|e| AetherError::Config(format!("Failed to convert rustls config: {:?}", e)))?;
@@ -210,15 +242,16 @@ impl QuicClient {
     }
 
     /// keepalive 付きで接続する
-    pub async fn connect_keepalive(&self, addr: SocketAddr, server_name: &str) -> Result<quinn::Connection> {
-        let connecting = self.endpoint.connect_with(Self::keepalive_config()?, addr, server_name)
+    pub async fn connect_keepalive(&self, addr: SocketAddr) -> Result<quinn::Connection> {
+        let connecting = self.endpoint.connect_with(Self::keepalive_config()?, addr, &server_name_for(&addr))
             .map_err(|e| AetherError::Quic(e.to_string()))?;
 
         connecting.await.map_err(|e| AetherError::Quic(e.to_string()))
     }
 
-    pub async fn connect(&self, addr: SocketAddr, server_name: &str) -> Result<quinn::Connection> {
-        let connecting = self.endpoint.connect(addr, server_name)
+    /// 接続する（SNI は送らない。[`server_name_for`]）
+    pub async fn connect(&self, addr: SocketAddr) -> Result<quinn::Connection> {
+        let connecting = self.endpoint.connect(addr, &server_name_for(&addr))
             .map_err(|e| AetherError::Quic(e.to_string()))?;
 
         connecting.await.map_err(|e| AetherError::Quic(e.to_string()))
@@ -277,5 +310,48 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
             rustls::SignatureScheme::ED25519,
             rustls::SignatureScheme::ED448,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_sni_is_sent_for_ip_addresses() {
+        // IP アドレスの名前は rustls で IpAddress として扱われ、SNI 拡張が付かない
+        for addr in ["203.0.113.5:9000", "[2001:db8::1]:443"] {
+            let addr: SocketAddr = addr.parse().unwrap();
+            let name = ServerName::try_from(server_name_for(&addr)).unwrap();
+            assert!(matches!(name, ServerName::IpAddress(_)), "{} で SNI が付く", addr);
+        }
+    }
+
+    #[tokio::test]
+    async fn client_and_server_agree_on_alpn() {
+        // ALPN を両側で揃えないとハンドシェイクが通らない
+        let server = QuicServer::new(&Config { listen_port: 0, ..Default::default() }).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            let incoming = server.endpoint().accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            conn.handshake_data()
+                .and_then(|h| h.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+                .and_then(|h| h.protocol)
+        });
+        let client = QuicClient::new().unwrap();
+        client
+            .connect(format!("127.0.0.1:{}", port).parse().unwrap())
+            .await
+            .expect("ハンドシェイクが通らない");
+        assert_eq!(accept.await.unwrap().as_deref(), Some(ALPN));
+    }
+
+    #[test]
+    fn certificate_names_are_random() {
+        let a = random_host_name();
+        let b = random_host_name();
+        assert_ne!(a, b);
+        assert!(!a.contains("aether"));
     }
 }

@@ -73,7 +73,7 @@ async fn unreachable_node_can_be_reached_over_its_own_connection() {
     let nat_node = UnreachableNode::new();
     let mut conn = None;
     for _ in 0..200 {
-        if let Ok(c) = nat_node.client.connect(addr, "aether-node").await {
+        if let Ok(c) = nat_node.client.connect(addr).await {
             conn = Some(c);
             break;
         }
@@ -160,7 +160,7 @@ async fn inbound_connections_survive_the_outbound_ttl() {
     common::wait_for_listener(addr).await;
 
     let nat_node = UnreachableNode::new();
-    let _conn = nat_node.client.connect(addr, "aether-node").await.unwrap();
+    let _conn = nat_node.client.connect(addr).await.unwrap();
 
     let router = relay.router.clone();
     common::wait_until("inbound registered", common::DEFAULT_TIMEOUT, || {

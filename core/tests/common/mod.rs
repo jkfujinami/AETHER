@@ -89,7 +89,7 @@ pub async fn spawn_ready_node(
         DEFAULT_TIMEOUT,
         || {
             let probe = &probe;
-            async move { probe.connect(addr, "aether-node").await.is_ok() }
+            async move { probe.connect(addr).await.is_ok() }
         },
     )
     .await;
@@ -106,7 +106,7 @@ pub async fn wait_for_listener(addr: SocketAddr) {
         DEFAULT_TIMEOUT,
         || {
             let probe = &probe;
-            async move { probe.connect(addr, "aether-node").await.is_ok() }
+            async move { probe.connect(addr).await.is_ok() }
         },
     )
     .await;

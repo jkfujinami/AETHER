@@ -40,7 +40,7 @@ impl RelayClient {
     /// 「生涯に一度でも敵の入口を引く」確率が 1 に収束する。
     pub async fn connect_entry(&mut self, addr: SocketAddr) -> Result<()> {
         // サーバー名は証明書検証をスキップしているので何でも良いが、将来的に重要
-        let conn = self.quic_client.connect(addr, "aether-relay").await?;
+        let conn = self.quic_client.connect(addr).await?;
         self.entry_connection = Some(conn);
         Ok(())
     }
@@ -136,7 +136,7 @@ impl RelayClient {
     /// 特定のアドレスに直接パケットを送信する (Tunnel構築など)
     pub async fn send_direct_packet(&self, addr: SocketAddr, packet_type: PacketType, payload: &[u8]) -> Result<()> {
         // Connection Pool から接続を取得
-        let conn = self.connection_pool.get_connection(addr, "aether-node").await?;
+        let conn = self.connection_pool.get_connection(addr).await?;
         let mut stream = conn.open_uni().await.map_err(|e| AetherError::Quic(e.to_string()))?;
         wire::write_packet(&mut stream, packet_type, payload).await?;
         stream.finish().map_err(|e| AetherError::Quic(e.to_string()))?;

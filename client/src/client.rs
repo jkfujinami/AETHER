@@ -46,12 +46,18 @@ impl AetherClient {
         }
         std::fs::create_dir_all(keys.data_dir())?;
 
+        // 待ち受けポート。常駐で指定が無ければ、初回にランダムに選んで以後は使い続ける
+        let port = match (&config.mode, config.port) {
+            (NodeMode::Relay(_), 0) => relay_port(&keys)?,
+            (_, p) => p,
+        };
+
         // ノードの鍵：一回限りなら使い捨て、常駐なら relay.key（どちらも私信の身元ではない）
         let (identity, core_config) = match &config.mode {
             NodeMode::Ephemeral => (
                 Identity::generate(),
                 Config {
-                    listen_port: config.port,
+                    listen_port: port,
                     node_id_pow_difficulty: 0,
                     advertise_self: false,
                     directory_pow_difficulty: config.network.directory_pow_difficulty,
@@ -61,7 +67,7 @@ impl AetherClient {
             ),
             NodeMode::Relay(opts) => {
                 let core_config = Config {
-                    listen_port: config.port,
+                    listen_port: port,
                     node_id_pow_difficulty: opts.pow_difficulty,
                     enable_port_mapping: opts.allow_port_mapping,
                     epoch_beacon: opts.epoch_beacon,
@@ -96,7 +102,7 @@ impl AetherClient {
         // 非同期ランタイムのスレッドを塞がないよう別スレッドで作る
         let mut node = {
             let (port, db, cfg, pass) = (
-                config.port,
+                port,
                 keys.mailbox_db_path(),
                 core_config.clone(),
                 keys.passphrase().map(str::to_owned),
@@ -242,6 +248,26 @@ impl AetherClient {
     }
 }
 
+/// 常駐ノードの待ち受けポート（初回にランダムに選んで保存する）
+///
+/// **固定の既定ポート（旧 9000）は使わない。** 全員が同じポートで待ち受けると、
+/// ポート番号だけで AETHER の利用者を一覧化できる。一方で毎回変えると
+/// 記述子のアドレスが変わり続け、他人のガードとして使い続けてもらえない。
+fn relay_port(keys: &KeyFiles) -> Result<u16> {
+    let path = keys.data_dir().join("relay.port");
+    if let Some(p) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
+    {
+        return Ok(p);
+    }
+    // 動的・私用ポートの範囲から選ぶ（よく使われるサービスのポートと重ならない）
+    let port = 49152 + rand::random::<u16>() % (65535 - 49152);
+    std::fs::write(&path, port.to_string())?;
+    Ok(port)
+}
+
 /// クライアントの状態
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Status {
@@ -256,4 +282,18 @@ pub struct Status {
 /// 収めるための安定した鍵として、鍵のハッシュを NodeId 代わりに使う。
 pub(crate) fn board_target(k_pub: &[u8; 32]) -> NodeId {
     NodeId(aether_core::crypto::keyword::subscription_id(k_pub))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_port_is_random_once_then_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyFiles::new(dir.path(), None);
+        let first = relay_port(&keys).unwrap();
+        assert!(first >= 49152, "動的ポートの範囲外: {}", first);
+        assert_eq!(relay_port(&keys).unwrap(), first, "起動のたびに変わるとガードに使われない");
+    }
 }

@@ -66,25 +66,29 @@ enum Dialer {
 }
 
 impl Dialer {
-    async fn connect(&self, addr: SocketAddr, server_name: &str) -> Result<Connection> {
+    async fn connect(&self, addr: SocketAddr) -> Result<Connection> {
         match self {
             Dialer::Endpoint(ep) => ep
-                .connect(addr, server_name)
+                .connect(addr, &crate::net::quic::server_name_for(&addr))
                 .map_err(|e| crate::AetherError::Quic(e.to_string()))?
                 .await
                 .map_err(|e| crate::AetherError::Quic(e.to_string())),
-            Dialer::Client(c) => c.connect(addr, server_name).await,
+            Dialer::Client(c) => c.connect(addr).await,
         }
     }
 
-    async fn connect_keepalive(&self, addr: SocketAddr, server_name: &str) -> Result<Connection> {
+    async fn connect_keepalive(&self, addr: SocketAddr) -> Result<Connection> {
         match self {
             Dialer::Endpoint(ep) => ep
-                .connect_with(QuicClient::keepalive_config()?, addr, server_name)
+                .connect_with(
+                    QuicClient::keepalive_config()?,
+                    addr,
+                    &crate::net::quic::server_name_for(&addr),
+                )
                 .map_err(|e| crate::AetherError::Quic(e.to_string()))?
                 .await
                 .map_err(|e| crate::AetherError::Quic(e.to_string())),
-            Dialer::Client(c) => c.connect_keepalive(addr, server_name).await,
+            Dialer::Client(c) => c.connect_keepalive(addr).await,
         }
     }
 }
@@ -166,7 +170,7 @@ impl ConnectionPool {
     ///
     /// 生きている接続があれば**由来を問わず再利用する**。
     /// 相手が NAT 内なら、相手が張った接続だけが到達経路になる。
-    pub async fn get_connection(&self, addr: SocketAddr, server_name: &str) -> Result<Connection> {
+    pub async fn get_connection(&self, addr: SocketAddr) -> Result<Connection> {
         let addr = normalize(addr);
         self.cleanup().await;
 
@@ -175,7 +179,7 @@ impl ConnectionPool {
         }
 
         // 生きた接続が無いのでダイヤルする
-        let connection = self.dialer.connect(addr, server_name).await?;
+        let connection = self.dialer.connect(addr).await?;
 
         // ダイヤルした接続も受信を回してもらう
         if let Some(tx) = self.opened_tx.lock().unwrap().as_ref() {
@@ -206,7 +210,7 @@ impl ConnectionPool {
     /// 返信トンネルの終端に使う。相手（ガード）はこの接続の上でしか
     /// 自分へ返信を届けられない（自分が NAT の内側でも、広告アドレスが無くても）。
     /// 既に保っている生きた接続があればそれを返す。
-    pub async fn pin_connection(&self, addr: SocketAddr, server_name: &str) -> Result<Connection> {
+    pub async fn pin_connection(&self, addr: SocketAddr) -> Result<Connection> {
         let addr = normalize(addr);
         {
             let pool = self.connections.read().await;
@@ -218,7 +222,7 @@ impl ConnectionPool {
             }
         }
 
-        let connection = self.dialer.connect_keepalive(addr, server_name).await?;
+        let connection = self.dialer.connect_keepalive(addr).await?;
 
         // 受信も回してもらう（返信はこの接続の上で届く）
         if let Some(tx) = self.opened_tx.lock().unwrap().as_ref() {

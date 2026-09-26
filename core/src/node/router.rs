@@ -133,7 +133,7 @@ impl Router {
 
     /// `addr` への keepalive 付き接続を張って保つ（返信トンネルの戻り道）
     pub async fn pin_connection(&self, addr: SocketAddr) -> Result<()> {
-        self.connection_pool.pin_connection(addr, "aether-node").await?;
+        self.connection_pool.pin_connection(addr).await?;
         Ok(())
     }
 
@@ -160,7 +160,7 @@ impl Router {
     /// 任意のパケットを指定した宛先に送信する
     pub async fn send_packet(&self, addr: SocketAddr, packet_type: PacketType, payload: &[u8]) -> Result<()> {
         // Connection Pool から接続を取得
-        let conn = self.connection_pool.get_connection(addr, "aether-node").await?;
+        let conn = self.connection_pool.get_connection(addr).await?;
         let mut stream = conn.open_uni().await.map_err(|e| AetherError::Quic(e.to_string()))?;
 
         wire::write_packet(&mut stream, packet_type, payload).await?;
