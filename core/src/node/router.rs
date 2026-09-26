@@ -1,6 +1,6 @@
 use crate::error::{Result, AetherError};
 use crate::crypto::identity::Identity;
-use crate::net::onion::OnionCircuit;
+use crate::net::onion::{self, OnionAction};
 use crate::net::seen_cache::SeenCache;
 use crate::net::quic::QuicClient;
 use crate::net::connection_pool::ConnectionPool;
@@ -8,7 +8,6 @@ use crate::protocol::wire::{self, PacketType};
 use std::sync::Arc;
 use tracing::debug;
 use std::net::SocketAddr;
-use x25519_dalek::PublicKey;
 
 /// Routerがパケットを処理した結果のアクション
 pub enum RoutingAction {
@@ -18,12 +17,12 @@ pub enum RoutingAction {
     LocalProcessing(Vec<u8>),
 }
 
-/// Onion 層のリプレイを覚えておく時間
+/// Onion パケットの一時公開鍵を覚えておく時間
 ///
-/// 確認攻撃（ガードが同じパケットを繰り返し流し、出口側に同じ中身の
-/// まとまりが現れるのを見て回路の両端を確かめる）はその場で行うので、
-/// この窓で主な脅威は塞がる。層に時刻を持たないため、窓を過ぎた再送までは防げない。
-const ONION_REPLAY_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// 経路に入れた時刻が ±`MAX_CLOCK_SKEW_MINUTES` 分を外れたパケットは時刻で弾くので、
+/// その窓（前後合わせて 20 分）より長く覚えていれば再送は必ずどちらかで止まる。
+const ONION_REPLAY_TTL: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60 * (onion::MAX_CLOCK_SKEW_MINUTES as u64 + 5));
 
 /// リプレイ検出に覚えておく件数（1世代あたり）
 const ONION_REPLAY_CAPACITY: usize = 1_000_000;
@@ -32,7 +31,7 @@ const ONION_REPLAY_CAPACITY: usize = 1_000_000;
 pub struct Router {
     identity: Arc<Identity>,
     connection_pool: ConnectionPool,
-    /// 剥いた Onion 層の (一時公開鍵, nonce)。同じ層を二度処理しない
+    /// 処理した Onion パケットの一時公開鍵。同じパケットを二度処理しない
     seen_layers: std::sync::Mutex<SeenCache>,
 }
 
@@ -64,46 +63,30 @@ impl Router {
         })
     }
 
-    /// 受信したOnion Packetを処理する
-    /// 1. パケット先頭の一時公開鍵と自分の秘密鍵で共有鍵を導出
-    /// 2. パケットを復号（皮剥き）
-    /// 3. 次のホップがあれば転送、なければペイロードを返す
+    /// 受信した Onion パケットの 1 層を処理する
+    ///
+    /// ヘッダの MAC と時刻を確かめ、次のホップへ同じ長さのまま転送するか、
+    /// 自分が出口なら中身を返す。
     pub async fn handle_packet(&self, packet: &[u8]) -> Result<RoutingAction> {
-        // パケット先頭のEphemeral Keyを取得
-        if packet.len() < 32 {
-            return Err(AetherError::Crypto("Packet too short for key derivation".into()));
-        }
+        let (alpha, action) = onion::process_layer(&self.identity.x25519_secret(), packet)?;
 
-        let ephemeral_bytes: [u8; 32] = packet[0..32].try_into().unwrap();
-        let ephemeral_pub = PublicKey::from(ephemeral_bytes);
-
-        // 自分の秘密鍵と相手の公開鍵でDH計算
-        let my_secret = self.identity.x25519_secret();
-        let shared_secret_bytes = my_secret.diffie_hellman(&ephemeral_pub).to_bytes();
-
-        // 復号とルーティング情報の取得
-        // unwrap_packet 内部で先頭32バイト(Pubkey)はスキップされる
-        let (next_hop, payload) = OnionCircuit::unwrap_packet(&shared_secret_bytes, packet)?;
-
-        // **リプレイは捨てる。** 同じ層を何度でも処理すると、ガードが同じパケットを
+        // **リプレイは捨てる。** 同じパケットを何度でも処理すると、ガードが同じものを
         // N 回流して出口側の反応を数え、回路の両端を突き合わせられる。
-        // 記録は復号に成功してから（偽パケットでキャッシュを埋めさせない）。
-        // 鍵は (一時公開鍵, nonce)。同じ回路の別パケットは nonce が違う。
-        let layer_id: [u8; 32] = {
-            use sha2::{Digest, Sha256};
-            Sha256::digest(&packet[..32 + crate::crypto::cipher::NONCE_SIZE]).into()
-        };
-        if !self.seen_layers.lock().unwrap().insert(layer_id) {
+        // 一時公開鍵 α はパケットごとに作り直されるので、同じ α は再送。
+        // 記録は MAC と時刻の検査に通ってから（偽パケットでキャッシュを埋めさせない）。
+        // 時刻の窓（±MAX_CLOCK_SKEW_MINUTES）より古いものは process_layer が弾くので、
+        // キャッシュはその窓より長く覚えていれば足りる。
+        if !self.seen_layers.lock().unwrap().insert(alpha) {
             return Err(AetherError::Protocol("Replayed onion layer dropped".into()));
         }
 
-        match next_hop {
-            Some(addr) => {
-                debug!("Forwarding packet to {}", addr);
-                self.forward_packet(addr, &payload).await?;
+        match action {
+            OnionAction::Forward { next, packet } => {
+                debug!("Forwarding packet to {}", next);
+                self.forward_packet(next, &packet).await?;
                 Ok(RoutingAction::Forwarded)
             }
-            None => {
+            OnionAction::Exit { payload } => {
                 debug!("Packet reached destination (self). Payload size: {}", payload.len());
                 Ok(RoutingAction::LocalProcessing(payload))
             }
@@ -113,27 +96,7 @@ impl Router {
     /// Tunnel Buildパケットを処理し、リレー登録情報を抽出する
     /// Payload: [TunnelID(32)][EphPK(32)][Nonce(12)][EncInst]
     pub fn process_tunnel_build(&self, payload: &[u8]) -> Result<([u8; 32], [u8; 32], crate::net::tunnel::HopInstruction)> {
-        if payload.len() < 32 + 32 + 12 {
-            return Err(AetherError::Protocol("TunnelBuild packet too short".into()));
-        }
-
-        // Parse parts
-        let tunnel_id: [u8; 32] = payload[0..32].try_into().unwrap();
-        let eph_pk_bytes: [u8; 32] = payload[32..64].try_into().unwrap();
-        let nonce: [u8; 12] = payload[64..76].try_into().unwrap();
-        let ciphertext = &payload[76..];
-
-        // DH
-        let eph_pk = PublicKey::from(eph_pk_bytes);
-        let my_secret = self.identity.x25519_secret();
-        let shared_secret = my_secret.diffie_hellman(&eph_pk).to_bytes();
-
-        // Decrypt Instruction
-        let inst_bytes = crate::crypto::cipher::decrypt(&shared_secret, &nonce, ciphertext)?;
-        let instruction: crate::net::tunnel::HopInstruction = bincode::deserialize(&inst_bytes)
-            .map_err(|e| AetherError::Protocol(format!("Invalid instruction: {}", e)))?;
-
-        Ok((tunnel_id, shared_secret, instruction))
+        crate::net::tunnel::open_build(&self.identity.x25519_secret(), payload)
     }
 
     /// accept した接続をプールへ登録する
@@ -216,14 +179,15 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::key_exchange::EphemeralKey;
+    use crate::net::onion::OnionCircuit;
+    use x25519_dalek::PublicKey;
 
     /// 自分宛て（出口）の1層パケットを作る
     fn packet_for(identity: &Identity) -> Vec<u8> {
-        let mut circuit = OnionCircuit::new(1);
+        let mut circuit = OnionCircuit::new();
         let pubkey = PublicKey::from(&identity.x25519_secret()).to_bytes();
         circuit
-            .add_hop("127.0.0.1:9000".parse().unwrap(), pubkey, EphemeralKey::generate())
+            .add_hop("127.0.0.1:9000".parse().unwrap(), pubkey)
             .unwrap();
         circuit.wrap_packet(b"payload").unwrap()
     }
@@ -240,7 +204,7 @@ mod tests {
         ));
         assert!(router.handle_packet(&packet).await.is_err(), "同じ層を二度処理した");
 
-        // 同じ回路でも別パケット（nonce が違う）は通る
+        // 同じ回路でも別パケット（一時鍵が違う）は通る
         let other = packet_for(&identity);
         assert!(router.handle_packet(&other).await.is_ok());
     }

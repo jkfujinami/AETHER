@@ -1,7 +1,6 @@
 use aether_core::net::relay::RelayClient;
 use aether_core::crypto::identity::Identity;
 use aether_core::net::onion::OnionCircuit;
-use aether_core::crypto::key_exchange;
 use aether_core::mailbox::schrodinger::SchrodingerMailbox;
 use aether_core::protocol::wire::InnerPacketType;
 use aether_core::net::gossip::GossipClient;
@@ -35,11 +34,8 @@ async fn test_local_e2e_mailbox_put() {
 
     // 3. Setup Circuit (Alice -> Bob)
     // Assume handshake done.
-    let mut circuit = OnionCircuit::new(1);
-
-    let client_ephemeral = key_exchange::EphemeralKey::generate();
-
-    circuit.add_hop(bob_addr, bob_x25519_pub_bytes, client_ephemeral).unwrap();
+    let mut circuit = OnionCircuit::new();
+    circuit.add_hop(bob_addr, bob_x25519_pub_bytes).unwrap();
     relay_client.set_circuit(circuit);
 
     // 4. Create Packet using SchrodingerMailbox logic

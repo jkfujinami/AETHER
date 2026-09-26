@@ -2,12 +2,102 @@
 //!
 //! 受信専用のトンネルを構築し、送信者に Gateway アドレスだけを公開する。
 //! これにより、送信者は受信者の実IPを知ることなくメッセージを送れる。
+//!
+//! # 長さを変えない
+//!
+//! 各ホップが AEAD で包み直すと、1 ホップごとに nonce とタグの分だけ長くなり、
+//! 中継は長さから「自分は gateway から何番目か」を知れる。ここでは
+//!
+//! - **gateway**（外からデータを受ける最初のホップ）が長さをバケットに切り上げ、乱数の nonce を付ける
+//! - **以降のホップ**は長さを変えないストリーム暗号を重ね、nonce をホップ固有の値で置き換える
+//!
+//! どのホップから見ても `[nonce 12][本文 (バケット長)]` で同じ長さになり、隣り合わない
+//! ホップどうしは nonce でメッセージを突き合わせられない。改ざんは中継では検出しない
+//! （本体のシャードは封で守られていて、終端で弾かれる）。
+//!
+//! gateway かどうかは、**gateway 用の tunnel_id の先頭ビット**で示す（[`GATEWAY_ID_BIT`]）。
 
 use crate::error::{Result, AetherError};
 use crate::crypto::{key_exchange, cipher};
+use chacha20::ChaCha20;
+use chacha20::cipher::{KeyIvInit, StreamCipher};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use std::net::SocketAddr;
 use serde::{Serialize, Deserialize};
-use x25519_dalek::PublicKey;
+use x25519_dalek::{PublicKey, StaticSecret};
+
+/// gateway 用の tunnel_id は先頭バイトの最下位ビットが 1（他のホップは 0）
+///
+/// gateway は外（保持者）から素のデータを受け、他のホップは `[nonce][本文]` を受ける。
+/// どちらの形かを受け手が知るための取り決め。
+pub const GATEWAY_ID_BIT: u8 = 0x01;
+
+/// トンネルの nonce の長さ
+const NONCE_LEN: usize = 12;
+
+fn is_gateway_id(id: &[u8; 32]) -> bool {
+    id[0] & GATEWAY_ID_BIT != 0
+}
+
+/// DH の出力から、用途ごとの鍵を HKDF で導出する
+struct TunnelKeys {
+    /// 本文のストリーム暗号の鍵
+    stream: [u8; 32],
+    /// 次のホップへ渡す nonce を作るための値（nonce をこれで XOR する）
+    nonce_mask: [u8; NONCE_LEN],
+}
+
+impl TunnelKeys {
+    fn derive(shared: &[u8; 32]) -> Self {
+        let hk = Hkdf::<Sha256>::new(Some(b"aether_tunnel_v2"), shared);
+        let mut k = Self {
+            stream: [0; 32],
+            nonce_mask: [0; NONCE_LEN],
+        };
+        hk.expand(b"stream", &mut k.stream).expect("HKDF の上限内");
+        hk.expand(b"nonce", &mut k.nonce_mask).expect("HKDF の上限内");
+        k
+    }
+}
+
+/// 構築指示を封じる鍵（DH の出力をそのまま使わない）
+fn instruction_key(shared: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(b"aether_tunnel_v2"), shared);
+    let mut k = [0u8; 32];
+    hk.expand(b"instruction", &mut k).expect("HKDF の上限内");
+    k
+}
+
+fn xor_stream(key: &[u8; 32], nonce: &[u8; NONCE_LEN], data: &mut [u8]) {
+    ChaCha20::new(key.into(), nonce.into()).apply_keystream(data);
+}
+
+fn xor_nonce(n: &[u8; NONCE_LEN], mask: &[u8; NONCE_LEN]) -> [u8; NONCE_LEN] {
+    let mut out = *n;
+    for (o, m) in out.iter_mut().zip(mask) {
+        *o ^= m;
+    }
+    out
+}
+
+/// 受け取った構築指示を開く（中継ノード用）
+///
+/// 形式: `[TunnelID 32][一時公開鍵 32][Nonce 12][暗号化された HopInstruction]`。
+/// 返り値の共有秘密は [`TunnelRelay::register_tunnel`] に渡す。
+pub fn open_build(secret: &StaticSecret, payload: &[u8]) -> Result<([u8; 32], [u8; 32], HopInstruction)> {
+    if payload.len() < 32 + 32 + NONCE_LEN {
+        return Err(AetherError::Protocol("TunnelBuild packet too short".into()));
+    }
+    let tunnel_id: [u8; 32] = payload[0..32].try_into().expect("長さ確認済み");
+    let eph: [u8; 32] = payload[32..64].try_into().expect("長さ確認済み");
+    let nonce: [u8; NONCE_LEN] = payload[64..76].try_into().expect("長さ確認済み");
+    let shared = secret.diffie_hellman(&PublicKey::from(eph)).to_bytes();
+    let plain = cipher::decrypt(&instruction_key(&shared), &nonce, &payload[76..])?;
+    let inst: HopInstruction = bincode::deserialize(&plain)
+        .map_err(|e| AetherError::Protocol(format!("Invalid instruction: {}", e)))?;
+    Ok((tunnel_id, shared, inst))
+}
 
 /// トンネル構築の結果: (トンネル本体, 各ホップへの命令)
 pub type BuildResult = Result<(InboundTunnel, Vec<(SocketAddr, Vec<u8>)>)>;
@@ -120,8 +210,9 @@ impl InboundTunnel {
         let mut decrypt_keys = Vec::new();
         let mut hop_instructions: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
 
-        // トンネルIDを生成
-        let tunnel_id: [u8; 32] = rand::random();
+        // トンネルIDを生成（gateway 用は先頭ビットを立てる）
+        let mut tunnel_id: [u8; 32] = rand::random();
+        tunnel_id[0] |= GATEWAY_ID_BIT;
 
         // Alice が受信する際の Tunnel ID を保存
         let mut receive_tunnel_id = [0u8; 32];
@@ -142,7 +233,10 @@ impl InboundTunnel {
             let listen_tunnel_id = if i == 0 {
                 tunnel_id // Gatewayは公開IDを使う
             } else {
-                rand::random() // RelayはランダムID
+                // RelayはランダムID（gateway のビットは下ろす）
+                let mut id: [u8; 32] = rand::random();
+                id[0] &= !GATEWAY_ID_BIT;
+                id
             };
 
             // Alice (最後のホップ) の場合、receive_tunnel_id を保存
@@ -174,7 +268,8 @@ impl InboundTunnel {
             let instruction_bytes = bincode::serialize(&instruction)
                 .map_err(|e| AetherError::Config(e.to_string()))?;
 
-            let (encrypted_instruction, nonce) = cipher::encrypt(&shared_secret, &instruction_bytes)?;
+            let (encrypted_instruction, nonce) =
+                cipher::encrypt(&instruction_key(&shared_secret), &instruction_bytes)?;
 
             // Hop に渡すデータ: [TunnelID][EphemeralPK][Nonce][EncInstruction]
             let mut hop_data = Vec::new();
@@ -217,22 +312,26 @@ impl InboundTunnel {
     /// # Returns
     /// * 復号されたペイロード
     pub fn decrypt(&self, encrypted_data: &[u8]) -> Result<Vec<u8>> {
-        // 各層を復号していく
-        let mut data = encrypted_data.to_vec();
+        // 形式: [最後のホップが付けた nonce 12][本文]
+        if encrypted_data.len() < NONCE_LEN + 4 {
+            return Err(AetherError::Crypto("Tunnel data too short".into()));
+        }
+        let mut nonce: [u8; NONCE_LEN] = encrypted_data[..NONCE_LEN].try_into().expect("長さ確認済み");
+        let mut body = encrypted_data[NONCE_LEN..].to_vec();
 
-        for key in &self.decrypt_keys {
-            // データ形式: [Nonce(12)][Ciphertext]
-            if data.len() < 12 {
-                return Err(AetherError::Crypto("Data too short for nonce".into()));
-            }
-
-            let nonce: [u8; 12] = data[..12].try_into().unwrap();
-            let ciphertext = &data[12..];
-
-            data = cipher::decrypt(key, &nonce, ciphertext)?;
+        // 自分に近いホップから順に剥がす。各ホップは「受けた nonce」で暗号化し、
+        // nonce を自分の値で XOR して渡しているので、逆にたどれる
+        for shared in &self.decrypt_keys {
+            let keys = TunnelKeys::derive(shared);
+            nonce = xor_nonce(&nonce, &keys.nonce_mask);
+            xor_stream(&keys.stream, &nonce, &mut body);
         }
 
-        Ok(data)
+        // gateway が付けた [長さ][データ][パディング] から取り出す
+        let len = u32::from_be_bytes(body[..4].try_into().expect("長さ確認済み")) as usize;
+        body.get(4..4 + len)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| AetherError::Crypto("Tunnel data length out of range".into()))
     }
 
     /// 公開用のエンドポイント情報を取得
@@ -243,7 +342,7 @@ impl InboundTunnel {
 
 /// トンネル中継ノードの処理
 pub struct TunnelRelay {
-    /// 登録されたトンネル: tunnel_id -> (共有鍵, 次ホップ, 次のトンネルID)
+    /// 登録されたトンネル: tunnel_id -> (共有秘密, 次ホップ, 次のトンネルID)
     tunnels: std::collections::HashMap<[u8; 32], ([u8; 32], SocketAddr, [u8; 32])>,
 }
 
@@ -291,17 +390,36 @@ impl TunnelRelay {
         tunnel_id: &[u8; 32],
         data: &[u8],
     ) -> Result<Option<ForwardingInstruction>> {
-        let (shared_key, next_hop, next_tunnel_id) = self.tunnels.get(tunnel_id)
+        let (shared, next_hop, next_tunnel_id) = self.tunnels.get(tunnel_id)
             .ok_or_else(|| AetherError::Config("Unknown tunnel ID".into()))?;
+        let keys = TunnelKeys::derive(shared);
 
-        // データを暗号化 (Inbound Tunnel は通過するたびに暗号化層を追加する)
-        // Note: 変数名は decrypt_key だが、実際は共有秘密鍵であり、ここでは暗号化に使う
-        let (encrypted_data, nonce) = cipher::encrypt(shared_key, data)?;
+        let (nonce, mut body) = if is_gateway_id(tunnel_id) {
+            // gateway：外から来た素のデータを [長さ][データ][乱数] でバケットに切り上げ、
+            // 乱数の nonce を付ける（以降のホップはこの長さのまま運ぶ）
+            let len = u32::try_from(data.len())
+                .map_err(|_| AetherError::Protocol("Tunnel data too large".into()))?;
+            let bucket = crate::net::onion::padded_len(4 + data.len());
+            let mut body = Vec::with_capacity(bucket);
+            body.extend_from_slice(&len.to_be_bytes());
+            body.extend_from_slice(data);
+            let mut pad = vec![0u8; bucket - body.len()];
+            rand::Rng::fill(&mut rand::thread_rng(), &mut pad[..]);
+            body.extend_from_slice(&pad);
+            (rand::random::<[u8; NONCE_LEN]>(), body)
+        } else {
+            if data.len() < NONCE_LEN {
+                return Err(AetherError::Protocol("Tunnel data too short".into()));
+            }
+            let nonce: [u8; NONCE_LEN] = data[..NONCE_LEN].try_into().expect("長さ確認済み");
+            (nonce, data[NONCE_LEN..].to_vec())
+        };
 
-        // [Nonce][EncryptedData] の形式にする
-        let mut forwarded_data = Vec::new();
-        forwarded_data.extend_from_slice(&nonce);
-        forwarded_data.extend_from_slice(&encrypted_data);
+        // 長さを変えずに暗号化を重ね、nonce を自分の値で置き換えて渡す
+        xor_stream(&keys.stream, &nonce, &mut body);
+        let mut forwarded_data = Vec::with_capacity(NONCE_LEN + body.len());
+        forwarded_data.extend_from_slice(&xor_nonce(&nonce, &keys.nonce_mask));
+        forwarded_data.extend_from_slice(&body);
 
         // 次のホップに転送
         Ok(Some((*next_hop, *next_tunnel_id, forwarded_data)))
@@ -326,98 +444,82 @@ mod tests {
         assert_eq!(endpoint.tunnel_id, deserialized.tunnel_id);
     }
 
+    /// 経路を組み、各ホップを登録した TunnelRelay を返す
+    fn setup(n: usize) -> (InboundTunnel, Vec<([u8; 32], TunnelRelay)>) {
+        let secrets: Vec<StaticSecret> =
+            (0..n).map(|_| StaticSecret::random_from_rng(rand::rngs::OsRng)).collect();
+        let path: Vec<SocketAddr> =
+            (1..=n).map(|i| format!("10.0.0.{}:9000", i).parse().unwrap()).collect();
+        let pubkeys = secrets.iter().map(|s| PublicKey::from(s).to_bytes()).collect();
+        let (tunnel, instructions) = InboundTunnel::build(path, pubkeys).unwrap();
+
+        let relays = instructions
+            .iter()
+            .zip(&secrets)
+            .map(|((_, data), secret)| {
+                let (tid, shared, inst) = open_build(secret, data).unwrap();
+                let mut relay = TunnelRelay::new();
+                relay.register_tunnel(tid, shared, inst.next_hop.unwrap(), inst.next_tunnel_id);
+                (tid, relay)
+            })
+            .collect();
+        (tunnel, relays)
+    }
+
+    /// gateway から終端まで流し、各ホップが受け取った長さと終端の出力を返す
+    fn traverse(relays: &[([u8; 32], TunnelRelay)], msg: &[u8]) -> (Vec<usize>, Vec<u8>) {
+        let mut data = msg.to_vec();
+        let mut tid = relays[0].0;
+        let mut seen = Vec::new();
+        for (_, relay) in relays {
+            let (_, next_tid, out) = relay.process_tunnel_data(&tid, &data).unwrap().unwrap();
+            seen.push(out.len());
+            data = out;
+            tid = next_tid;
+        }
+        (seen, data)
+    }
+
     #[test]
-    fn test_tunnel_build_processing_decrypt() {
+    fn tunnel_roundtrip_with_constant_length() {
+        let (tunnel, relays) = setup(4); // gateway, 中継, ガード, 自分
+        let msg = b"Hello Anonymously!";
+        let (lens, out) = traverse(&relays, msg);
+        assert!(lens.windows(2).all(|w| w[0] == w[1]), "ホップごとに長さが変わった: {:?}", lens);
+        assert_eq!(tunnel.decrypt(&out).unwrap(), msg);
+    }
 
-        use crate::crypto::cipher;
+    #[test]
+    fn replies_of_different_sizes_look_alike() {
+        let (_, relays) = setup(3);
+        let (a, _) = traverse(&relays, &[1u8; 30]);
+        let (b, _) = traverse(&relays, &[2u8; 700]);
+        assert_eq!(a, b, "応答の大きさが中継から見分けられる");
+    }
 
-        // 1. Setup Keys
-        let alice_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let alice_pk = x25519_dalek::PublicKey::from(&alice_secret);
-        let alice_addr: SocketAddr = "10.0.0.3:9000".parse().unwrap();
+    #[test]
+    fn only_the_gateway_id_has_the_gateway_bit() {
+        let (tunnel, relays) = setup(4);
+        assert!(is_gateway_id(&tunnel.endpoint.tunnel_id));
+        assert!(relays[1..].iter().all(|(tid, _)| !is_gateway_id(tid)));
+    }
 
-        let relay_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let relay_pk = x25519_dalek::PublicKey::from(&relay_secret);
-        let relay_addr: SocketAddr = "10.0.0.2:9000".parse().unwrap();
-
-        let gateway_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let gateway_pk = x25519_dalek::PublicKey::from(&gateway_secret);
-        let gateway_addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
-
-        // 2. Build Tunnel: Gateway -> Relay -> Alice
-        let path = vec![gateway_addr, relay_addr, alice_addr];
-        let hop_pubkeys = vec![gateway_pk.to_bytes(), relay_pk.to_bytes(), alice_pk.to_bytes()];
-
-        let (alice_tunnel, mut hop_instructions) = InboundTunnel::build(path.clone(), hop_pubkeys).unwrap();
-
-        assert_eq!(hop_instructions.len(), 3);  // Gateway, Relay, Alice
-
-        // 3. Register Tunnels
-        let mut gateway_node = TunnelRelay::new();
-        let mut relay_node = TunnelRelay::new();
-
-        // --- Gateway Registration ---
-        let (gw_target, gw_data) = hop_instructions.remove(0);
-        assert_eq!(gw_target, gateway_addr);
-
-        let gw_tunnel_id: [u8;32] = gw_data[0..32].try_into().unwrap();
-        let gw_eph_pk: [u8;32] = gw_data[32..64].try_into().unwrap();
-        let gw_nonce: [u8;12] = gw_data[64..76].try_into().unwrap();
-        let gw_enc_inst = &gw_data[76..];
-
-        let gw_eph_pub = x25519_dalek::PublicKey::from(gw_eph_pk);
-        let gw_shared = gateway_secret.diffie_hellman(&gw_eph_pub).to_bytes();
-        let gw_inst_bytes = cipher::decrypt(&gw_shared, &gw_nonce, gw_enc_inst).unwrap();
-        let gw_inst: HopInstruction = bincode::deserialize(&gw_inst_bytes).unwrap();
-
-        gateway_node.register_tunnel(gw_tunnel_id, gw_shared, gw_inst.next_hop.unwrap(), gw_inst.next_tunnel_id);
-
-        // --- Relay Registration ---
-        let (r_target, r_data) = hop_instructions.remove(0);
-        assert_eq!(r_target, relay_addr);
-
-        let r_tunnel_id: [u8;32] = r_data[0..32].try_into().unwrap();
-        let r_eph_pk: [u8;32] = r_data[32..64].try_into().unwrap();
-        let r_nonce: [u8;12] = r_data[64..76].try_into().unwrap();
-        let r_enc_inst = &r_data[76..];
-
-        let r_eph_pub = x25519_dalek::PublicKey::from(r_eph_pk);
-        let r_shared = relay_secret.diffie_hellman(&r_eph_pub).to_bytes();
-        let r_inst_bytes = cipher::decrypt(&r_shared, &r_nonce, r_enc_inst).unwrap();
-        let r_inst: HopInstruction = bincode::deserialize(&r_inst_bytes).unwrap();
-
-        relay_node.register_tunnel(r_tunnel_id, r_shared, r_inst.next_hop.unwrap(), r_inst.next_tunnel_id);
-
-        // --- Alice (Endpoint) Setup for Encryption ---
-        let (alice_target, alice_data) = hop_instructions.remove(0);
-        assert_eq!(alice_target, alice_addr);
-        let alice_eph_pk: [u8;32] = alice_data[32..64].try_into().unwrap();
-        let alice_eph_pub = x25519_dalek::PublicKey::from(alice_eph_pk);
-        let alice_shared = alice_secret.diffie_hellman(&alice_eph_pub).to_bytes();
-
-        // 4. Send Data through Tunnel
-        let original_msg = b"Hello Anonymously!";
-
-        // Gateway receives Raw Message
-        let (gw_next, gw_next_tid, gw_out) = gateway_node.process_tunnel_data(&gw_tunnel_id, original_msg).unwrap().unwrap();
-        assert_eq!(gw_next, relay_addr);
-        // gw_out is [Nonce][Enc(Msg)]
-
-        // Relay processes (forwarded from Gateway)
-        let (r_next, _r_next_tid, r_out) = relay_node.process_tunnel_data(&gw_next_tid, &gw_out).unwrap().unwrap();
-        assert_eq!(r_next, alice_addr);
-
-        // Alice processes (Endpoint encryption)
-        // 手動で process_tunnel_data 相当を実行 (Alice Node 実体がないため)
-        let (alice_enc, alice_nonce) = cipher::encrypt(&alice_shared, &r_out).unwrap();
-        let mut alice_out = Vec::new();
-        alice_out.extend_from_slice(&alice_nonce);
-        alice_out.extend_from_slice(&alice_enc);
-
-        // Alice Decrypts (Final Hop)
-        let decrypted_msg = alice_tunnel.decrypt(&alice_out).unwrap();
-
-        assert_eq!(decrypted_msg, original_msg);
+    #[test]
+    fn nonces_differ_at_every_hop() {
+        // 隣り合わないホップどうしが nonce でメッセージを突き合わせられないこと
+        let (_, relays) = setup(3);
+        let mut data = b"x".to_vec();
+        let mut tid = relays[0].0;
+        let mut nonces = Vec::new();
+        for (_, relay) in &relays {
+            let (_, next_tid, out) = relay.process_tunnel_data(&tid, &data).unwrap().unwrap();
+            nonces.push(out[..NONCE_LEN].to_vec());
+            data = out;
+            tid = next_tid;
+        }
+        assert_ne!(nonces[0], nonces[1]);
+        assert_ne!(nonces[1], nonces[2]);
+        assert_ne!(nonces[0], nonces[2]);
     }
 
     #[test]
@@ -441,11 +543,7 @@ mod tests {
             .iter()
             .zip(&secrets)
             .map(|((_, data), secret)| {
-                let eph: [u8; 32] = data[32..64].try_into().unwrap();
-                let nonce: [u8; 12] = data[64..76].try_into().unwrap();
-                let shared = secret.diffie_hellman(&PublicKey::from(eph)).to_bytes();
-                let plain = cipher::decrypt(&shared, &nonce, &data[76..]).unwrap();
-                bincode::deserialize::<HopInstruction>(&plain).unwrap().next_hop
+                open_build(secret, data).unwrap().2.next_hop
             })
             .collect();
 

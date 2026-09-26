@@ -4,7 +4,6 @@
 //! ネットワーク全体でノード数倍のコストになる (設計書 18.3-E)。
 //! ここでサイズ上限を固定し、うっかりフィールドが増えるのを防ぐ。
 
-use aether_core::crypto::key_exchange;
 use aether_core::net::onion::OnionCircuit;
 use aether_core::protocol::hint::{HintPacket, HintPayload};
 use std::net::SocketAddr;
@@ -55,15 +54,14 @@ fn onion_layer_overhead_and_throughput() {
         "10.0.0.3:8080".parse().unwrap(),
     ];
 
-    let mut circuit = OnionCircuit::new(1);
+    let mut circuit = OnionCircuit::new();
     let mut secrets = Vec::new();
     for addr in &relays {
-        let relay_static = key_exchange::StaticKey::generate();
-        let client_ephemeral = key_exchange::EphemeralKey::generate();
-        secrets.push(relay_static.diffie_hellman(&client_ephemeral.public_key()));
+        let relay_static = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         circuit
-            .add_hop(*addr, relay_static.public_key().to_bytes(), client_ephemeral)
+            .add_hop(*addr, x25519_dalek::PublicKey::from(&relay_static).to_bytes())
             .unwrap();
+        secrets.push(relay_static);
     }
 
     println!("\n--- 3-Hop Onion のペイロード膨張 ---");
@@ -87,7 +85,7 @@ fn onion_layer_overhead_and_throughput() {
     const ITERS: u32 = 200;
     let start = Instant::now();
     for _ in 0..ITERS {
-        let (_next, _inner) = OnionCircuit::unwrap_packet(&secrets[0], &wrapped).unwrap();
+        let _ = aether_core::net::onion::process_layer(&secrets[0], &wrapped).unwrap();
     }
     let elapsed = start.elapsed();
 

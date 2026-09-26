@@ -4,7 +4,6 @@ use crate::net::connection_pool::ConnectionPool;
 use crate::protocol::wire::{self, InnerPacketType, PacketType};
 use crate::net::onion::OnionCircuit;
 use crate::net::guard::{Guard, GuardCandidate, GuardSet, GUARD_SAMPLE_SIZE};
-use crate::crypto::key_exchange::EphemeralKey;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -107,11 +106,11 @@ impl RelayClient {
     /// 接続済みの入口から始まる経路で回路を組む
     ///
     /// `hops` は入口（接続済みのガード）から出口までの `(アドレス, X25519 公開鍵)`。
-    /// ホップごとに使い捨ての一時鍵を使う（回路間で鍵を使い回すと中継が回路を突き合わせられる）。
+    /// 一時鍵はパケットごとに作り直す（[`OnionCircuit::wrap_packet`]）。
     pub fn set_path(&mut self, hops: &[(SocketAddr, [u8; 32])]) -> Result<()> {
-        let mut circuit = OnionCircuit::new(1);
+        let mut circuit = OnionCircuit::new();
         for (addr, pubkey) in hops {
-            circuit.add_hop(*addr, *pubkey, EphemeralKey::generate())?;
+            circuit.add_hop(*addr, *pubkey)?;
         }
         self.circuit = Some(circuit);
         Ok(())

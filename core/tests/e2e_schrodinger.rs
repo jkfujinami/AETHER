@@ -14,7 +14,6 @@
 //! ```
 
 use aether_core::crypto::identity::{Identity, NodeId};
-use aether_core::crypto::key_exchange;
 use aether_core::mailbox::schrodinger::SchrodingerMailbox;
 use aether_core::net::gossip::GossipClient;
 use aether_core::net::onion::OnionCircuit;
@@ -71,14 +70,8 @@ async fn client_via(exit: &Node) -> RelayClient {
     let mut client = RelayClient::new().unwrap();
     client.connect_entry(exit.addr).await.expect("connect to exit");
 
-    let mut circuit = OnionCircuit::new(1);
-    circuit
-        .add_hop(
-            exit.addr,
-            exit.identity_x25519,
-            key_exchange::EphemeralKey::generate(),
-        )
-        .unwrap();
+    let mut circuit = OnionCircuit::new();
+    circuit.add_hop(exit.addr, exit.identity_x25519).unwrap();
     client.set_circuit(circuit);
     client
 }

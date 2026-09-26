@@ -9,7 +9,6 @@
 //! Sybil で Mailbox の座を取っても発信者には近づけない。
 
 use aether_core::crypto::identity::Identity;
-use aether_core::crypto::key_exchange;
 use aether_core::net::onion::OnionCircuit;
 use aether_core::net::relay::RelayClient;
 use std::net::SocketAddr;
@@ -43,9 +42,8 @@ async fn exit_relay_forwards_to_a_different_mailbox() {
         .await
         .expect("failed to connect to exit relay");
 
-    let mut circuit = OnionCircuit::new(1);
-    let ephemeral = key_exchange::EphemeralKey::generate();
-    circuit.add_hop(exit_addr, exit_x25519, ephemeral).unwrap();
+    let mut circuit = OnionCircuit::new();
+    circuit.add_hop(exit_addr, exit_x25519).unwrap();
     client.set_circuit(circuit);
 
     // Mailbox ペイロード: [Key(32)][Value]
