@@ -112,6 +112,11 @@ impl AetherClient {
                 Session::initiator(&sk, &bundle.signed_prekey, init)
             }
         };
+        // Hint（宛先の認識・本体の置き場所）の秘密。会話が立っていれば日ごとの鍵チェーン、
+        // 初回接触の間は静的な DH（相手はまだ SK を持っていない）
+        let hint_secret = session
+            .hint_secret_for_send(aether_core::protocol::hint::current_timestamp())
+            .unwrap_or(shared_secret);
         let sealed = session.seal(message, &[])?;
         // **封じたらすぐ保存する。** 置く途中で失敗してから保存せずにやり直すと、同じ
         // メッセージ鍵（＝同じ鍵と nonce）で別の平文を封じることになる。途中まで置いた
@@ -129,7 +134,7 @@ impl AetherClient {
 
         let (body_c, hint_c) = self.body_and_hint_circuits().await?;
         let report_exits = (hex_id(&body_c.exit.node_id), hex_id(&hint_c.exit.node_id));
-        let mailbox = self.sending_mailbox(body_c, hint_c, to, shared_secret);
+        let mailbox = self.sending_mailbox(body_c, hint_c, to, hint_secret);
 
         let (hint, _key, profile) = mailbox.place_ratchet_body(&to, &body).await?;
         events::progress(&self.events, format!("本体を配置しました ({} バイト送出)", profile.bytes));

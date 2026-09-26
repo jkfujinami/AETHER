@@ -262,7 +262,15 @@ impl AetherClient {
         if let Err(e) = keystore.prune_seen() {
             events::warning(&self.events, format!("処理済みの目印を掃除できません: {}", e));
         }
-        let secrets_now = || receiver.subs.lock().unwrap().secrets.clone();
+        // 認識に使う秘密：購読（静的な DH・板の鍵）＋会話ごとの Hint 鍵チェーン（昨日・今日・明日）
+        let secrets_now = || {
+            let (secrets, _, moved) = with_hint_chains(&receiver.subs.lock().unwrap(), &keystore);
+            if moved {
+                // 日が変わった。新しい鍵で拾えるよう次の周回で張り替える
+                receiver.changed.store(true, Ordering::SeqCst);
+            }
+            secrets
+        };
 
         // 最初のトンネル。リレー一覧の収束を待ちつつ粘る
         let deadline = Instant::now() + FIRST_SESSION_WAIT;
@@ -364,7 +372,7 @@ impl AetherClient {
             }
 
             let current = sessions[0].mailbox.clone();
-            let origins = receiver.subs.lock().unwrap().origins.clone();
+            let (_, origins, _) = with_hint_chains(&receiver.subs.lock().unwrap(), &keystore);
             let mut done = Vec::new();
             for (mailbox_key, p) in pending.iter_mut() {
                 // 封が別メッセージ・偽造を弾くので、素通しで足していい
@@ -390,8 +398,15 @@ impl AetherClient {
                             done.push(*mailbox_key);
                             continue;
                         }
+                        let had_session = keystore.contains(contact);
                         match open_private_body(&keystore, &identity, prekeys.as_ref(), &me, contact, &body) {
-                            Ok(Some(msg)) => (msg, None),
+                            Ok(Some(msg)) => {
+                                if !had_session {
+                                    // 会話が立った。相手はこれから Hint 鍵チェーンで送ってくる
+                                    receiver.changed.store(true, Ordering::SeqCst);
+                                }
+                                (msg, None)
+                            }
                             Ok(None) => {
                                 done.push(*mailbox_key);
                                 continue;
@@ -473,6 +488,38 @@ async fn send_cover_fetch(mailbox: &SchrodingerMailbox, reply_to: &TunnelEndpoin
             .send_onion_message_typed(PacketType::TunnelData, &data, reply_to.gateway)
             .await;
     }
+}
+
+/// `(認識に使う秘密, 秘密ごとの出どころ, 日が進んだか)`
+type ChainedSubscriptions = (HashMap<NodeId, [u8; 32]>, HashMap<[u8; 32], Origin>, bool);
+
+/// 購読に、会話ごとの Hint 鍵チェーンの秘密を足したもの
+///
+/// チェーンの秘密は合成した NodeId をキーにして Mailbox の連絡先へ入れる
+/// （認識は値だけを見るので、キーは重ならなければ何でもよい）。
+fn with_hint_chains(
+    subs: &Subscriptions,
+    keystore: &KeyStore,
+) -> ChainedSubscriptions {
+    let mut secrets = subs.secrets.clone();
+    let mut origins = subs.origins.clone();
+    let now = aether_core::protocol::hint::current_timestamp();
+    let mut moved_any = false;
+    for origin in subs.origins.values() {
+        let Origin::Private(contact) = origin else { continue };
+        let Ok(Some(mut session)) = keystore.load(contact) else { continue };
+        let (keys, moved) = session.hint_secrets_for_receive(now);
+        if moved {
+            // 古い日の鍵をディスクから消す
+            let _ = keystore.save(contact, &session);
+            moved_any = true;
+        }
+        for key in keys {
+            secrets.insert(NodeId(key), key);
+            origins.insert(key, Origin::Private(*contact));
+        }
+    }
+    (secrets, origins, moved_any)
 }
 
 fn add_private(subs: &mut Subscriptions, identity: &Identity, c: &Contact) -> Result<()> {

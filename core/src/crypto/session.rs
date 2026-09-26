@@ -21,6 +21,22 @@
 //! 受け取った側は、初回メッセージの一時鍵を覚えておく（[`Session::peer_initial_ek`]）。
 //! 同じ一時鍵の初回メッセージが再び来ても、セッションを作り直さない。
 //!
+//! # Hint の鍵も日ごとに進める
+//!
+//! 宛先の認識（Hint の blind_tag・Hint の暗号・本体の置き場所）は、以前は身元鍵同士の
+//! 静的な DH（`Identity::agree`）だけで作っていた。Broadcast Veil では監視ノードも全 Hint を
+//! 受け取って保存できるので、端末を押収されて身元鍵を取られると、保存されていた過去の
+//! 全 Hint から「誰と・いつ」やり取りしたかを復元できた（本文はラチェットで守られていても、
+//! メタデータに前方秘匿が無かった）。
+//!
+//! そこで会話が立ったら、Hint 用の秘密を X3DH の `SK` から作る**日ごとのハッシュチェーン**
+//! （[`HintChain`]）に切り替える。`K_{d+1} = H(K_d)` なので、両者は日付だけから同じ鍵を
+//! 計算でき、網のやり取りは増えない。前の日の鍵は捨てるので、押収されても読めるのは
+//! その日以降だけ。`SK` 自体は保存しない。
+//!
+//! 静的な DH が残るのは、相手がまだ `SK` を持っていない初回接触の間
+//! （[`Session::pending_initial`] がある間）だけ。
+//!
 //! [`InitialMessage`]: crate::crypto::x3dh::InitialMessage
 
 use crate::crypto::ratchet::{Header, Ratchet};
@@ -35,10 +51,67 @@ struct SealedBody {
     ciphertext: Vec<u8>,
 }
 
+/// 1 日の長さ（Hint 鍵チェーンの刻み）
+pub const HINT_DAY_SECS: u64 = 24 * 3600;
+
+/// Hint 用の秘密の日ごとのハッシュチェーン（モジュール先頭の説明を参照）
+///
+/// 手元に残すのは今日と昨日の鍵だけ。昨日の鍵は、日付をまたいで届いた Hint
+/// （backlog の 24 時間の窓・時計のずれ）を認識するため。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct HintChain {
+    day: u64,
+    today: [u8; 32],
+    yesterday: [u8; 32],
+}
+
+impl HintChain {
+    /// `SK` から、`now` の日の鍵まで進めたチェーンを作る
+    ///
+    /// 日番号 0 から数えるので、両者は作った日が違っても同じ鍵に到達する
+    /// （数万回の SHA-256 で、作るときに 1 回だけ）。
+    fn new(sk: &[u8; 32], now: u64) -> Self {
+        let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, sk);
+        let mut key = [0u8; 32];
+        hk.expand(b"aether_hint_chain_v1", &mut key)
+            .expect("32 バイトは HKDF の上限内");
+        let day = now / HINT_DAY_SECS;
+        let mut yesterday = key;
+        for _ in 0..day {
+            yesterday = key;
+            key = Self::step(&key);
+        }
+        Self { day, today: key, yesterday }
+    }
+
+    fn step(key: &[u8; 32]) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::new()
+            .chain_update(b"aether_hint_chain_step_v1")
+            .chain_update(key)
+            .finalize()
+            .into()
+    }
+
+    /// `now` の日まで進める（戻らない）。進めたら true
+    fn advance(&mut self, now: u64) -> bool {
+        let target = now / HINT_DAY_SECS;
+        let moved = target > self.day;
+        while self.day < target {
+            self.yesterday = self.today;
+            self.today = Self::step(&self.today);
+            self.day += 1;
+        }
+        moved
+    }
+}
+
 /// 連絡先1人ぶんの前方秘匿セッション（KeyStore に永続化する）
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     ratchet: Ratchet,
+    /// Hint 用の秘密のチェーン（[`HintChain`]）
+    hint: HintChain,
     /// 開始側で、まだ相手から 1 通も受け取っていない間は、送るたびに添える初回メッセージ
     pub pending_initial: Option<InitialMessage>,
     /// 応答側で、このセッションを立てた初回メッセージの一時鍵
@@ -53,6 +126,7 @@ impl Session {
     pub fn initiator(sk: &[u8; 32], peer_signed_prekey: &[u8; 32], initial: InitialMessage) -> Self {
         Self {
             ratchet: Ratchet::init_alice(sk, peer_signed_prekey),
+            hint: HintChain::new(sk, crate::protocol::hint::current_timestamp()),
             pending_initial: Some(initial),
             peer_initial_ek: None,
         }
@@ -64,6 +138,7 @@ impl Session {
     pub fn responder(sk: &[u8; 32], my_signed_prekey_secret: &[u8; 32], initial_ek: [u8; 32]) -> Self {
         Self {
             ratchet: Ratchet::init_bob(sk, my_signed_prekey_secret),
+            hint: HintChain::new(sk, crate::protocol::hint::current_timestamp()),
             pending_initial: None,
             peer_initial_ek: Some(initial_ek),
         }
@@ -72,6 +147,25 @@ impl Session {
     /// 相手から 1 通でも受け取ったか（開始側で、初回メッセージを添えなくてよくなったか）
     pub fn has_heard_from_peer(&self) -> bool {
         self.pending_initial.is_none()
+    }
+
+    /// 送信する Hint に使う秘密。相手がまだ `SK` を持っていない（初回接触の）間は `None`
+    ///
+    /// `None` のときは呼び出し側が静的な DH の秘密を使う。日が変わっていればチェーンを
+    /// 進めるので、呼び出し側はこの後セッションを保存すること。
+    pub fn hint_secret_for_send(&mut self, now: u64) -> Option<[u8; 32]> {
+        self.hint.advance(now);
+        self.pending_initial.is_none().then_some(self.hint.today)
+    }
+
+    /// 受信で認識に使う Hint の秘密（昨日・今日・明日）。進めたら第 2 要素が true
+    ///
+    /// 明日の鍵は今日の鍵から計算できるので、手元に残しても前方秘匿は損なわない。
+    /// 相手の時計が進んでいる・日付の境目で送られた Hint を取りこぼさないために含める。
+    pub fn hint_secrets_for_receive(&mut self, now: u64) -> ([[u8; 32]; 3], bool) {
+        let moved = self.hint.advance(now);
+        let tomorrow = HintChain::step(&self.hint.today);
+        ([self.hint.yesterday, self.hint.today, tomorrow], moved)
     }
 
     /// 1 通を封じる
@@ -183,6 +277,47 @@ mod tests {
         assert!(b.open(b"garbage", b"").is_err());
 
         assert_eq!(b.open(&good, b"").unwrap(), b"good");
+    }
+
+    #[test]
+    fn hint_chain_agrees_on_both_sides_and_only_after_hearing_back() {
+        let (mut a, mut b) = pair();
+        let now = crate::protocol::hint::current_timestamp();
+        assert!(a.hint_secret_for_send(now).is_none(), "初回接触の間は静的な秘密を使う");
+        let bob_today = b.hint_secret_for_send(now).expect("応答側は SK を持っている");
+        let (alice_keys, _) = a.hint_secrets_for_receive(now);
+        assert!(alice_keys.contains(&bob_today));
+
+        b.open(&a.seal(b"x", b"").unwrap(), b"").ok();
+        a.open(&b.seal(b"y", b"").unwrap(), b"").unwrap();
+        assert_eq!(a.hint_secret_for_send(now), Some(bob_today));
+    }
+
+    #[test]
+    fn hint_chain_forgets_older_days() {
+        let (mut a, _) = pair();
+        let now = crate::protocol::hint::current_timestamp();
+        let (before, _) = a.hint_secrets_for_receive(now);
+        let (after, moved) = a.hint_secrets_for_receive(now + 3 * HINT_DAY_SECS);
+        assert!(moved);
+        for old in &before {
+            assert!(!after.contains(old), "3 日後に 3 日前の鍵が残っている");
+        }
+        // 一方通行: 前の日へは戻らない
+        let (again, moved) = a.hint_secrets_for_receive(now);
+        assert!(!moved);
+        assert_eq!(again, after);
+    }
+
+    #[test]
+    fn hint_chains_created_on_different_days_meet() {
+        let sk = [7u8; 32];
+        let day = HINT_DAY_SECS;
+        let mut early = HintChain::new(&sk, 20_000 * day);
+        let late = HintChain::new(&sk, 20_002 * day);
+        early.advance(20_002 * day);
+        assert_eq!(early.today, late.today);
+        assert_eq!(early.yesterday, late.yesterday);
     }
 
     #[test]
