@@ -1,5 +1,7 @@
 # AETHER
 
+> **English:** [README_en.md](README_en.md) · Design document: [docs/whitepaper.md](docs/whitepaper.md)
+
 **匿名 P2P ネットワーク ── Winny 後継**
 
 私信メッセンジャーと公開ファイル共有・掲示板を、**1つの匿名基盤**の上に載せた Rust 実装です。「誰が・誰に・何を送ったか」をネットワーク観測から隠し、押収に耐え、コンテンツを消えなくします。
