@@ -154,12 +154,20 @@ impl KeyFiles {
     ///
     /// 友だち一覧・お気に入りの板など、「誰と・どこで」を示すものに使う。
     /// 押収されても、パスフレーズ無しには読めない。無ければ `None`。
+    ///
+    /// **パスフレーズが設定されているのに平文（magic なし）のファイルを読んだ場合、
+    /// 読んだ後に暗号化して書き直す。** 後からパスフレーズを設定した人の
+    /// 古い平文ファイルが、以後もずっと平文のまま残ってしまう問題への対処。
+    /// 書き直しに失敗しても読み出し自体は成功させる（鍵を読めないよりまし）。
     pub(crate) fn read_secure(&self, path: &Path) -> Result<Option<Vec<u8>>> {
         if !path.exists() {
             return Ok(None);
         }
         let raw = std::fs::read(path)?;
         let Some(rest) = raw.strip_prefix(SECURE_MAGIC.as_slice()) else {
+            if self.passphrase().is_some() {
+                let _ = self.write_secure(path, &raw);
+            }
             return Ok(Some(raw));
         };
         let pass = self.passphrase().ok_or_else(|| {
@@ -180,7 +188,6 @@ impl KeyFiles {
 
     /// 小さな設定ファイルを書く（パスフレーズがあれば暗号化、所有者だけが読める権限）
     pub(crate) fn write_secure(&self, path: &Path, plain: &[u8]) -> Result<()> {
-        std::fs::create_dir_all(&self.data_dir)?;
         let bytes = match self.passphrase() {
             Some(pass) => {
                 let salt: [u8; 16] = rand::random();
@@ -192,15 +199,11 @@ impl KeyFiles {
             }
             None => plain.to_vec(),
         };
-        std::fs::write(path, bytes)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        write_private_atomic(&self.data_dir, path, &bytes)
     }
 
+    /// 鍵ファイルを読む。**パスフレーズが設定されているのに平文だった場合は
+    /// 読んだ後に暗号化して書き直す**（[`read_secure`](Self::read_secure) と同じ理由）。
     pub(crate) fn read_key(&self, path: &Path) -> Result<Identity> {
         let bytes = std::fs::read(path)?;
         // 暗号化された鍵（マジック付き）はパスフレーズが要る。平文はそのまま。
@@ -213,25 +216,56 @@ impl KeyFiles {
             })?;
             Ok(Identity::from_encrypted_bytes(&bytes, pass)?)
         } else {
-            Ok(Identity::from_bytes(&bytes)?)
+            let identity = Identity::from_bytes(&bytes)?;
+            if self.passphrase().is_some() {
+                let _ = self.write_key(path, &identity);
+            }
+            Ok(identity)
         }
     }
 
     /// 鍵を書く（パスフレーズがあれば暗号化、所有者だけが読める権限）
     pub(crate) fn write_key(&self, path: &Path, identity: &Identity) -> Result<()> {
-        std::fs::create_dir_all(&self.data_dir)?;
-
         let bytes = match self.passphrase() {
             Some(pass) => identity.to_encrypted_bytes(pass)?,
             None => identity.to_bytes().to_vec(),
         };
-        std::fs::write(path, bytes)?;
+        write_private_atomic(&self.data_dir, path, &bytes)
+    }
+}
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+/// `bytes` を `path` へ原子的に書く（unix では所有者だけが読める権限で）
+///
+/// 書いてから `chmod` すると、書き込みから権限変更までの一瞬 0644 (誰でも読める) の
+/// 窓ができる。一時ファイルを最初から 0600 で作って書き、`rename` で置き換えれば
+/// その窓が無い（rename は同一ファイルシステム内ではアトミック）。
+fn write_private_atomic(data_dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        // 同時に複数プロセスが書かないので固定名で十分。同じディレクトリに置いて
+        // rename が同一ファイルシステム内で完結するようにする。
+        let tmp_path = path.with_extension("tmp-write");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)?;
         Ok(())
     }
 }
@@ -270,5 +304,65 @@ mod tests {
 
         assert!(KeyFiles::new(dir.path(), None).load_identity().is_err());
         assert_eq!(locked.load_identity().unwrap().public_id(), id.public_id());
+    }
+
+    /// パスフレーズ無しで作った鍵（平文）を、後からパスフレーズ付きで読むと
+    /// 暗号化して書き直されること。古い平文ファイルが永遠に平文で残る問題への対処。
+    #[test]
+    fn reading_a_plaintext_key_with_a_passphrase_re_encrypts_it_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = KeyFiles::new(dir.path(), None);
+        let id = plain.create_identity(false).unwrap();
+        let path = plain.identity_path();
+
+        let raw_before = std::fs::read(&path).unwrap();
+        assert!(!Identity::is_encrypted_bytes(&raw_before), "前提条件: 平文で保存されているはず");
+
+        let locked = KeyFiles::new(dir.path(), Some("correct horse".into()));
+        let read_back = locked.load_identity().unwrap();
+        assert_eq!(read_back.public_id(), id.public_id(), "読み出し自体はパスフレーズ無しでも成功すること");
+
+        let raw_after = std::fs::read(&path).unwrap();
+        assert!(Identity::is_encrypted_bytes(&raw_after), "読んだ後、暗号化して書き直されているはず");
+
+        // 書き直された後も同じパスフレーズで読める
+        assert_eq!(locked.load_identity().unwrap().public_id(), id.public_id());
+        // パスフレーズ無しではもう読めない
+        assert!(plain.load_identity().is_err());
+    }
+
+    /// `read_secure` 側（friends.bin 等）でも同じ書き直しが起きること
+    #[test]
+    fn reading_a_plaintext_secure_file_with_a_passphrase_re_encrypts_it_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = KeyFiles::new(dir.path(), None);
+        let path = dir.path().join("friends.bin");
+        plain.write_secure(&path, b"plain contents").unwrap();
+
+        let raw_before = std::fs::read(&path).unwrap();
+        assert!(!raw_before.starts_with(SECURE_MAGIC), "前提条件: 平文で保存されているはず");
+
+        let locked = KeyFiles::new(dir.path(), Some("correct horse".into()));
+        let read_back = locked.read_secure(&path).unwrap().unwrap();
+        assert_eq!(read_back, b"plain contents");
+
+        let raw_after = std::fs::read(&path).unwrap();
+        assert!(raw_after.starts_with(SECURE_MAGIC), "読んだ後、暗号化して書き直されているはず");
+        assert_eq!(locked.read_secure(&path).unwrap().unwrap(), b"plain contents");
+    }
+
+    /// 書いたファイルが所有者だけ読める権限（0600）で、しかも
+    /// 書き込み中に緩い権限の窓ができないこと（rename による原子的な置き換え）
+    #[cfg(unix)]
+    #[test]
+    fn written_files_are_owner_only_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyFiles::new(dir.path(), None);
+        keys.create_identity(false).unwrap();
+
+        let mode = std::fs::metadata(keys.identity_path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

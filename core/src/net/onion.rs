@@ -359,7 +359,14 @@ fn process_layer_at(
             let inner = ChaCha20Poly1305::new((&keys.payload).into())
                 .decrypt(&[0u8; 12].into(), body)
                 .map_err(|_| AetherError::Crypto("Onion payload authentication failed".into()))?;
-            let len = u32::from_be_bytes(inner[..4].try_into().expect("バケットは 4 バイト以上")) as usize;
+            // 正規の wrap_at は最低 MIN_PADDED_LEN バイトのバケットを作るので、ここが
+            // 4 バイト未満になるのは本文がタグのみ（body が TAG_LEN ちょうど）等の
+            // 不正なパケットだけ。`inner[..4]` へ直接インデックスすると panic するので
+            // 弾いてから読む。
+            if inner.len() < 4 {
+                return Err(AetherError::Protocol("Onion exit payload too short".into()));
+            }
+            let len = u32::from_be_bytes(inner[..4].try_into().expect("長さ確認済み")) as usize;
             let payload = inner
                 .get(4..4 + len)
                 .ok_or_else(|| AetherError::Protocol("Onion payload length out of range".into()))?
@@ -529,5 +536,44 @@ mod tests {
     fn too_many_hops_is_an_error() {
         let (mut circuit, _, _) = relays(3);
         assert!(circuit.add_hop("10.0.0.9:9".parse().unwrap(), [1; 32]).is_err());
+    }
+
+    /// 出口の本文がタグのみ（空平文の AEAD 出力・16 バイト）の不正パケットでも
+    /// panic せずエラーを返すこと（`inner[..4]` への素通しインデックスの回帰テスト）。
+    ///
+    /// `wrap_at` は常に `MIN_PADDED_LEN` 以上のバケットを作るのでこの形は正規には
+    /// 現れない。ここでは同じ private ヘルパーを使い、手で出口宛てパケットを組む。
+    #[test]
+    fn exit_with_tag_only_body_does_not_panic() {
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let pubkey = PublicKey::from(&secret);
+
+        let eph = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+        let alpha = PublicKey::from(&eph).to_bytes();
+        let shared = eph.diffie_hellman(&pubkey).to_bytes();
+        let keys = HopKeys::derive(&shared);
+
+        let minute = now_minutes();
+        let mut beta = vec![0u8; HEADER_BLOCK];
+        beta[..ROUTE_LEN].copy_from_slice(&encode_route(None, minute));
+        rand::Rng::fill(&mut rand::thread_rng(), &mut beta[SLOT..]);
+        let stream = keystream(&keys.header, beta.len());
+        xor_into(&mut beta, &stream);
+        let gamma = mac(&keys.mac, &beta);
+
+        // 空平文の AEAD 出力 = タグのみ 16 バイト
+        let body = ChaCha20Poly1305::new((&keys.payload).into())
+            .encrypt(&[0u8; 12].into(), &[][..])
+            .unwrap();
+        assert_eq!(body.len(), TAG_LEN);
+
+        let mut packet = Vec::with_capacity(32 + MAC_LEN + HEADER_BLOCK + TAG_LEN);
+        packet.extend_from_slice(&alpha);
+        packet.extend_from_slice(&gamma);
+        packet.extend_from_slice(&beta);
+        packet.extend_from_slice(&body);
+
+        // 以前は inner[..4] で panic していた。今はエラーを返すだけであること
+        assert!(process_layer(&secret, &packet).is_err());
     }
 }

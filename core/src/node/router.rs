@@ -67,7 +67,16 @@ impl Router {
     ///
     /// ヘッダの MAC と時刻を確かめ、次のホップへ同じ長さのまま転送するか、
     /// 自分が出口なら中身を返す。
-    pub async fn handle_packet(&self, packet: &[u8]) -> Result<RoutingAction> {
+    ///
+    /// `is_allowed_next` で次ホップの妥当性を確かめてから転送する。
+    /// **Router 自身はディレクトリを持たない**ので、呼び出し側（ノード）が
+    /// 「自分自身か既知リレーか」を判定する述語を渡す。これが無いと、
+    /// 中継が任意の踏み台・内部アドレスへダイヤルさせられる。
+    pub async fn handle_packet(
+        &self,
+        packet: &[u8],
+        is_allowed_next: impl Fn(SocketAddr) -> bool,
+    ) -> Result<RoutingAction> {
         let (alpha, action) = onion::process_layer(&self.identity.x25519_secret(), packet)?;
 
         // **リプレイは捨てる。** 同じパケットを何度でも処理すると、ガードが同じものを
@@ -82,6 +91,12 @@ impl Router {
 
         match action {
             OnionAction::Forward { next, packet } => {
+                if !is_allowed_next(next) {
+                    return Err(AetherError::Protocol(format!(
+                        "Onion forward to disallowed next hop {} dropped",
+                        next
+                    )));
+                }
                 debug!("Forwarding packet to {}", next);
                 self.forward_packet(next, &packet).await?;
                 Ok(RoutingAction::Forwarded)
@@ -199,13 +214,32 @@ mod tests {
         let packet = packet_for(&identity);
 
         assert!(matches!(
-            router.handle_packet(&packet).await.unwrap(),
+            router.handle_packet(&packet, |_| true).await.unwrap(),
             RoutingAction::LocalProcessing(_)
         ));
-        assert!(router.handle_packet(&packet).await.is_err(), "同じ層を二度処理した");
+        assert!(router.handle_packet(&packet, |_| true).await.is_err(), "同じ層を二度処理した");
 
         // 同じ回路でも別パケット（一時鍵が違う）は通る
         let other = packet_for(&identity);
-        assert!(router.handle_packet(&other).await.is_ok());
+        assert!(router.handle_packet(&other, |_| true).await.is_ok());
+    }
+
+    /// 次ホップが許可述語に落ちる場合は転送しない（踏み台・内部アドレス対策）
+    #[tokio::test]
+    async fn forward_to_disallowed_next_hop_is_rejected() {
+        let identity = Arc::new(Identity::generate());
+        let router = Router::new(identity.clone()).unwrap();
+
+        // 2ホップの回路: 自分は最初のホップ（転送役）
+        let mut circuit = OnionCircuit::new();
+        let self_pubkey = PublicKey::from(&identity.x25519_secret()).to_bytes();
+        circuit.add_hop("127.0.0.1:9000".parse().unwrap(), self_pubkey).unwrap();
+        let stranger = Identity::generate();
+        let stranger_pubkey = PublicKey::from(&stranger.x25519_secret()).to_bytes();
+        circuit.add_hop("203.0.113.9:9001".parse().unwrap(), stranger_pubkey).unwrap();
+        let packet = circuit.wrap_packet(b"payload").unwrap();
+
+        // 何も許可しない述語 → 転送されず、エラーになる
+        assert!(router.handle_packet(&packet, |_| false).await.is_err());
     }
 }

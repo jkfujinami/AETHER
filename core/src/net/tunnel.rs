@@ -24,8 +24,21 @@ use chacha20::cipher::{KeyIvInit, StreamCipher};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 use serde::{Serialize, Deserialize};
 use x25519_dalek::{PublicKey, StaticSecret};
+
+/// 登録済みトンネルの有効期間
+///
+/// これが無いと、10分ごとの張り替えでも古いエントリが溜まり続け、
+/// かつ誰でも任意の ID を登録できるので無制限の蓄積 DoS になる。
+/// 過ぎたものは `process_tunnel_data` で無効扱いにし、登録時にも掃除する。
+const TUNNEL_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// 登録を受け付けるトンネル数の上限
+///
+/// TTL だけでは、TTL 内に大量登録されると防げない。
+const MAX_TUNNELS: usize = 100_000;
 
 /// gateway 用の tunnel_id は先頭バイトの最下位ビットが 1（他のホップは 0）
 ///
@@ -340,10 +353,13 @@ impl InboundTunnel {
     }
 }
 
+/// 登録済みトンネル1件分: (共有秘密, 次ホップ, 次のトンネルID, 登録時刻)
+type TunnelEntry = ([u8; 32], SocketAddr, [u8; 32], Instant);
+
 /// トンネル中継ノードの処理
 pub struct TunnelRelay {
-    /// 登録されたトンネル: tunnel_id -> (共有秘密, 次ホップ, 次のトンネルID)
-    tunnels: std::collections::HashMap<[u8; 32], ([u8; 32], SocketAddr, [u8; 32])>,
+    /// 登録されたトンネル: tunnel_id -> エントリ
+    tunnels: std::collections::HashMap<[u8; 32], TunnelEntry>,
 }
 
 impl Default for TunnelRelay {
@@ -369,14 +385,53 @@ impl TunnelRelay {
     }
 
     /// トンネルを登録する (Gateway がトンネル構築時に呼ばれる)
+    ///
+    /// **既存の tunnel_id は上書きしない。** gateway の tunnel_id は
+    /// 保持者や出口に見える値なので、同じ ID で TunnelBuild を送りつければ
+    /// 返信トンネルを乗っ取れてしまう。呼び出し側は戻り値が `false` なら
+    /// 登録が拒否されたことをログに残すこと。
+    ///
+    /// 登録のたびに期限切れエントリを掃除し、上限（[`MAX_TUNNELS`]）を超える
+    /// 新規登録も拒否する（誰でも登録できる以上、無制限の蓄積を防ぐ必要がある）。
+    #[must_use = "登録が拒否された場合、呼び出し側はログに残すこと"]
     pub fn register_tunnel(
         &mut self,
         tunnel_id: [u8; 32],
         shared_key: [u8; 32],
         next_hop: SocketAddr,
         next_tunnel_id: [u8; 32],
+    ) -> bool {
+        self.cleanup_expired();
+
+        if self.tunnels.contains_key(&tunnel_id) {
+            return false;
+        }
+        if self.tunnels.len() >= MAX_TUNNELS {
+            return false;
+        }
+
+        self.tunnels.insert(tunnel_id, (shared_key, next_hop, next_tunnel_id, Instant::now()));
+        true
+    }
+
+    /// 期限切れ（[`TUNNEL_TTL`] を過ぎた）エントリを取り除く
+    fn cleanup_expired(&mut self) {
+        let now = Instant::now();
+        self.tunnels.retain(|_, (_, _, _, registered_at)| now.duration_since(*registered_at) < TUNNEL_TTL);
+    }
+
+    /// テスト用: 登録時刻を `age` 前にずらして直接挿入する（TTL 切れの状態を作る）
+    #[cfg(test)]
+    fn insert_raw(
+        &mut self,
+        tunnel_id: [u8; 32],
+        shared_key: [u8; 32],
+        next_hop: SocketAddr,
+        next_tunnel_id: [u8; 32],
+        age: Duration,
     ) {
-        self.tunnels.insert(tunnel_id, (shared_key, next_hop, next_tunnel_id));
+        let registered_at = Instant::now() - age;
+        self.tunnels.insert(tunnel_id, (shared_key, next_hop, next_tunnel_id, registered_at));
     }
 
     /// トンネルデータを処理する
@@ -390,8 +445,11 @@ impl TunnelRelay {
         tunnel_id: &[u8; 32],
         data: &[u8],
     ) -> Result<Option<ForwardingInstruction>> {
-        let (shared, next_hop, next_tunnel_id) = self.tunnels.get(tunnel_id)
+        let (shared, next_hop, next_tunnel_id, registered_at) = self.tunnels.get(tunnel_id)
             .ok_or_else(|| AetherError::Config("Unknown tunnel ID".into()))?;
+        if registered_at.elapsed() >= TUNNEL_TTL {
+            return Err(AetherError::Config("Tunnel expired".into()));
+        }
         let keys = TunnelKeys::derive(shared);
 
         let (nonce, mut body) = if is_gateway_id(tunnel_id) {
@@ -459,7 +517,7 @@ mod tests {
             .map(|((_, data), secret)| {
                 let (tid, shared, inst) = open_build(secret, data).unwrap();
                 let mut relay = TunnelRelay::new();
-                relay.register_tunnel(tid, shared, inst.next_hop.unwrap(), inst.next_tunnel_id);
+                assert!(relay.register_tunnel(tid, shared, inst.next_hop.unwrap(), inst.next_tunnel_id));
                 (tid, relay)
             })
             .collect();
@@ -554,5 +612,44 @@ mod tests {
     fn builder_terminated_tunnel_needs_a_relay() {
         let path = vec!["10.0.0.1:9000".parse().unwrap(), "10.0.0.2:9000".parse().unwrap()];
         assert!(InboundTunnel::build_to_builder(path, vec![[1; 32], [2; 32]]).is_err());
+    }
+
+    /// 同じ tunnel_id で登録し直しても、既存の登録（次ホップ）は乗っ取られないこと
+    #[test]
+    fn register_tunnel_does_not_overwrite_existing_id() {
+        let mut relay = TunnelRelay::new();
+        let mut tid = [1u8; 32];
+        tid[0] |= GATEWAY_ID_BIT;
+        let original_next: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let hijack_next: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+
+        assert!(relay.register_tunnel(tid, [1u8; 32], original_next, [2u8; 32]));
+        assert!(
+            !relay.register_tunnel(tid, [9u8; 32], hijack_next, [9u8; 32]),
+            "既存 ID を上書きできてしまった"
+        );
+
+        let (next_hop, _, _) = relay.process_tunnel_data(&tid, b"hello").unwrap().unwrap();
+        assert_eq!(next_hop, original_next, "後から送りつけた登録に乗っ取られた");
+    }
+
+    /// TTL を過ぎた登録は無効に扱われ、次の登録で掃除されて上書きできること
+    #[test]
+    fn expired_tunnel_is_rejected_and_then_cleaned_up() {
+        let mut relay = TunnelRelay::new();
+        let mut tid = [3u8; 32];
+        tid[0] |= GATEWAY_ID_BIT;
+        relay.insert_raw(
+            tid,
+            [1u8; 32],
+            "10.0.0.1:9000".parse().unwrap(),
+            [2u8; 32],
+            TUNNEL_TTL + Duration::from_secs(1),
+        );
+
+        assert!(relay.process_tunnel_data(&tid, b"hello").is_err(), "期限切れなのに処理された");
+
+        // register_tunnel は登録のたびに期限切れを掃除するので、同じ ID でも通る
+        assert!(relay.register_tunnel(tid, [9u8; 32], "10.0.0.9:9000".parse().unwrap(), [9u8; 32]));
     }
 }

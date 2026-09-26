@@ -259,9 +259,23 @@ pub async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Packet
         _ => PacketType::Unknown,
     };
 
-    // Payload
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload).await.map_err(AetherError::Network)?;
+    // Payload: 申告された長さぶんを先に確保しない。
+    //
+    // `vec![0u8; len]` だと、送り主が中身を送らないまま長さだけ大きく申告する
+    // ストリームを多数開くだけで、受け手にメモリを確保させ続けられる
+    // （DoS）。`take(len)` で実際に届いた分だけ読み、そのぶんだけ伸ばす。
+    let mut payload = Vec::new();
+    let read = (&mut *reader)
+        .take(len as u64)
+        .read_to_end(&mut payload)
+        .await
+        .map_err(AetherError::Network)?;
+    if read != len {
+        return Err(AetherError::Protocol(format!(
+            "Packet payload shorter than declared length: got {} of {}",
+            read, len
+        )));
+    }
 
     Ok((packet_type, payload))
 }
@@ -280,4 +294,36 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(writer: &mut W, packet_type: Pa
     writer.write_all(payload).await.map_err(AetherError::Network)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_packet_roundtrip() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let payload = vec![0x42u8; 200];
+        write_packet(&mut client, PacketType::GossipHint, &payload).await.unwrap();
+        drop(client);
+
+        let (packet_type, body) = read_packet(&mut server).await.unwrap();
+        assert_eq!(packet_type, PacketType::GossipHint);
+        assert_eq!(body, payload);
+    }
+
+    /// 申告した長さぶんの中身が実際には届かない場合はエラーにすること。
+    ///
+    /// 以前は `vec![0u8; len]` で申告長ぶんを先に確保していたため、
+    /// 多数のストリームで大きな長さだけ申告されるとメモリを消費させられた。
+    #[tokio::test]
+    async fn read_packet_rejects_short_body() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_u32(1000).await.unwrap();
+        client.write_u8(PacketType::MailboxPut as u8).await.unwrap();
+        client.write_all(b"abc").await.unwrap();
+        drop(client); // EOF: これ以上は届かない
+
+        assert!(read_packet(&mut server).await.is_err());
+    }
 }

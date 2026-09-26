@@ -421,28 +421,50 @@ impl NodeServer {
     /// Inbound Tunnel の終端（＝自分）への構築指示を自分の広告アドレスへ送ると、
     /// 経路上に「このアドレスがトンネルを作った」という足跡が残るだけで得るものが無い。
     pub async fn accept_own_tunnel_build(&self, payload: &[u8]) -> Result<()> {
-        Self::register_tunnel_build(&self.router, &self.tunnel_relay, payload, None).await
+        // 自分自身の分は next_hop が自分の広告アドレスなので、
+        // 転送先の検査（is_allowed_next）を通さなくてよい。
+        Self::register_tunnel_build(&self.router, &self.tunnel_relay, payload, None, |_| true).await
     }
 
     /// TunnelBuild を登録する
     ///
     /// `builder` はこの指示を運んできた接続の相手。`next_hop = None` の指示は
     /// そこへ返す（終端の手前のホップが、NAT 内の構築者へ届けるため）。
+    ///
+    /// `is_allowed_next` は `builder` が `Some`（＝網経由で届いた指示）かつ
+    /// `next_hop` が `Some(addr)` のときだけ効く。**ここを通さないと、網経由の
+    /// TunnelBuild で任意の踏み台・内部アドレスへダイヤルさせられる。**
+    /// `builder = None`（自分自身の分）や `next_hop = None`（構築者へ返す）は
+    /// 従来どおり検査しない。
     async fn register_tunnel_build(
         router: &Router,
         tunnel_relay: &RwLock<TunnelRelay>,
         payload: &[u8],
         builder: Option<SocketAddr>,
+        is_allowed_next: impl Fn(SocketAddr) -> bool,
     ) -> Result<()> {
         let (tid, shared_secret, inst) = router.process_tunnel_build(payload)?;
+
+        if builder.is_some()
+            && let Some(next_hop) = inst.next_hop
+            && !is_allowed_next(next_hop)
+        {
+            debug!("TunnelBuild next_hop {} is neither self nor a known relay; ignoring", next_hop);
+            return Ok(());
+        }
+
         let Some(next) = inst.next_hop.or(builder) else {
             tracing::warn!("TunnelBuild to return to its builder, but the builder is unknown. Ignoring.");
             return Ok(());
         };
-        tunnel_relay
+        if !tunnel_relay
             .write()
             .await
-            .register_tunnel(tid, shared_secret, next, inst.next_tunnel_id);
+            .register_tunnel(tid, shared_secret, next, inst.next_tunnel_id)
+        {
+            debug!("Tunnel registration for ID={:?} -> {} rejected (duplicate ID or full)", tid, next);
+            return Ok(());
+        }
         debug!("Tunnel registered: ID={:?} -> {}", tid, next);
         Ok(())
     }
@@ -599,8 +621,16 @@ impl NodeServer {
     ) -> Result<()> {
         match packet_type {
             PacketType::OnionPacket => {
+                // 中継先は自分か既知リレーに限る。そうでなければ、任意の踏み台・
+                // 内部アドレスへ中継がダイヤルさせられてしまう。
+                let action = {
+                    let dir = ctx.directory.read().await;
+                    ctx.router
+                        .handle_packet(&payload, |next| ctx.is_self(next) || is_known_relay_addr(&dir, next))
+                        .await?
+                };
 
-                match ctx.router.handle_packet(&payload).await? {
+                match action {
                     RoutingAction::Forwarded => {
                         // 転送完了
                         debug!("Onion packet forwarded");
@@ -624,10 +654,14 @@ impl NodeServer {
                                 if ctx.is_self(dest) {
                                     // 自分自身が Mailbox に選ばれている場合は素直に保存する
                                     ctx.mailbox.handle_put(payload).await?;
-                                } else {
+                                } else if is_known_relay_addr(&*ctx.directory.read().await, dest) {
                                     ctx.router
                                         .send_packet(dest, PacketType::MailboxPut, payload)
                                         .await?;
+                                } else {
+                                    // **転送先は既知リレーに限る。** そうでないと、出口リレーが
+                                    // 踏み台や内部アドレスへの任意ダイヤルに使われる。
+                                    debug!("MailboxForward dest {} is not a known relay; discarding", dest);
                                 }
                             }
                             wire::InnerPacketType::TypedForward => {
@@ -637,8 +671,11 @@ impl NodeServer {
 
                                 if ctx.is_self(dest) {
                                     Box::pin(Self::process_packet(packet_type, inner.to_vec(), ctx.clone())).await?;
-                                } else {
+                                } else if is_known_relay_addr(&*ctx.directory.read().await, dest) {
                                     ctx.router.send_packet(dest, packet_type, inner).await?;
+                                } else {
+                                    // **転送先は既知リレーに限る**（MailboxForward と同じ理由）。
+                                    debug!("TypedForward dest {} is not a known relay; discarding", dest);
                                 }
                             }
                             wire::InnerPacketType::GossipHint => {
@@ -753,7 +790,13 @@ impl NodeServer {
 
                 let response = {
                     let dir = ctx.directory.read().await;
-                    pex::select_response(&dir, &request, Some(&ctx.descriptor))
+                    // **`ctx.descriptor` ではなく、ディレクトリ上の自分のエントリを使う。**
+                    // `ctx.descriptor` は run() 時点のスナップショットで、
+                    // check_filtering_shared 等による Tier 昇格を反映しない
+                    // （反映先はディレクトリ側）。古い記述子を配り続けると、
+                    // 昇格が他ノードへ広まらない。
+                    let self_descriptor = dir.get(&ctx.descriptor.node_id).cloned();
+                    pex::select_response(&dir, &request, self_descriptor.as_ref())
                 };
 
                 debug!("PEX: returning {} relay(s) to {}", response.relays.len(), requester_addr);
@@ -769,6 +812,22 @@ impl NodeServer {
                 // その接続グラフはディレクトリで既に公開されている。
                 // **クライアント→ガードの punch を仲介してはならない**
                 // （守ろうとしているペアそのものが漏れる）。
+                //
+                // **未認証の PunchRequest を PunchNotify の送り主確認の回避に使わせない。**
+                // PunchNotify は「送り主が既知リレーか」しか見ないので、認証なしの
+                // PunchRequest を既知リレー A に送りつけ、A に任意候補付きの
+                // PunchNotify を既知リレー B へ出させれば、B は「既知リレーから」という
+                // だけで受け入れて第三者へプローブを撃ってしまう。ここで:
+                // (a) 観測できる送信元が無ければ無視する
+                // (b) request.requester がディレクトリに載っていて、その記述子の
+                //     アドレスが観測した送信元と一致する場合だけ仲介する（自称を信じない）
+                // (c) 相手へ渡す候補は申告の request.candidates ではなく、
+                //     観測した送信元アドレスだけにする
+                let Some(sender_addr) = ctx.remote_addr else {
+                    debug!("PunchRequest without an observed source; ignoring");
+                    return Ok(());
+                };
+
                 let request = PunchRequest::decode(&payload)?;
 
                 let (target, requester) = {
@@ -784,25 +843,37 @@ impl NodeServer {
                     return Ok(());
                 };
 
-                // 相手へ: 要求者の候補
+                let Some(requester) = requester else {
+                    debug!("Punch requester {} is unknown", request.requester);
+                    return Ok(());
+                };
+
+                let observed_ip = crate::net::addr::normalize(sender_addr).ip();
+                if crate::net::addr::normalize(requester.addr).ip() != observed_ip {
+                    debug!(
+                        "PunchRequest claims to be {} but observed source {} does not match its descriptor; ignoring",
+                        request.requester, sender_addr
+                    );
+                    return Ok(());
+                }
+
+                // 相手へ: 要求者の候補（観測したアドレスのみ。申告の候補は信じない）
                 let notify = PunchNotify {
                     peer: request.requester,
-                    candidates: request.candidates.clone(),
+                    candidates: vec![sender_addr],
                 };
                 let _ = ctx.router
                     .send_packet(target.addr, PacketType::PunchNotify, &notify.encode()?)
                     .await;
 
                 // 要求者へ: 相手の候補
-                if let Some(requester) = requester {
-                    let back = PunchNotify {
-                        peer: request.target,
-                        candidates: vec![target.addr],
-                    };
-                    let _ = ctx.router
-                        .send_packet(requester.addr, PacketType::PunchNotify, &back.encode()?)
-                        .await;
-                }
+                let back = PunchNotify {
+                    peer: request.target,
+                    candidates: vec![target.addr],
+                };
+                let _ = ctx.router
+                    .send_packet(requester.addr, PacketType::PunchNotify, &back.encode()?)
+                    .await;
             },
             PacketType::PunchNotify => {
                 // **送り主がディレクトリ上の既知リレーでなければ無視する。**
@@ -878,10 +949,36 @@ impl NodeServer {
             PacketType::FilterProbeOrder => {
                 // 第三者として1発だけ撃つ。
                 // 相手のフィルタが EIF ならこれが届く
+                //
+                // **送り主がディレクトリ上の既知リレーでなければ無視する。**
+                // 認証なしで通れば、誰でも任意のノードに任意の宛先へ UDP を
+                // 撃たせる踏み台になる（本来この指示は FilterCheck の仲介役しか出さない）。
+                let Some(sender_addr) = ctx.remote_addr else {
+                    debug!("FilterProbeOrder without an observed source; ignoring");
+                    return Ok(());
+                };
+                let known_sender = {
+                    let dir = ctx.directory.read().await;
+                    is_known_relay_addr(&dir, sender_addr)
+                };
+                if !known_sender {
+                    debug!("FilterProbeOrder from {} which is not a known relay; ignoring", sender_addr);
+                    return Ok(());
+                }
+
                 let order = FilterProbeOrder::decode(&payload)?;
 
+                // 候補の絞り込みは PunchNotify と同じ基準（未指定・マルチキャスト・
+                // ブロードキャスト除外、送り主がループバックでない限りループバック除外）
+                let sender_is_loopback = crate::net::addr::normalize(sender_addr).ip().is_loopback();
+                let targets = sanitize_punch_candidates(std::slice::from_ref(&order.target), sender_is_loopback);
+                let Some(&target) = targets.first() else {
+                    debug!("FilterProbeOrder target {} rejected by sanitization", order.target);
+                    return Ok(());
+                };
+
                 let probe = punch::build_probe(stun::agent::TransactionId::new())?;
-                let _ = ctx.socket.send_raw(order.target, &probe).await;
+                let _ = ctx.socket.send_raw(target, &probe).await;
             },
             PacketType::PexResponse => {
                 let response = PexResponse::decode(&payload)?;
@@ -978,11 +1075,14 @@ impl NodeServer {
                 }
             },
             PacketType::TunnelBuild => {
+                let dir = ctx.directory.read().await;
+                let is_allowed_next = |addr: SocketAddr| ctx.is_self(addr) || is_known_relay_addr(&dir, addr);
                 if let Err(e) = Self::register_tunnel_build(
                     &ctx.router,
                     &ctx.tunnel_relay,
                     &payload,
                     ctx.remote_addr,
+                    is_allowed_next,
                 )
                 .await
                 {
@@ -1062,6 +1162,15 @@ impl NodeServer {
                 return;
             }
         };
+
+        // **PoW を確かめてから stem へ流す。** ここを通さないと、PoW を解いていない
+        // Hint を大量に StemHint として投げつけるだけで stem 経路（後継への再送・
+        // フェイルセーフの fluff）を焚きつけられる（fluff 側の relay_hint は
+        // handle_hint_packet 内で確認しているが、stem に乗る間は素通し）。
+        if !packet.verify_pow(ctx.gossip.pow_difficulty()) {
+            debug!("Hint for injection failed PoW check; discarded");
+            return;
+        }
 
         // 拡散先候補 = ディレクトリの他ノード
         let neighbors: Vec<NodeId> = {
@@ -1441,6 +1550,10 @@ impl NodeServer {
         if result.accepts_unsolicited() {
             let mut promoted = self.descriptor.clone();
             promoted.tier = Tier::Open;
+            // **署名し直してから入れる。** 署名が古い（Reversed 時点の）ままだと、
+            // 他ノードが受け取った際に署名不一致で弾かれ、issued_at も進まない
+            // ので、この昇格が網全体に広まらない。
+            promoted.resign(&self.identity);
             let mut dir = self.directory.write().await;
             dir.insert_unchecked(promoted);
             info!("Promoted to Tier 0: filtering is endpoint-independent");
