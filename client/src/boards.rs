@@ -171,6 +171,25 @@ impl KeyFiles {
         self.write_secure(&self.favorites_path(), &json)?;
         Ok(BoardInfo::new(id, label, false))
     }
+
+    /// お気に入りの板を削除する
+    ///
+    /// 公式の板はそもそもお気に入りに入っていないので、ここには来ない
+    /// （呼び出し側で公式かどうかを確認すること）。
+    pub fn remove_favorite_board(&self, id: &BoardId) -> Result<()> {
+        let uri = id.uri();
+        let mut favs: Vec<Favorite> = match self.read_secure(&self.favorites_path())? {
+            Some(json) => serde_json::from_slice(&json).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let before = favs.len();
+        favs.retain(|f| f.uri != uri);
+        if favs.len() == before {
+            return Err(ClientError::invalid("お気に入りに登録されていません"));
+        }
+        let json = serde_json::to_vec(&favs).expect("Favorite は直列化できる");
+        self.write_secure(&self.favorites_path(), &json)
+    }
 }
 
 #[cfg(test)]
@@ -204,5 +223,22 @@ mod tests {
         let favs = keys.load_favorite_boards().unwrap();
         assert_eq!(favs.len(), 1);
         assert_eq!(favs[0].id().unwrap(), id);
+    }
+
+    #[test]
+    fn remove_favorite_board_removes_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyFiles::new(dir.path(), None);
+        let id = BoardId::random();
+        keys.add_favorite_board(&id, "身内の板").unwrap();
+        keys.remove_favorite_board(&id).unwrap();
+        assert!(keys.load_favorite_boards().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_favorite_board_errs_if_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyFiles::new(dir.path(), None);
+        assert!(keys.remove_favorite_board(&BoardId::random()).is_err());
     }
 }
