@@ -73,6 +73,30 @@ impl KeyFiles {
     }
 
     /// リレー鍵の NodeId PoW の解（キャッシュ）
+    /// 常駐ノードが前回いたネットワーク（[`crate::client`] の network_key。パスフレーズがあれば暗号化）
+    pub fn relay_net_path(&self) -> PathBuf {
+        self.data_dir.join("relay.net")
+    }
+
+    /// 常駐ノードの待ち受けポートを保存するファイル
+    pub fn relay_port_path(&self) -> PathBuf {
+        self.data_dir.join("relay.port")
+    }
+
+    /// リレーの鍵・PoW・待ち受けポートを捨てる（次の起動で作り直される）
+    ///
+    /// ネットワークが変わったときに呼ぶ。残すと、公開のリレー一覧で前の場所と結びつく。
+    pub fn discard_relay_identity(&self) -> Result<()> {
+        for path in [self.relay_key_path(), self.relay_pow_path(), self.relay_port_path()] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
     pub fn relay_pow_path(&self) -> PathBuf {
         self.data_dir.join("relay.pow")
     }
