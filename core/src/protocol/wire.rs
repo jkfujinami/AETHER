@@ -159,6 +159,9 @@ pub fn parse_typed_forward(body: &[u8]) -> Result<(SocketAddr, PacketType, &[u8]
         // 返信トンネルの構築指示。gateway へ直接送ると、構築者（＝受信者）の
         // IP を gateway に晒して Inbound Tunnel の意味が消える。出口経由で届ける。
         0x31 => PacketType::TunnelBuild,
+        // 自分の返信トンネルの疎通確認。回路 → gateway → … → 自分と一周させる。
+        // 出口は取得要求の返信先（gateway）をもともと見ているので、新たに漏れるものは無い。
+        0x30 => PacketType::TunnelData,
         other => {
             return Err(AetherError::Protocol(format!(
                 "TypedForward may not carry packet type 0x{:02x}",

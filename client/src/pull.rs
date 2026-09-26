@@ -29,6 +29,11 @@ use std::time::Duration;
 /// 指示より先に要求が保持者へ届き、返信が未登録の gateway で落ちるのを避ける。
 const TUNNEL_SETTLE: Duration = Duration::from_millis(500);
 
+/// 回路を組み直す回数の上限
+const PULL_ATTEMPTS: usize = 3;
+/// 疎通確認の目印が戻るのを待つ時間
+const PROBE_WAIT: Duration = Duration::from_secs(5);
+
 pub(crate) struct PullSession {
     pub mailbox: SchrodingerMailbox,
     pub receive_tunnel_id: [u8; 32],
@@ -41,6 +46,55 @@ impl AetherClient {
     ///
     /// `contacts` は Mailbox に載せる共有秘密。検索/取得は空、受信は購読中の秘密を渡す。
     pub(crate) async fn open_pull_session(
+        &self,
+        contacts: HashMap<NodeId, [u8; 32]>,
+    ) -> Result<PullSession> {
+        // 中間・出口・gateway の生死は、直接確かめると IP を晒す。
+        // 組んだあとで自分宛てに一周させて確かめ、戻らなければ別のリレーで組み直す
+        let mut last_err = None;
+        for attempt in 1..=PULL_ATTEMPTS {
+            match self.try_open_pull_session(contacts.clone()).await {
+                Ok(session) => match self.probe(&session).await {
+                    Ok(()) => return Ok(session),
+                    Err(e) => last_err = Some(e),
+                },
+                Err(e) => last_err = Some(e),
+            }
+            if attempt < PULL_ATTEMPTS {
+                crate::events::progress(&self.events, "回路が応答しないので、別のリレーで組み直します");
+            }
+        }
+        Err(last_err.unwrap_or_else(|| ClientError::network("回路を組めませんでした")))
+    }
+
+    /// 回路 → gateway → 中間 → ガード → 自分 と目印を一周させ、戻ってくるか確かめる
+    async fn probe(&self, session: &PullSession) -> Result<()> {
+        let marker: [u8; 32] = rand::random();
+        let mut data = session.reply_to.tunnel_id.to_vec();
+        data.extend_from_slice(&marker);
+        session
+            .mailbox
+            .relay_client()
+            .send_onion_message_typed(PacketType::TunnelData, &data, session.gateway)
+            .await?;
+
+        let until = tokio::time::Instant::now() + PROBE_WAIT;
+        while tokio::time::Instant::now() < until {
+            let raw = self.take_replies(&session.receive_tunnel_id).await?;
+            if session
+                .mailbox
+                .decrypt_replies(&raw)
+                .iter()
+                .any(|m| m.as_slice() == marker)
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(ClientError::network("回路か返信トンネルが応答しません"))
+    }
+
+    async fn try_open_pull_session(
         &self,
         contacts: HashMap<NodeId, [u8; 32]>,
     ) -> Result<PullSession> {
