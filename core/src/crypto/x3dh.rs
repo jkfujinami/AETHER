@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn full_x3dh_over_frames_establishes_a_forward_secret_session() {
-        // 送信〜受信の丸ごと：X3DH → SK → Session::bootstrap(SK) → frame → 相手が復元
+        // 送信〜受信の丸ごと：X3DH → SK → Session::initiator/responder → frame → 相手が復元
         use crate::crypto::session::Session;
 
         let alice = Identity::generate();
@@ -495,7 +495,7 @@ mod tests {
 
         // Alice: initiate → SK → Session、初回本文をフレーム化
         let (sk_a, init) = initiate(&alice, &bob.public_id(), &bundle).unwrap();
-        let mut alice_session = Session::bootstrap(&sk_a, &alice.public_id(), &bob.public_id());
+        let mut alice_session = Session::initiator(&sk_a, &bundle.signed_prekey, init.clone());
         let sealed1 = alice_session.seal(b"hello via x3dh", b"").unwrap();
         let framed1 = frame_initial(&init, &sealed1).unwrap();
 
@@ -504,7 +504,8 @@ mod tests {
         let init = got_init.unwrap();
         let sk_b = respond(&bob, &secrets, &init).unwrap();
         assert_eq!(sk_a, sk_b, "両者が同じ X3DH SK に到達");
-        let mut bob_session = Session::bootstrap(&sk_b, &bob.public_id(), &alice.public_id());
+        let mut bob_session =
+            Session::responder(&sk_b, &secrets.signed_prekey_secret, init.ephemeral_key);
         assert_eq!(bob_session.open(got_sealed, b"").unwrap(), b"hello via x3dh");
 
         // 継続（2 通目）は Bob→Alice も含めて双方向に流れる

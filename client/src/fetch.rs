@@ -97,7 +97,7 @@ impl AetherClient {
         // **両方を同時に要求し、先に揃った方で決める**（片方のタイムアウトを待たない）
         let body_key = SchrodingerMailbox::body_mailbox_key(&content_ref);
         let first = self
-            .fetch_objects(&session, &[content_ref, body_key], &k_pub, OBJECT_WAIT, |got| {
+            .fetch_objects(&session, &[(content_ref, content_ref), (body_key, content_ref)], &k_pub, OBJECT_WAIT, |got| {
                 got.iter().any(Option::is_some)
             })
             .await?;
@@ -109,7 +109,12 @@ impl AetherClient {
                 format!("{} を取得します ({} チャンク / {} バイト)", manifest.name, total, manifest.size),
             );
             let chunks = self
-                .fetch_objects(&session, &manifest.chunk_refs, &k_pub, OBJECT_WAIT, |got| {
+                .fetch_objects(
+                    &session,
+                    &manifest.chunk_refs.iter().map(|r| (*r, *r)).collect::<Vec<_>>(),
+                    &k_pub,
+                    OBJECT_WAIT,
+                    |got| {
                     got.iter().all(Option::is_some)
                 })
                 .await?;
@@ -147,9 +152,9 @@ impl AetherClient {
         }
         let k_pub = board.key();
         let session = self.open_pull_session(HashMap::new()).await?;
-        let keys: Vec<[u8; 32]> = content_refs
+        let keys: Vec<([u8; 32], [u8; 32])> = content_refs
             .iter()
-            .map(SchrodingerMailbox::body_mailbox_key)
+            .map(|r| (SchrodingerMailbox::body_mailbox_key(r), *r))
             .collect();
         self.fetch_objects(&session, &keys, &k_pub, OBJECT_WAIT, |got| {
             got.iter().all(Option::is_some)
@@ -163,7 +168,8 @@ impl AetherClient {
         target: &NodeId,
     ) -> Result<aether_core::crypto::x3dh::PreKeyBundle> {
         let session = self.open_pull_session(HashMap::new()).await?;
-        session.mailbox.request_prekey_bundle(target).await?;
+        let period = SchrodingerMailbox::prekey_period(aether_core::protocol::hint::current_timestamp());
+        session.mailbox.request_prekey_bundle(target, period).await?;
 
         let mut collected = Vec::new();
         let until = tokio::time::Instant::now() + PREKEY_WAIT;
@@ -171,7 +177,7 @@ impl AetherClient {
             let raw = self.take_replies(&session.receive_tunnel_id).await?;
             if !raw.is_empty() {
                 collected.extend(session.mailbox.decrypt_replies(&raw));
-                if let Some(bundle) = session.mailbox.reassemble_prekey_bundle(&collected, target)? {
+                if let Some(bundle) = session.mailbox.reassemble_prekey_bundle(&collected, target, period)? {
                     return Ok(bundle);
                 }
             }
@@ -186,15 +192,17 @@ impl AetherClient {
     /// 複数のオブジェクトをまとめて要求し、並行に集める
     ///
     /// `done` が真になるか上限時間で返す。3 シャード揃ったものから復元する。
+    /// `mailbox_keys` は `(置き場所, 照合する内容アドレス)` の組。中身のハッシュが
+    /// 内容アドレスと一致したものだけを返す。
     async fn fetch_objects(
         &self,
         session: &PullSession,
-        mailbox_keys: &[[u8; 32]],
+        mailbox_keys: &[([u8; 32], [u8; 32])],
         secret: &[u8; 32],
         wait: Duration,
         done: impl Fn(&[Option<Vec<u8>>]) -> bool,
     ) -> Result<Vec<Option<Vec<u8>>>> {
-        for key in mailbox_keys {
+        for (key, _) in mailbox_keys {
             session.mailbox.request_object(key, secret).await?;
         }
 
@@ -205,11 +213,13 @@ impl AetherClient {
             let raw = self.take_replies(&session.receive_tunnel_id).await?;
             if !raw.is_empty() {
                 collected.extend(session.mailbox.decrypt_replies(&raw));
-                for (key, slot) in mailbox_keys.iter().zip(results.iter_mut()) {
+                for ((key, content_ref), slot) in mailbox_keys.iter().zip(results.iter_mut()) {
+                    // 中身を ref と照合する。板の読者なら誰でも封の通る偽シャードを作れる
                     if slot.is_none()
-                        && let Ok(Some(obj)) = session.mailbox.reassemble(&collected, key, secret)
+                        && let Some((plain, _)) =
+                            session.mailbox.open_public(&collected, key, secret, content_ref)
                     {
-                        *slot = Some(obj);
+                        *slot = Some(plain);
                     }
                 }
                 if done(&results) {

@@ -28,9 +28,6 @@ use std::path::Path;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// 1つの Hint を何ピアへ拡散するか
-const GOSSIP_FANOUT: usize = 3;
-
 /// Hint backlog の複製数（19.1.3）。本体シャードの K と揃える
 const HINT_REPLICAS: usize = 5;
 
@@ -623,12 +620,23 @@ impl NodeServer {
             PacketType::OnionPacket => {
                 // 中継先は自分か既知リレーに限る。そうでなければ、任意の踏み台・
                 // 内部アドレスへ中継がダイヤルさせられてしまう。
-                let action = {
+                //
+                // **ディレクトリのロックを持ったまま転送（await）しない。** 次ホップへの
+                // ダイヤルが遅いと、ロック待ちの PEX 書き込みの後ろで全パケット処理が詰まる。
+                // 既知リレーのアドレスを先に写し取ってから判定する。
+                let known: std::collections::HashSet<SocketAddr> = {
                     let dir = ctx.directory.read().await;
-                    ctx.router
-                        .handle_packet(&payload, |next| ctx.is_self(next) || is_known_relay_addr(&dir, next))
-                        .await?
+                    dir.all()
+                        .into_iter()
+                        .map(|d| crate::net::addr::normalize(d.addr))
+                        .collect()
                 };
+                let action = ctx
+                    .router
+                    .handle_packet(&payload, |next| {
+                        ctx.is_self(next) || known.contains(&crate::net::addr::normalize(next))
+                    })
+                    .await?;
 
                 match action {
                     RoutingAction::Forwarded => {
@@ -1408,7 +1416,10 @@ impl NodeServer {
         for packet in packets {
             let peers: Vec<SocketAddr> = {
                 let dir = ctx.directory.read().await;
-                dir.random_path(GOSSIP_FANOUT, std::slice::from_ref(&ctx.descriptor.node_id))
+                dir.random_path(
+                    gossip_server::gossip_fanout(dir.len()),
+                    std::slice::from_ref(&ctx.descriptor.node_id),
+                )
                     .into_iter()
                     .map(|r| r.addr)
                     .collect()

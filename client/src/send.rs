@@ -8,7 +8,7 @@
 use crate::circuit::Circuit;
 use crate::boards::BoardId;
 use crate::client::{AetherClient, board_target};
-use crate::error::{ClientError, Result};
+use crate::error::Result;
 use crate::events::{self, ClientEvent, SendState};
 use aether_core::crypto::identity::NodeId;
 use aether_core::mailbox::hint_release::{self, ReleaseStatus, UploadProfile};
@@ -92,7 +92,6 @@ impl AetherClient {
         use aether_core::crypto::x3dh;
 
         let identity = self.keys.load_identity()?;
-        let me = identity.public_id();
         let shared_secret = match secret {
             Some(s) => s,
             None => identity.agree(&to)?,
@@ -100,8 +99,8 @@ impl AetherClient {
 
         // 認識（blind_tag / mailbox 位置）は agree 秘密、本文はラチェット（分離）
         let ks = self.keystore()?;
-        let (mut session, initial) = match ks.load(&to)? {
-            Some(s) => (s, None),
+        let mut session = match ks.load(&to)? {
+            Some(s) => s,
             None => {
                 events::progress(
                     &self.events,
@@ -110,12 +109,20 @@ impl AetherClient {
                 let bundle = self.fetch_prekey_bundle(&to).await?;
                 let (sk, init) = x3dh::initiate(&identity, &to, &bundle)?;
                 events::progress(&self.events, "X3DH 成立（前方秘匿＋耐量子ハイブリッド）");
-                (Session::bootstrap(&sk, &me, &to), Some(init))
+                Session::initiator(&sk, &bundle.signed_prekey, init)
             }
         };
         let sealed = session.seal(message, &[])?;
-        // フレーム: 初回は [0x01][InitialMessage][sealed]、継続は [0x00][sealed]
-        let body = match &initial {
+        // **封じたらすぐ保存する。** 置く途中で失敗してから保存せずにやり直すと、同じ
+        // メッセージ鍵（＝同じ鍵と nonce）で別の平文を封じることになる。途中まで置いた
+        // シャードが残っていれば、二つの暗号文から平文の差が漏れる。受け取る側は
+        // 飛んだ番号を取りこぼしとして扱えるので、進めすぎても会話は壊れない
+        ks.save(&to, &session)?;
+
+        // フレーム: 相手から返事が来るまでは初回メッセージを添える [0x01][InitialMessage][sealed]。
+        // 最初の 1 通を取りこぼされても、後の 1 通で相手はセッションを立てられる。
+        // 返事が来てからは継続 [0x00][sealed]
+        let body = match &session.pending_initial {
             Some(init) => x3dh::frame_initial(init, &sealed)?,
             None => x3dh::frame_continuation(&sealed),
         };
@@ -125,8 +132,6 @@ impl AetherClient {
         let mailbox = self.sending_mailbox(body_c, hint_c, to, shared_secret);
 
         let (hint, _key, profile) = mailbox.place_ratchet_body(&to, &body).await?;
-        // 置けたらラチェットを進めて保存（置けないまま進めると相手と食い違う）
-        ks.save(&to, &session)?;
         events::progress(&self.events, format!("本体を配置しました ({} バイト送出)", profile.bytes));
         self.send_status(ticket, SendState::Placed);
 
@@ -182,14 +187,11 @@ impl AetherClient {
                 chunks: Some(chunks),
             }
         } else {
-            let (hint, _key, profile) = mailbox.place_body_profiled(&target, &post.content).await?;
+            // 内容アドレスで置く（取得側が中身を ref と照合できる）
+            let (hint, content_ref, profile) = mailbox.place_public_body(&k_pub, &post.content).await?;
             events::progress(&self.events, format!("本体を配置しました ({} バイト送出)", profile.bytes));
 
             self.release_hint(&mailbox, &hint, &profile, None).await?;
-
-            let (content_ref, _) = mailbox
-                .decrypt_hint(&hint)
-                .ok_or_else(|| ClientError::invalid("自分の Hint を開けません"))?;
             let descriptor = IndexDescriptor {
                 content_ref,
                 name: post.name.clone(),

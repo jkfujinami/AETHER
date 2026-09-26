@@ -8,8 +8,41 @@ use tokio::sync::{broadcast, Mutex};
 /// ローカル購読者向けのバッファ段数
 const LOCAL_HINT_BUFFER: usize = 1024;
 
-/// Hint の TTL 初期値
-pub const DEFAULT_HINT_TTL: u8 = 5;
+/// Hint の TTL 初期値（＝最大ホップ数）
+///
+/// **網全体へ届く大きさにする。** 拡散先を [`gossip_fanout`] 台ずつ選ぶ push 型の
+/// gossip では、1 つの Hint が届く台数は最大でも「拡散先^TTL」程度。以前の TTL 5・
+/// 拡散先 3 では約 360 台で頭打ちになり、300 台を超える網では Broadcast Veil
+/// （全員が全 Hint を受け取る）も配送も崩れた。ループは ID の重複排除で止まるので、
+/// TTL は網の直径より十分大きければよい（拡散先 4 でも 16 ホップで 4^16 台）。
+pub const DEFAULT_HINT_TTL: u8 = 16;
+
+/// 受信した Hint の TTL の上限
+///
+/// TTL は ID にも PoW にも含まれず誰でも書き換えられる。中継が大きな値に
+/// 書き換えても、ここで頭打ちにする（重複排除があるので害は小さいが、上限を持つ）。
+pub const MAX_HINT_TTL: u8 = DEFAULT_HINT_TTL;
+
+/// 1 つの Hint を何台へ拡散するか（既知リレー数 `relays` に応じて決める）
+///
+/// push 型 gossip で全員に届く条件はおおよそ「拡散先 ≳ ln N」。取りこぼす割合は
+/// 約 e^-(拡散先 - ln N) なので、ln N に余裕 3 を足す。帯域は 1 Hint あたり
+/// 拡散先ぶん（数百バイト × 十数台）で、Hint が小さいので許容できる。
+pub fn gossip_fanout(relays: usize) -> usize {
+    let ln_n = (relays.max(1) as f64).ln().ceil() as usize;
+    (ln_n + 3).clamp(4, 20)
+}
+
+/// 配送済み Hint を覚えておく期間（秒）
+///
+/// 分散 backlog の保持窓（24 時間）と受信側の鮮度窓（24 時間）に揃える。
+/// live の重複排除（[`SeenCache`] の 15 分）だけだと、15 分を過ぎた Hint が
+/// backlog 同期や再注入で**もう一度ローカルへ配られ**、受信者が同じ私信を開き直す
+/// （初回フレームならセッションが初期化されて会話が壊れる）。再フラッドも防ぐ。
+pub const DELIVERED_WINDOW_SECS: u64 = crate::net::hint_log::RETENTION_WINDOW_SECS;
+
+/// 配送済み Hint の想定件数（1 世代あたり）。超えても誤検知率が上がるだけ
+const DELIVERED_CAPACITY: usize = 2_000_000;
 
 /// 1バッチに詰め込める Hint の上限
 ///
@@ -31,6 +64,9 @@ pub enum HintAction {
 
 pub struct GossipServer {
     seen: Arc<Mutex<SeenCache>>,
+    /// 配送済み Hint（[`DELIVERED_WINDOW_SECS`]）。一度ローカルへ配った Hint は
+    /// 再配送も再拡散もしない
+    delivered: Arc<Mutex<SeenCache>>,
     /// 新規 Hint をローカル購読者へ配る口
     ///
     /// Broadcast Veil の前提そのもの。全ノードが全 Hint を受け取り、
@@ -50,6 +86,10 @@ impl GossipServer {
         let (local, _) = broadcast::channel(LOCAL_HINT_BUFFER);
         Self {
             seen: Arc::new(Mutex::new(SeenCache::default())),
+            delivered: Arc::new(Mutex::new(SeenCache::new(
+                DELIVERED_CAPACITY,
+                DELIVERED_WINDOW_SECS,
+            ))),
             local,
             pow_difficulty: config.pow_difficulty as u32,
         }
@@ -78,14 +118,19 @@ impl GossipServer {
         if !packet.verify_pow(self.pow_difficulty) {
             return false;
         }
-        {
-            let mut seen = self.seen.lock().await;
-            if !seen.insert(packet.id()) {
-                return false;
-            }
+        if !self.first_delivery(&packet).await {
+            return false;
         }
         let _ = self.local.send(packet);
         true
+    }
+
+    /// 初めて見る Hint か（live の窓と配送済みの窓の両方に登録する）
+    async fn first_delivery(&self, packet: &HintPacket) -> bool {
+        let id = packet.id();
+        let fresh_live = self.seen.lock().await.insert(id);
+        let fresh_ever = self.delivered.lock().await.insert(id);
+        fresh_live && fresh_ever
     }
 
     /// Hint パケットを処理する
@@ -113,13 +158,12 @@ impl GossipServer {
         }
 
         // 重複チェック。ID は TTL を含まないため、
-        // 中継で TTL が変化しても同一パケットとして認識できる
-        {
-            let mut seen = self.seen.lock().await;
-            if !seen.insert(packet.id()) {
-                return HintAction::Drop;
-            }
+        // 中継で TTL が変化しても同一パケットとして認識できる。
+        // 配送済みの窓（24 時間）でも弾く ── 15 分後の再注入で再フラッドさせない
+        if !self.first_delivery(&packet).await {
+            return HintAction::Drop;
         }
+        packet.ttl = packet.ttl.min(MAX_HINT_TTL);
 
         // TTL を減らす **前に** ローカルへ配る。
         //
@@ -162,6 +206,7 @@ impl GossipServer {
     /// 期限切れエントリを掃除する（定期タスクから呼ぶ）
     pub async fn cleanup(&self) {
         self.seen.lock().await.cleanup();
+        self.delivered.lock().await.cleanup();
     }
 
     /// 観測された Hint レート (件/秒)
@@ -311,5 +356,34 @@ mod tests {
     async fn malformed_payload_is_an_error() {
         let s = server();
         assert!(s.handle_hint(b"not a hint").await.is_err());
+    }
+
+    #[test]
+    fn fanout_grows_with_the_network_so_hints_reach_everyone() {
+        assert_eq!(gossip_fanout(0), 4);
+        assert_eq!(gossip_fanout(5), 5);
+        assert!(gossip_fanout(1_000) >= 10);
+        assert!(gossip_fanout(100_000) >= 15);
+        assert_eq!(gossip_fanout(usize::MAX), 20, "上限で頭打ち");
+    }
+
+    #[tokio::test]
+    async fn inflated_ttl_is_capped() {
+        let s = server();
+        match s.handle_hint(&packet(9, 255)).await.unwrap() {
+            HintAction::Relay(out) => assert_eq!(out.ttl, MAX_HINT_TTL - 1),
+            HintAction::Drop => panic!("新規 Hint は中継されるべき"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hint_seen_live_is_not_redelivered_via_backlog() {
+        let s = server();
+        let mut rx = s.subscribe();
+        let p = HintPacket::new([4; 4], [0u8; 12], vec![4; 48], 5);
+        s.handle_hint_packet(p.clone()).await;
+        assert!(!s.deliver_local(p).await, "backlog から同じ Hint を二度配らない");
+        rx.recv().await.unwrap();
+        assert!(rx.try_recv().is_err());
     }
 }

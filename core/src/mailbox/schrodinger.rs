@@ -38,6 +38,21 @@ pub const K_REPLICAS: usize = 5;
 /// 256KB に対しては +0.08% で償却される。
 pub const CHUNK_SIZE: usize = 256 * 1024;
 
+/// プレキー束の置き場所が変わる周期（2 日）
+///
+/// 本体の TTL（既定 1 週間）より短くする。束を置き直さないまま周期をまたいでも、
+/// 前の期間の置き場所に残っている束を引ける（[`SchrodingerMailbox::request_prekey_bundle`]）。
+pub const PREKEY_PERIOD_SECS: u64 = 2 * 24 * 3600;
+
+/// 索引の記述子に解く PoW の下限（ビット）。2^16 回の SHA-256 で、1 件あたり数十ミリ秒
+const INDEX_RECORD_MIN_POW: u32 = 16;
+
+/// 内容アドレスに一致するシャードの組み合わせを探す回数の上限
+///
+/// 板の読者なら誰でも封の通る偽シャードを作れるので、最初に届いた組が正しいとは限らない。
+/// 上限は、偽シャードを大量に送りつけられても CPU を食い尽くされないため。
+const MAX_REASSEMBLY_ATTEMPTS: usize = 256;
+
 /// シュレーディンガーMailboxの実装
 pub struct SchrodingerMailbox {
     relay: Arc<RelayClient>,
@@ -418,75 +433,63 @@ impl SchrodingerMailbox {
 
     /// ダウンロードした本体を再シードする (18.3-C・ダウンローダが保持者になる)
     ///
-    /// 取得して復元に成功した sealed shard を、**現在の** K 最近接へ置き直す。
-    /// 元の保持者が離脱・期限切れになってもコンテンツが生き続け、
-    /// 人気なほど保持者が増える（Winny の「消えない」性質）。
+    /// **検証済みの本体**（[`open_public`](Self::open_public) が内容アドレスと照合したもの）
+    /// からシャードを作り直し、**現在の** K 最近接へ置き直す。RS 符号化と封は決定論的なので、
+    /// 元の投稿者が置いたものと同じシャードになる。
     ///
-    /// 封を検証してから撒くので、渡された中にゴミが混じっていても伝播しない。
-    /// index 重複はまとめる。戻り値は再シードした distinct shard 数。
-    pub async fn reseed(
+    /// 受け取ったシャードをそのまま撒き直すと、封の鍵は板の鍵から誰でも導けるので、
+    /// 偽のシャードを混ぜられたときに偽物まで広めてしまう。
+    pub async fn reseed_object(
         &self,
         mailbox_key: &[u8; 32],
         secret: &SharedSecret,
-        sealed_shards: &[Vec<u8>],
-    ) -> Result<usize> {
-        let mac_key = self.shard_mac_key(secret);
-        let mut seen = std::collections::HashSet::new();
-        let mut count = 0;
-
-        for sealed in sealed_shards {
-            // 封（HMAC）を通った shard だけ再シードする
-            let Some(shard) = sharding::open(sealed, mailbox_key, &mac_key) else {
-                continue;
-            };
-            if !seen.insert(shard.index) {
-                continue; // 同じ index は1回でよい
-            }
-
-            let targets = self.shard_targets(mailbox_key, secret, shard.index).await;
-            let shard_key = sharding::shard_key(mailbox_key, shard.index);
-            let mut put = Vec::with_capacity(32 + sealed.len());
-            put.extend_from_slice(&shard_key);
-            put.extend_from_slice(sealed);
-
-            for target in targets {
-                self.relay.send_onion_message(&put, target).await?;
-            }
-            count += 1;
-        }
-        Ok(count)
+        object: &[u8],
+    ) -> Result<UploadProfile> {
+        self.place_object(mailbox_key, secret, object).await
     }
 
-    /// プレキー束の配置座標と公開鍵を NodeId から導出する（X3DH / 3-1）
+    /// プレキー束の配置座標と公開鍵を NodeId と期間から導出する（X3DH / 3-1）
     ///
-    /// どちらも **NodeId だけから計算できる**（公開値）ので、相手の NodeId を知る者は
-    /// 誰でも束の位置を特定して取得できる。束自体は署名済みなので、保持者や取得経路が
-    /// 改竄しても [`x3dh::initiate`](crate::crypto::x3dh::initiate) が弾く。
-    fn prekey_location(node_id: &NodeId) -> ([u8; 32], SharedSecret) {
+    /// どちらも **NodeId と期間番号だけから計算できる**（公開値）ので、相手の NodeId を
+    /// 知る者は誰でも束の位置を特定して取得できる。束自体は署名済みなので、保持者や
+    /// 取得経路が改竄しても [`x3dh::initiate`](crate::crypto::x3dh::initiate) が弾く。
+    ///
+    /// **位置は [`PREKEY_PERIOD_SECS`] ごとに変わる。** 固定だと保持者も固定になり、
+    /// (1) 狙った NodeId の束の位置へ Sybil を置けば初回接触をずっと妨害でき、
+    /// (2) 保持者が「この人がいつ束を置き直したか」＝在席を観測し続けられる。
+    fn prekey_location(node_id: &NodeId, period: u64) -> ([u8; 32], SharedSecret) {
         use sha2::Digest;
         let mut mk = Sha256::new();
-        mk.update(b"aether_prekey_v1");
+        mk.update(b"aether_prekey_v2");
         mk.update(node_id.as_bytes());
+        mk.update(period.to_be_bytes());
         let mailbox_key: [u8; 32] = mk.finalize().into();
 
         let mut pk = Sha256::new();
-        pk.update(b"aether_prekey_pub_v1");
+        pk.update(b"aether_prekey_pub_v2");
         pk.update(node_id.as_bytes());
+        pk.update(period.to_be_bytes());
         let pub_key: [u8; 32] = pk.finalize().into();
 
         (mailbox_key, pub_key)
     }
 
+    /// いまの期間番号（プレキー束の置き場所を決める）
+    pub fn prekey_period(now: u64) -> u64 {
+        now / PREKEY_PERIOD_SECS
+    }
+
     /// 自分のプレキー束を網へ公開する（X3DH の Bob 役 / 3-1）
     ///
-    /// `H("aether_prekey_v1"‖NodeId)` の担当保持者へ、RS シャードに割って置く。
+    /// `period` の置き場所の担当保持者へ、RS シャードに割って置く。
     /// 束は公開情報（署名付き公開鍵の集まり）なので暗号化はしない ── 完全性は
     /// シャードの HMAC 封と、束に載る Ed25519 署名が担う。
     pub async fn publish_prekey_bundle(
         &self,
         bundle: &crate::crypto::x3dh::PreKeyBundle,
+        period: u64,
     ) -> Result<()> {
-        let (mailbox_key, pub_key) = Self::prekey_location(&bundle.node_id);
+        let (mailbox_key, pub_key) = Self::prekey_location(&bundle.node_id, period);
         let object =
             bincode::serialize(bundle).map_err(|e| AetherError::Serialization(e.to_string()))?;
         self.place_object(&mailbox_key, &pub_key, &object).await?;
@@ -494,9 +497,14 @@ impl SchrodingerMailbox {
     }
 
     /// 相手のプレキー束の取得要求を出す（返信は Inbound Tunnel 経由 / 3-1）
-    pub async fn request_prekey_bundle(&self, node_id: &NodeId) -> Result<()> {
-        let (mailbox_key, pub_key) = Self::prekey_location(node_id);
-        self.request_body(&mailbox_key, &pub_key).await
+    ///
+    /// 相手が今の期間にまだ置き直していないこともあるので、前の期間の置き場所も引く。
+    pub async fn request_prekey_bundle(&self, node_id: &NodeId, period: u64) -> Result<()> {
+        for p in [period, period.saturating_sub(1)] {
+            let (mailbox_key, pub_key) = Self::prekey_location(node_id, p);
+            self.request_body(&mailbox_key, &pub_key).await?;
+        }
+        Ok(())
     }
 
     /// トンネルで回収したシャードから相手のプレキー束を復元する（3-1）
@@ -507,16 +515,17 @@ impl SchrodingerMailbox {
         &self,
         replies: &[Vec<u8>],
         node_id: &NodeId,
+        period: u64,
     ) -> Result<Option<crate::crypto::x3dh::PreKeyBundle>> {
-        let (mailbox_key, pub_key) = Self::prekey_location(node_id);
-        match self.reassemble_raw(replies, &mailbox_key, &pub_key)? {
-            Some(object) => {
+        for p in [period, period.saturating_sub(1)] {
+            let (mailbox_key, pub_key) = Self::prekey_location(node_id, p);
+            if let Some(object) = self.reassemble_raw(replies, &mailbox_key, &pub_key)? {
                 let bundle = bincode::deserialize(&object)
                     .map_err(|e| AetherError::Protocol(format!("Invalid prekey bundle: {}", e)))?;
-                Ok(Some(bundle))
+                return Ok(Some(bundle));
             }
-            None => Ok(None),
         }
+        Ok(None)
     }
 
     /// 索引に記述子を1件公開する (19.7 / Phase 2-3)
@@ -528,7 +537,13 @@ impl SchrodingerMailbox {
         k_pub: &SharedSecret,
         descriptor: &IndexDescriptor,
     ) -> Result<()> {
-        let record = IndexRecord::create(k_pub, descriptor, self.hint_pow_difficulty)?;
+        // 保持者は索引を PoW の強い順に返す（弱い記述子の洪水で一覧から追い出されないように）。
+        // Hint より強めに解いておく。難易度 0（試験）はそのまま
+        let difficulty = match self.hint_pow_difficulty {
+            0 => 0,
+            d => d.max(INDEX_RECORD_MIN_POW),
+        };
+        let record = IndexRecord::create(k_pub, descriptor, difficulty)?;
         let idx_key = index::index_key(k_pub);
         let record_bytes = record.encode()?;
 
@@ -602,18 +617,6 @@ impl SchrodingerMailbox {
             }
         }
         out
-    }
-
-    /// 公開コンテンツの Hint を再放流する (18.3-A・保持者による再放流)
-    ///
-    /// nonce（= mailbox_key の素）から鮮度を保った**新しい** Hint を作って流す。
-    /// これで初回 gossip の窓や 24h backlog を超えても発見可能性が続く。
-    /// 頻度 ∝ 保持者数 ∝ 人気、で自己調整される。
-    ///
-    /// **公開コンテンツ専用。** 私信は受信者が読めば役目を終えるので再放流しない。
-    pub async fn republish(&self, secret: &SharedSecret, nonce: &[u8; 32]) -> Result<()> {
-        let hint = self.build_hint(secret, nonce)?;
-        self.gossip.broadcast(&hint).await
     }
 
     fn shared_secret_for(&self, to: &NodeId) -> Result<SharedSecret> {
@@ -744,6 +747,103 @@ impl SchrodingerMailbox {
     /// 内部の RelayClient への参照（テスト・上位層から直接送信したい場合）
     pub fn relay_client(&self) -> &RelayClient {
         &self.relay
+    }
+
+    /// 公開の本体（板への 1 件の投稿）を**内容アドレス**で置く
+    ///
+    /// 本体 `[MsgNonce(12)][EncMsg]` のハッシュ [`chunk::content_address`] を `content_ref`
+    /// とし、`mailbox_key = SHA256(content_ref)` に置く。Hint の nonce も `content_ref` に
+    /// するので、Hint から取り寄せた人も索引から取り寄せた人も、**復元した本体のハッシュを
+    /// `content_ref` と照合できる**（[`open_public`](Self::open_public)）。
+    ///
+    /// 板の鍵は読者全員が知っているので、封も暗号も「板の鍵を知る誰か」が作ったことしか
+    /// 保証しない。照合が無いと、読者の誰でも同じ ref の中身を別物（マルウェアなど）に
+    /// 差し替えられた。
+    pub async fn place_public_body(
+        &self,
+        secret: &SharedSecret,
+        message: &[u8],
+    ) -> Result<(HintPacket, [u8; 32], UploadProfile)> {
+        let message_key = self.derive_key(secret, b"aether_message_v1");
+        let (ciphertext, msg_nonce) = cipher::encrypt(&message_key, message)?;
+        let mut object = Vec::with_capacity(12 + ciphertext.len());
+        object.extend_from_slice(&msg_nonce);
+        object.extend_from_slice(&ciphertext);
+
+        let content_ref = chunk::content_address(&object);
+        let mailbox_key = Self::body_mailbox_key(&content_ref);
+        let profile = self.place_object(&mailbox_key, secret, &object).await?;
+        let hint = self.build_hint(secret, &content_ref)?;
+        Ok((hint, content_ref, profile))
+    }
+
+    /// シャード群から、**内容アドレスが `content_ref` に一致する**生の本体を復元する
+    ///
+    /// 封の通るシャードを index ごとに集め、3 つの index の組み合わせを試して、
+    /// 復元結果のハッシュが一致するものだけを返す。偽シャードが混ざっていても、
+    /// 正しいシャードが 3 枚あれば復元できる。
+    pub fn reassemble_verified(
+        &self,
+        replies: &[Vec<u8>],
+        mailbox_key: &[u8; 32],
+        key: &SharedSecret,
+        content_ref: &[u8; 32],
+    ) -> Option<Vec<u8>> {
+        let mac_key = self.shard_mac_key(key);
+        let mut by_index: Vec<Vec<Shard>> = vec![Vec::new(); sharding::TOTAL_SHARDS];
+        for reply in replies {
+            let Some(shard) = sharding::open(reply, mailbox_key, &mac_key) else {
+                continue;
+            };
+            let slot = &mut by_index[shard.index as usize];
+            if !slot.contains(&shard) {
+                slot.push(shard);
+            }
+        }
+
+        let present: Vec<usize> = (0..sharding::TOTAL_SHARDS)
+            .filter(|i| !by_index[*i].is_empty())
+            .collect();
+        let mut attempts = 0;
+        for a in 0..present.len() {
+            for b in a + 1..present.len() {
+                for c in b + 1..present.len() {
+                    let [ia, ib, ic] = [present[a], present[b], present[c]];
+                    for sa in &by_index[ia] {
+                        for sb in &by_index[ib] {
+                            for sc in &by_index[ic] {
+                                attempts += 1;
+                                if attempts > MAX_REASSEMBLY_ATTEMPTS {
+                                    return None;
+                                }
+                                let trio = [sa.clone(), sb.clone(), sc.clone()];
+                                if let Ok(object) = sharding::decode(&trio)
+                                    && chunk::content_address(&object) == *content_ref
+                                {
+                                    return Some(object);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 公開の本体を、内容アドレスを照合したうえで平文へ戻す
+    ///
+    /// 戻り値は `(平文, 生の本体)`。生の本体は再シード（[`reseed_object`](Self::reseed_object)）に使う。
+    pub fn open_public(
+        &self,
+        replies: &[Vec<u8>],
+        mailbox_key: &[u8; 32],
+        key: &SharedSecret,
+        content_ref: &[u8; 32],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let object = self.reassemble_verified(replies, mailbox_key, key, content_ref)?;
+        let plain = self.decrypt_mailbox_value(&object, key).ok()?;
+        Some((plain, object))
     }
 
     /// トンネルで回収したシャード群から本体を復元し、平文へ戻す（静的鍵）
