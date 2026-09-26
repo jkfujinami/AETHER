@@ -108,10 +108,13 @@ impl AetherClient {
             let dir = directory.read().await;
             dir.circuit_hops(
                 &guard.node_id,
+                &[guard.addr],
                 &[me, circuit.middle.node_id, circuit.exit.node_id],
                 &[],
             )
-            .or_else(|| dir.circuit_hops(&guard.node_id, &[me], &[circuit.exit.node_id]))
+            .or_else(|| {
+                dir.circuit_hops(&guard.node_id, &[guard.addr], &[me], &[circuit.exit.node_id])
+            })
             .ok_or_else(|| {
                 ClientError::network("返信トンネルを組めません（到達可能なリレーが足りません）")
             })?

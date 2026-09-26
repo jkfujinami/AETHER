@@ -122,6 +122,36 @@ impl RelayDescriptor {
     }
 }
 
+/// 回路の多様性を測るネットワークの単位（IPv4 /16・IPv6 /32）
+///
+/// ループバック・プライベート・リンクローカルは対象外（`None`）。手元のテスト網は
+/// 全員が 127.0.0.1 や同じ LAN にいるので、制限すると回路が組めなくなる。
+fn subnet_key(addr: &SocketAddr) -> Option<Vec<u8>> {
+    let ip = crate::net::addr::normalize(*addr).ip();
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            (!(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()))
+                .then(|| v4.octets()[..2].to_vec())
+        }
+        std::net::IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            let local = v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg0 & 0xfe00) == 0xfc00 // ULA
+                || (seg0 & 0xffc0) == 0xfe80; // リンクローカル
+            (!local).then(|| v6.octets()[..4].to_vec())
+        }
+    }
+}
+
+/// 2 つのアドレスが同じネットワークにあるか（テスト網のアドレスは常に「別」）
+pub fn same_subnet(a: &SocketAddr, b: &SocketAddr) -> bool {
+    match (subnet_key(a), subnet_key(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// リレーリスト
 pub struct RelayDirectory {
     relays: HashMap<NodeId, RelayDescriptor>,
@@ -352,11 +382,15 @@ impl RelayDirectory {
     ///   出口に発信者の IP を晒すので、事前に絞るしかない。
     /// - `exclude` は一切使わない相手（自分など）、`avoid_exit` は出口にだけ
     ///   使わない相手（回路分離で他の回路が使った出口）。
+    /// - **ホップどうしを同じネットワーク（IPv4 /16・IPv6 /32）から選ばない。**
+    ///   `avoid_subnets_of`（ガードなど）とも重ねない。1 つの事業者で安く大量に立てた
+    ///   偽リレーが 1 本の回路の複数ホップを占めにくくする（Tor と同じ規則）。
     ///
     /// 候補が足りなければ `None`。**短い回路へ黙って落とさない**（fail closed）。
     pub fn circuit_hops(
         &self,
         guard: &NodeId,
+        avoid_subnets_of: &[SocketAddr],
         exclude: &[NodeId],
         avoid_exit: &[NodeId],
     ) -> Option<(RelayDescriptor, RelayDescriptor)> {
@@ -369,14 +403,16 @@ impl RelayDirectory {
                 r.node_id != *guard
                     && !exclude.contains(&r.node_id)
                     && r.tier.accepts_strangers()
+                    && !avoid_subnets_of.iter().any(|a| same_subnet(a, &r.addr))
             })
             .collect();
         pool.shuffle(&mut rand::thread_rng());
 
         let exit_idx = pool.iter().position(|r| !avoid_exit.contains(&r.node_id))?;
         let exit = pool.remove(exit_idx).clone();
-        let middle = pool.first()?;
-        Some(((*middle).clone(), exit))
+        // 中間は出口と別のネットワークから
+        let middle = pool.into_iter().find(|r| !same_subnet(&r.addr, &exit.addr))?;
+        Some((middle.clone(), exit))
     }
 
     /// Onion 回路用にランダムな `hops` 台を選ぶ
@@ -542,7 +578,7 @@ mod tests {
         let guard = NodeId([1u8; 32]);
         let me = NodeId([2u8; 32]);
         for _ in 0..50 {
-            let (middle, exit) = dir.circuit_hops(&guard, &[me], &[]).unwrap();
+            let (middle, exit) = dir.circuit_hops(&guard, &[], &[me], &[]).unwrap();
             assert_ne!(middle.node_id, exit.node_id);
             for hop in [&middle, &exit] {
                 assert_ne!(hop.node_id, guard, "ガードを中間・出口に再利用しない");
@@ -558,7 +594,7 @@ mod tests {
         let guard = NodeId([1u8; 32]);
         let other_exit = NodeId([3u8; 32]);
         for _ in 0..50 {
-            let (_, exit) = dir.circuit_hops(&guard, &[], &[other_exit]).unwrap();
+            let (_, exit) = dir.circuit_hops(&guard, &[], &[], &[other_exit]).unwrap();
             assert_ne!(exit.node_id, other_exit);
         }
     }
@@ -567,7 +603,7 @@ mod tests {
     fn circuit_hops_fail_closed_when_too_few_relays() {
         // ガード以外に1台しか無ければ 3 ホップは組めない。短い回路に落とさない
         let dir = directory(2);
-        assert!(dir.circuit_hops(&NodeId([1u8; 32]), &[], &[]).is_none());
+        assert!(dir.circuit_hops(&NodeId([1u8; 32]), &[], &[], &[]).is_none());
     }
 
     #[test]
@@ -577,10 +613,45 @@ mod tests {
         hidden.tier = crate::net::reachability::Tier::Reversed;
         dir.insert_unchecked(hidden);
         for _ in 0..50 {
-            let (middle, exit) = dir.circuit_hops(&NodeId([1u8; 32]), &[], &[]).unwrap();
+            let (middle, exit) = dir.circuit_hops(&NodeId([1u8; 32]), &[], &[], &[]).unwrap();
             assert_ne!(middle.node_id, NodeId([9u8; 32]));
             assert_ne!(exit.node_id, NodeId([9u8; 32]));
         }
+    }
+
+    #[test]
+    fn circuit_hops_come_from_different_networks() {
+        // 同じ /16 に大量の偽リレーを並べても、1 本の回路の複数ホップは取れない
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        for n in 1..=20u8 {
+            let mut d = descriptor(n);
+            d.addr = format!("198.51.{}.{}:9000", n % 2, n).parse().unwrap(); // 198.51/16 だけ
+            dir.insert_unchecked(d);
+        }
+        let mut other = descriptor(100);
+        other.addr = "203.0.113.9:9000".parse().unwrap();
+        dir.insert_unchecked(other.clone());
+
+        let guard_addr: SocketAddr = "192.0.2.1:9000".parse().unwrap();
+        for _ in 0..30 {
+            let (middle, exit) = dir.circuit_hops(&NodeId([0xEE; 32]), &[guard_addr], &[], &[]).unwrap();
+            assert!(!same_subnet(&middle.addr, &exit.addr));
+            assert!(middle.node_id == other.node_id || exit.node_id == other.node_id);
+        }
+        // ガードと同じネットワークのリレーも避ける
+        let (m, e) = dir.circuit_hops(&NodeId([0xEE; 32]), &["203.0.113.200:1".parse().unwrap()], &[], &[]).map_or((None, None), |(m, e)| (Some(m), Some(e)));
+        assert!(m.is_none() && e.is_none(), "ガードと同じ /16 のリレーを使った");
+    }
+
+    #[test]
+    fn local_networks_are_not_restricted() {
+        // テスト網（127.0.0.1・プライベート）は同じネットワークとみなさない
+        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        assert!(!same_subnet(&a, &b));
+        assert!(!same_subnet(&"10.0.0.1:1".parse().unwrap(), &"10.0.0.2:1".parse().unwrap()));
+        assert!(same_subnet(&"8.8.4.4:1".parse().unwrap(), &"8.8.8.8:1".parse().unwrap()));
+        assert!(same_subnet(&"[2001:db8::1]:1".parse().unwrap(), &"[2001:db8:0:1::9]:1".parse().unwrap()));
     }
 
     #[test]

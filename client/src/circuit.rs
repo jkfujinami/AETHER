@@ -68,7 +68,7 @@ impl AetherClient {
         let (middle, exit) = loop {
             let picked = {
                 let dir = directory.read().await;
-                dir.circuit_hops(&guard.node_id, &[me], avoid_exit)
+                dir.circuit_hops(&guard.node_id, &[guard.addr], &[me], avoid_exit)
             };
             if let Some(hops) = picked {
                 break hops;
