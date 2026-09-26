@@ -92,6 +92,14 @@ async fn message_travels_from_alice_to_bob_through_the_mailbox() {
         storage.push(node(port).await);
     }
 
+    // ノード同士も互いを既知のリレーとして知っている（転送先は既知のリレーに限られる）
+    {
+        let mut all: Vec<&Arc<aether_core::node::server::NodeServer>> =
+            vec![&exit.server, &gateway.server, &bob_node.server];
+        all.extend(storage.iter().map(|n| &n.server));
+        common::introduce(&all).await;
+    }
+
     // 全員が同じリレーリストを持つ（記述子の検証は relay_list の単体テストで見る）
     let mut dir = RelayDirectory::new(aether_core::net::ring::EPOCH_SEED_PLACEHOLDER, 0);
     for n in &storage {

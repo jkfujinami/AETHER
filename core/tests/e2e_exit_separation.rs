@@ -34,6 +34,7 @@ async fn exit_relay_forwards_to_a_different_mailbox() {
 
     let exit_node = common::spawn_ready_node(exit_port, exit_id, exit_dir.path()).await;
     let mailbox_node = common::spawn_ready_node(mailbox_port, mailbox_id, mailbox_dir.path()).await;
+    common::introduce(&[&exit_node, &mailbox_node]).await;
 
     // クライアントは出口リレーへの1ホップ回路を張る
     let mut client = RelayClient::new().unwrap();

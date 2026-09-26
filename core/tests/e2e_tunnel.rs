@@ -32,6 +32,7 @@ async fn test_inbound_tunnel_e2e() {
     let _gw_server = common::spawn_ready_node(gw_port, gw_id, gw_dir.path()).await;
     let _relay_server = common::spawn_ready_node(relay_port, relay_id, relay_dir.path()).await;
     let alice_server = common::spawn_ready_node(alice_port, alice_id, alice_dir.path()).await;
+    common::introduce(&[&_gw_server, &_relay_server, &alice_server]).await;
 
     // 2. Alice builds tunnel: Gateway -> Relay -> Alice
     // Alice acts as a client to set this up.

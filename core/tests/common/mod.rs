@@ -97,6 +97,21 @@ pub async fn spawn_ready_node(
     server
 }
 
+/// ノード同士を互いのディレクトリに到達可能なリレーとして載せる
+///
+/// 中継・転送・トンネルの次ホップは「自分か既知のリレー」に限られる
+/// （踏み台・内部アドレスへのダイヤルを防ぐため）。PEX で知り合う手間を省き、
+/// 試験で使うノードを最初から互いに知っている状態にする。
+pub async fn introduce(nodes: &[&Arc<NodeServer>]) {
+    for known in nodes {
+        let mut d = known.descriptor.clone();
+        d.tier = aether_core::net::reachability::Tier::Open;
+        for node in nodes {
+            node.directory().write().await.insert_unchecked(d.clone());
+        }
+    }
+}
+
 /// 指定アドレスが接続を受け付けるまで待つ
 pub async fn wait_for_listener(addr: SocketAddr) {
     // QuicClient は UDP ソケットと rustls 設定を張るので、ループ内で作らない
