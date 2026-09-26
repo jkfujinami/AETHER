@@ -147,6 +147,22 @@ impl Router {
     }
 
     /// `addr` への keepalive 付き接続を張って保つ（返信トンネルの戻り道）
+    /// `addr` に `expected` の鍵の持ち主がいるか（記述子の到達確認）
+    pub async fn probe_identity(
+        &self,
+        addr: SocketAddr,
+        expected: crate::crypto::identity::NodeId,
+    ) -> bool {
+        self.connection_pool
+            .probe_identity(addr, expected, std::time::Duration::from_secs(5))
+            .await
+    }
+
+    /// keepalive 付きの接続を保ち、その接続を返す（回路の入口に使う）
+    pub async fn pinned_connection(&self, addr: SocketAddr) -> Result<quinn::Connection> {
+        self.connection_pool.pin_connection(addr).await
+    }
+
     pub async fn pin_connection(&self, addr: SocketAddr) -> Result<()> {
         self.connection_pool.pin_connection(addr).await?;
         Ok(())
@@ -163,6 +179,11 @@ impl Router {
     }
 
     /// 新規 outbound 接続の通知を受け取る
+    /// 接続先の NodeId を引く口を設定する（証明書を NodeId と照合する）
+    pub fn set_key_resolver(&self, resolver: crate::net::connection_pool::KeyResolver) {
+        self.connection_pool.set_key_resolver(resolver);
+    }
+
     pub fn subscribe_opened(&self) -> tokio::sync::mpsc::UnboundedReceiver<quinn::Connection> {
         self.connection_pool.subscribe_opened()
     }

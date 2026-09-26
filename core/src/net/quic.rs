@@ -1,4 +1,5 @@
 use crate::{Config, Result, AetherError};
+use crate::crypto::identity::{Identity, NodeId};
 use crate::net::shared_socket::{SharedSocket, SideChannelDatagram};
 use quinn::Endpoint;
 use std::net::SocketAddr;
@@ -44,8 +45,17 @@ pub struct QuicServer {
 }
 
 impl QuicServer {
+    /// 使い捨ての鍵で証明書を作って待ち受ける（試験・広告しないノード）
     pub fn new(config: &Config) -> Result<Self> {
-        let server_config = Self::server_config()?;
+        Self::with_identity(config, None)
+    }
+
+    /// ノードの鍵（NodeId）で証明書を作って待ち受ける
+    ///
+    /// 接続してくる側は、ディレクトリ上の NodeId と証明書の公開鍵を照合する
+    /// （[`NodeIdVerifier`]）。`None` なら使い捨ての鍵で作る。
+    pub fn with_identity(config: &Config, identity: Option<&Identity>) -> Result<Self> {
+        let server_config = Self::server_config(identity)?;
 
         // **デュアルスタックで bind する。**
         // IPv6 が使える環境では NAT が存在しないため、
@@ -75,7 +85,7 @@ impl QuicServer {
         //   （発信で穴が開くのは発信に使ったソケットの分だけ）
         // - NAT のセッション表を2つ消費する
         let mut endpoint = endpoint;
-        endpoint.set_default_client_config(QuicClient::skip_verify_config()?);
+        endpoint.set_default_client_config(QuicClient::client_config(None)?);
 
         Ok(Self {
             endpoint,
@@ -115,7 +125,7 @@ impl QuicServer {
 
     /// 既存のUDPソケットを使用してサーバーを起動する (Hole Punching用)
     pub fn new_with_socket(socket: std::net::UdpSocket) -> Result<Self> {
-        let server_config = Self::server_config()?;
+        let server_config = Self::server_config(None)?;
 
         let runtime = quinn::TokioRuntime;
         let (socket, side_rx) = SharedSocket::from_std(socket, &runtime)
@@ -141,8 +151,11 @@ impl QuicServer {
     /// 固定名（旧 `aether-node`）だと、能動的に繋いで証明書を見るだけで AETHER と分かる。
     /// 自己署名である以上、正規のサイトと完全には見分けがつかなくならないが、
     /// 名前一つで一覧化される状態は避ける。
-    fn server_config() -> Result<quinn::ServerConfig> {
-        let (cert, key) = Self::generate_self_signed_cert()?;
+    fn server_config(identity: Option<&Identity>) -> Result<quinn::ServerConfig> {
+        let (cert, key) = match identity {
+            Some(id) => certificate_for(id)?,
+            None => certificate_for(&Identity::generate())?,
+        };
         let mut tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert], key)
@@ -151,20 +164,6 @@ impl QuicServer {
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
             .map_err(|e| AetherError::Config(format!("Failed to convert rustls config: {:?}", e)))?;
         Ok(quinn::ServerConfig::with_crypto(Arc::new(crypto)))
-    }
-
-    fn generate_self_signed_cert() -> Result<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)> {
-        let cert = rcgen::generate_simple_self_signed(vec![random_host_name()])
-            .map_err(|e| AetherError::Crypto(e.to_string()))?;
-
-        let key_der = cert.key_pair.serialize_der();
-        let cert_der = cert.cert.der().to_vec();
-
-        Ok((
-            rustls::pki_types::CertificateDer::from(cert_der),
-            rustls::pki_types::PrivateKeyDer::try_from(key_der)
-                .map_err(|e| AetherError::Crypto(format!("Invalid private key: {:?}", e)))?
-        ))
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -182,7 +181,7 @@ pub struct QuicClient {
 
 impl QuicClient {
     pub fn new() -> Result<Self> {
-        let client_config = Self::skip_verify_config()?;
+        let client_config = Self::client_config(None)?;
 
         // クライアント側もデュアルスタック。
         // v6 のリレーへ繋げなくなるのを防ぐ
@@ -201,7 +200,7 @@ impl QuicClient {
 
     /// 既存のUDPソケットを使用してクライアントを起動する
     pub fn new_with_socket(socket: std::net::UdpSocket) -> Result<Self> {
-        let client_config = Self::skip_verify_config()?;
+        let client_config = Self::client_config(None)?;
 
         let mut endpoint = Endpoint::new(
             quinn::EndpointConfig::default(),
@@ -214,12 +213,26 @@ impl QuicClient {
         Ok(Self { endpoint })
     }
 
-    pub(crate) fn skip_verify_config() -> Result<quinn::ClientConfig> {
+    /// ノードの待ち受けと同じエンドポイント（UDP ソケット）から接続するクライアント
+    ///
+    /// 回路の入口（ガード）への接続を別ソケットから出すと、観測者は「中継ではなく
+    /// この人自身の送受信」だけを別ポートとして見分けられる。同じソケットから出す。
+    pub fn from_endpoint(endpoint: Endpoint) -> Self {
+        Self { endpoint }
+    }
+
+    /// 接続先の証明書を `expected`（NodeId）と照合する TLS 設定
+    ///
+    /// `None` は相手の NodeId が分からない場合（種ノードへの最初の接続など）で、
+    /// 証明書の鍵は照合しない（ハンドシェイクの署名は検証する）。
+    pub(crate) fn client_config(expected: Option<NodeId>) -> Result<quinn::ClientConfig> {
         let mut config = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();
 
-        config.dangerous().set_certificate_verifier(Arc::new(SkipServerVerification));
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NodeIdVerifier::new(expected)));
         config.alpn_protocols = vec![ALPN.to_vec()];
 
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(config)
@@ -233,8 +246,8 @@ impl QuicClient {
     /// 通常の接続はアイドルで切れてよいが、返信トンネルの終端（ガード → 自分）は
     /// **自分が張った接続だけが唯一の戻り道**になる。切れると NAT の内側へは
     /// 二度と届かないので、無通信でも keepalive で生かしておく。
-    pub(crate) fn keepalive_config() -> Result<quinn::ClientConfig> {
-        let mut config = Self::skip_verify_config()?;
+    pub(crate) fn keepalive_config(expected: Option<NodeId>) -> Result<quinn::ClientConfig> {
+        let mut config = Self::client_config(expected)?;
         let mut transport = quinn::TransportConfig::default();
         transport.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
         config.transport_config(Arc::new(transport));
@@ -243,7 +256,16 @@ impl QuicClient {
 
     /// keepalive 付きで接続する
     pub async fn connect_keepalive(&self, addr: SocketAddr) -> Result<quinn::Connection> {
-        let connecting = self.endpoint.connect_with(Self::keepalive_config()?, addr, &server_name_for(&addr))
+        self.connect_keepalive_expecting(addr, None).await
+    }
+
+    /// keepalive 付きで、証明書を `expected` と照合して接続する
+    pub async fn connect_keepalive_expecting(
+        &self,
+        addr: SocketAddr,
+        expected: Option<NodeId>,
+    ) -> Result<quinn::Connection> {
+        let connecting = self.endpoint.connect_with(Self::keepalive_config(expected)?, addr, &server_name_for(&addr))
             .map_err(|e| AetherError::Quic(e.to_string()))?;
 
         connecting.await.map_err(|e| AetherError::Quic(e.to_string()))
@@ -251,7 +273,18 @@ impl QuicClient {
 
     /// 接続する（SNI は送らない。[`server_name_for`]）
     pub async fn connect(&self, addr: SocketAddr) -> Result<quinn::Connection> {
-        let connecting = self.endpoint.connect(addr, &server_name_for(&addr))
+        self.connect_expecting(addr, None).await
+    }
+
+    /// 証明書を `expected`（NodeId）と照合して接続する
+    pub async fn connect_expecting(
+        &self,
+        addr: SocketAddr,
+        expected: Option<NodeId>,
+    ) -> Result<quinn::Connection> {
+        let connecting = self
+            .endpoint
+            .connect_with(Self::client_config(expected)?, addr, &server_name_for(&addr))
             .map_err(|e| AetherError::Quic(e.to_string()))?;
 
         connecting.await.map_err(|e| AetherError::Quic(e.to_string()))
@@ -261,18 +294,90 @@ impl QuicClient {
 // 共通型
 pub type QuicConnection = quinn::Connection;
 
-#[derive(Debug)]
-struct SkipServerVerification;
+/// Ed25519 の秘密鍵（32 バイトの種）を PKCS#8 v1 に包む（RFC 8410）
+fn ed25519_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
+    const PREFIX: [u8; 16] = [
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+    ];
+    let mut der = PREFIX.to_vec();
+    der.extend_from_slice(seed);
+    der
+}
 
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+/// 証明書の公開鍵情報（SubjectPublicKeyInfo）のうち、Ed25519 の鍵の直前まで
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
+/// ノードの鍵で自己署名した証明書を作る
+///
+/// **証明書の鍵 ＝ NodeId の鍵**にする。接続する側は証明書の公開鍵をディレクトリ上の
+/// NodeId と照合できる。以前は起動ごとの使い捨ての鍵で、接続側も何も検証しなかった
+/// ので、経路上の能動的な攻撃者（ISP 経由の傍受など）がリンクを中継（MITM）でき、
+/// onion 以外の通信（返信の着信・PEX・Hint）の種別・量・時刻を見られた。
+/// 名前は従来どおり起動ごとの乱数（固定名は目印になる）。
+fn certificate_for(
+    identity: &Identity,
+) -> Result<(CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)> {
+    let der = ed25519_pkcs8(&identity.to_bytes());
+    let key_pair = rcgen::KeyPair::try_from(der.as_slice())
+        .map_err(|e| AetherError::Crypto(format!("Invalid node key for TLS: {}", e)))?;
+    let cert = rcgen::CertificateParams::new(vec![random_host_name()])
+        .and_then(|p| p.self_signed(&key_pair))
+        .map_err(|e| AetherError::Crypto(e.to_string()))?;
+    Ok((
+        cert.der().clone(),
+        rustls::pki_types::PrivatePkcs8KeyDer::from(der).into(),
+    ))
+}
+
+/// 証明書から Ed25519 の公開鍵を取り出す（無ければ `None`）
+fn ed25519_key_in(cert: &CertificateDer<'_>) -> Option<[u8; 32]> {
+    let der = cert.as_ref();
+    let at = der
+        .windows(ED25519_SPKI_PREFIX.len())
+        .position(|w| w == ED25519_SPKI_PREFIX)?;
+    let start = at + ED25519_SPKI_PREFIX.len();
+    der.get(start..start + 32)?.try_into().ok()
+}
+
+/// 接続先の証明書を NodeId と照合する検証器
+///
+/// - 証明書の鍵が `expected`（ディレクトリ上の NodeId）と一致すること（`None` なら照合しない）
+/// - ハンドシェイクの署名がその鍵で正しいこと（＝相手が鍵を持っていること）
+///
+/// CA の連鎖・名前・有効期限は見ない（自己署名で、名前は乱数）。
+#[derive(Debug)]
+struct NodeIdVerifier {
+    expected: Option<NodeId>,
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl NodeIdVerifier {
+    fn new(expected: Option<NodeId>) -> Self {
+        Self {
+            expected,
+            algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for NodeIdVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if let Some(expected) = &self.expected
+            && ed25519_key_in(end_entity).as_ref() != Some(expected.as_bytes())
+        {
+            return Err(rustls::Error::General(
+                "peer certificate does not match the expected NodeId".into(),
+            ));
+        }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -282,34 +387,21 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         _cert: &CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        // QUIC は TLS 1.3 だけを使う
+        Err(rustls::Error::General("TLS 1.2 is not used".into()))
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-         vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA1,
-            rustls::SignatureScheme::ECDSA_SHA1_Legacy,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ED448,
-        ]
+        self.algorithms.supported_schemes()
     }
 }
 
@@ -353,5 +445,45 @@ mod tests {
         let b = random_host_name();
         assert_ne!(a, b);
         assert!(!a.contains("aether"));
+    }
+
+    #[test]
+    fn certificate_carries_the_node_key() {
+        let id = Identity::generate();
+        let (cert, _) = certificate_for(&id).unwrap();
+        assert_eq!(ed25519_key_in(&cert), Some(*id.public_id().as_bytes()));
+    }
+
+    async fn handshake(server_id: &Identity, expected: Option<NodeId>) -> Result<quinn::Connection> {
+        let server = QuicServer::with_identity(
+            &Config { listen_port: 0, ..Default::default() },
+            Some(server_id),
+        )
+        .unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Some(incoming) = server.endpoint().accept().await {
+                let _ = incoming.await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        });
+        QuicClient::new()
+            .unwrap()
+            .connect_expecting(format!("127.0.0.1:{}", port).parse().unwrap(), expected)
+            .await
+    }
+
+    #[tokio::test]
+    async fn connects_when_the_certificate_matches_the_expected_node() {
+        let id = Identity::generate();
+        assert!(handshake(&id, Some(id.public_id())).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn refuses_a_peer_that_is_not_the_expected_node() {
+        // 経路上で別の鍵の証明書を出された（MITM）想定
+        let impostor = Identity::generate();
+        let expected = Identity::generate().public_id();
+        assert!(handshake(&impostor, Some(expected)).await.is_err());
     }
 }

@@ -54,14 +54,26 @@ impl RingPosition {
 /// 当面は固定値。有効化する際はここを外部ビーコン (drand / Bitcoin) 由来にする。
 pub const EPOCH_SEED_PLACEHOLDER: [u8; 32] = [0u8; 32];
 
-/// リレーのリング座標を NodeId から導出する
+/// リレーのリング座標を NodeId と **NodeId PoW の解**から導出する
 ///
 /// 広告不要・検証可能。`epoch_seed` を混ぜてあるので、
 /// エポック方式を有効化しても NodeId の形式は変わらない。
-pub fn position_of_node(node_id: &NodeId, epoch_seed: &[u8; 32]) -> RingPosition {
+///
+/// # PoW の解を混ぜる理由（位置の狙い撃ち対策）
+///
+/// 以前は NodeId だけから位置を決めていた。鍵の生成も位置の計算も安いので、攻撃者は
+/// 鍵を大量に作って「狙った置き場所（公式の板の索引、ある人のプレキー束）の近く」に
+/// 落ちるものを選び、**最後に 1 回だけ** PoW を解けばよかった（数十秒で保持者の座を取れた）。
+/// 解（`pow_nonce`）を混ぜると、位置を 1 回試すごとに PoW を 1 回解く必要がある。
+/// N 台の網で K 最近接に入るには約 N/K 回の試行が要るので、費用は N/K 倍になる。
+///
+/// ノードごとの観測（在籍期間など）ではなく記述子に載った値だけで決まるので、
+/// 送信者と受信者で保持者の判断が食い違わない。
+pub fn position_of_node(node_id: &NodeId, pow_nonce: u64, epoch_seed: &[u8; 32]) -> RingPosition {
     let mut hasher = Sha256::new();
-    hasher.update(b"aether_ring_node_v1");
+    hasher.update(b"aether_ring_node_v2");
     hasher.update(node_id.as_bytes());
+    hasher.update(pow_nonce.to_be_bytes());
     hasher.update(epoch_seed);
     RingPosition::from_hash(&hasher.finalize().into())
 }
@@ -143,23 +155,23 @@ mod tests {
     #[test]
     fn positions_stay_in_range() {
         for n in 0..=255u8 {
-            let p = position_of_node(&node(n), &EPOCH_SEED_PLACEHOLDER);
+            let p = position_of_node(&node(n), 0, &EPOCH_SEED_PLACEHOLDER);
             assert!((0.0..1.0).contains(&p.value()), "位置が範囲外: {}", p.value());
         }
     }
 
     #[test]
     fn node_position_is_deterministic() {
-        let a = position_of_node(&node(7), &EPOCH_SEED_PLACEHOLDER);
-        let b = position_of_node(&node(7), &EPOCH_SEED_PLACEHOLDER);
+        let a = position_of_node(&node(7), 0, &EPOCH_SEED_PLACEHOLDER);
+        let b = position_of_node(&node(7), 0, &EPOCH_SEED_PLACEHOLDER);
         assert_eq!(a.value(), b.value(), "同じ NodeId なら同じ座標でなければならない");
     }
 
     #[test]
     fn epoch_seed_moves_positions() {
         // エポック方式を有効化したとき、グラインドした座標が持ち越されないこと
-        let a = position_of_node(&node(7), &[0u8; 32]);
-        let b = position_of_node(&node(7), &[1u8; 32]);
+        let a = position_of_node(&node(7), 0, &[0u8; 32]);
+        let b = position_of_node(&node(7), 0, &[1u8; 32]);
         assert_ne!(a.value(), b.value());
     }
 
@@ -251,5 +263,13 @@ mod tests {
         let a = k_nearest(&items, target, 5, |p| RingPosition(*p));
         let b = k_nearest(&items, target, 5, |p| RingPosition(*p));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn position_depends_on_the_pow_solution() {
+        // 位置を変えるには PoW を解き直す必要がある
+        let a = position_of_node(&node(7), 1, &EPOCH_SEED_PLACEHOLDER);
+        let b = position_of_node(&node(7), 2, &EPOCH_SEED_PLACEHOLDER);
+        assert_ne!(a, b);
     }
 }

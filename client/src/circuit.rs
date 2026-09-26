@@ -44,7 +44,8 @@ impl AetherClient {
         let directory = self.node.directory();
 
         // --- 入口：固定ガード ---
-        let mut client = RelayClient::new()?;
+        // 待ち受けと同じソケットから出す（自分の送受信を中継の通信に紛れさせる）
+        let mut client = RelayClient::via_node(self.node.router.clone(), self.node.server.endpoint());
         let guard = {
             let candidates: Vec<_> = {
                 let dir = directory.read().await;

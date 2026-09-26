@@ -22,7 +22,7 @@
 //! 狙った mailbox_key の隣に着地する NodeId を選べてしまう (18.5.3)。
 
 use crate::error::{AetherError, Result};
-use crate::net::relay_list::{RelayDescriptor, RelayDirectory};
+use crate::net::relay_list::{RelayDescriptor, RelayDirectory, DESCRIPTOR_TTL_SECS};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
@@ -114,12 +114,16 @@ pub fn select_response(
 ) -> PexResponse {
     let want = (request.want as usize).min(MAX_DESCRIPTORS_PER_RESPONSE);
     let requester = request.requester.as_ref().map(|r| r.node_id);
+    let now = crate::protocol::hint::current_timestamp();
+    let cutoff = now.saturating_sub(DESCRIPTOR_TTL_SECS);
 
     let mut pool: Vec<RelayDescriptor> = directory
         .all()
         .into_iter()
         // 要求者自身を返しても情報にならない
         .filter(|r| Some(r.node_id) != requester)
+        // 期限切れの記述子は配らない（死んだノードを網に広め続けない）
+        .filter(|r| r.issued_at >= cutoff)
         .cloned()
         .collect();
 
@@ -143,13 +147,30 @@ pub fn select_response(
 /// 1件の不正で応答全体を捨てると、攻撃者が1件混ぜるだけで
 /// PEX を妨害できてしまう。
 pub fn absorb_response(directory: &mut RelayDirectory, response: PexResponse) -> usize {
+    absorb_response_with_conflicts(directory, response).0
+}
+
+/// 応答を取り込み、`(新しく増えた数, 既存の記述子と衝突して入れられなかったもの)` を返す
+///
+/// 衝突したもの（同じ IP:port・IP ごとの上限）は、呼び出し側が到達確認で決着させる
+/// （[`RelayDirectory::blocking_claims`]）。
+pub fn absorb_response_with_conflicts(
+    directory: &mut RelayDirectory,
+    response: PexResponse,
+) -> (usize, Vec<(RelayDescriptor, Vec<crate::crypto::identity::NodeId>)>) {
     let before = directory.len();
+    let mut conflicts = Vec::new();
 
     for descriptor in response.relays {
-        let _ = directory.insert(descriptor);
+        if directory.insert(descriptor.clone()).is_err() {
+            let blockers = directory.blocking_claims(&descriptor);
+            if !blockers.is_empty() {
+                conflicts.push((descriptor, blockers));
+            }
+        }
     }
 
-    directory.len().saturating_sub(before)
+    (directory.len().saturating_sub(before), conflicts)
 }
 
 #[cfg(test)]
@@ -166,7 +187,7 @@ mod tests {
             pow_nonce: 0,
             uptime_secs: 3600,
             tier: crate::net::reachability::Tier::Open,
-            issued_at: 0,
+            issued_at: crate::protocol::hint::current_timestamp(),
             signature: Vec::new(),
         }
     }
@@ -270,11 +291,31 @@ mod tests {
     }
 
     #[test]
+    fn does_not_hand_out_expired_descriptors() {
+        // 死んだノードや大昔の記述子を PEX で配り続けない
+        let mut dir = directory(3);
+        let mut stale = descriptor(9);
+        stale.issued_at = 0; // TTL より十分古い
+        dir.insert_unchecked(stale);
+
+        let response = select_response(&dir, &PexRequest::new(descriptor(250)), None);
+        assert!(!response.relays.iter().any(|r| r.node_id == NodeId([9u8; 32])));
+    }
+
+    #[test]
     fn absorb_counts_new_entries() {
         let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        // 別ノードなのでアドレスも別にする（同じ addr を別 NodeId が名乗ると弾かれる）
         let response = PexResponse {
-            relays: (0..5)
-                .map(|_| signed(&crate::crypto::identity::Identity::generate(), 0))
+            relays: (0..5u16)
+                .map(|port| {
+                    RelayDescriptor::new_signed(
+                        &crate::crypto::identity::Identity::generate(),
+                        format!("127.0.0.1:{}", 9100 + port).parse().unwrap(),
+                        0,
+                        crate::net::reachability::Tier::Open,
+                    )
+                })
                 .collect(),
         };
 

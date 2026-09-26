@@ -56,6 +56,14 @@ const DANDELION_MAX_STEM_RETRIES: usize = 3;
 /// 期限切れデータの掃除間隔
 const GC_INTERVAL: Duration = Duration::from_secs(300);
 
+/// 自分の記述子を署名し直す間隔（[`RelayDescriptor::issued_at`] の延命）
+///
+/// [`crate::net::relay_list::DESCRIPTOR_TTL_SECS`] の 1/3。この余裕が無いと、
+/// PEX の伝播や一時的なネットワーク不調で更新が間に合わず、生きているリレーの
+/// 記述子が期限切れ扱いで網から消えてしまう。
+const DESCRIPTOR_RESIGN_INTERVAL: Duration =
+    Duration::from_secs(crate::net::relay_list::DESCRIPTOR_TTL_SECS / 3);
+
 /// PEX の最短間隔（収束中）
 ///
 /// 参加直後はリストが空同然なので、素早く回して網全体を掴む。
@@ -240,7 +248,8 @@ impl NodeServer {
         passphrase: Option<&str>,
     ) -> Result<Self> {
         let config = Config { listen_port: port, ..config.clone() };
-        let server = QuicServer::new(&config)?;
+        // 証明書はノードの鍵で作る（接続側がディレクトリの NodeId と照合する）
+        let server = QuicServer::with_identity(&config, Some(&identity))?;
 
         // Modules init
         let identity = Arc::new(identity);
@@ -298,6 +307,22 @@ impl NodeServer {
         );
         initial.insert_unchecked(descriptor.clone());
         let directory = Arc::new(RwLock::new(initial));
+
+        // 接続先の証明書を、ディレクトリ上のそのアドレスの NodeId と照合させる
+        {
+            let dir = directory.clone();
+            router.set_key_resolver(Arc::new(move |addr| {
+                let dir = dir.clone();
+                Box::pin(async move {
+                    let want = crate::net::addr::normalize(addr);
+                    let dir = dir.read().await;
+                    dir.all()
+                        .into_iter()
+                        .find(|d| crate::net::addr::normalize(d.addr) == want)
+                        .map(|d| d.node_id)
+                })
+            }));
+        }
 
         Ok(Self {
             server,
@@ -503,6 +528,9 @@ impl NodeServer {
         self.spawn_hint_reconcile();
         if self.epoch_beacon {
             self.spawn_epoch_beacon();
+        }
+        if self.advertise_self {
+            self.spawn_resign();
         }
 
         // **自分がダイヤルした接続も受信を回す。**
@@ -790,9 +818,18 @@ impl NodeServer {
                 // 要求者自身を取り込む。これで一方向の要求だけで相互に知り合える
                 // （一回限りのクライアントは記述子を載せてこない）
                 if let Some(requester) = &request.requester {
-                    let mut dir = ctx.directory.write().await;
-                    if let Err(e) = dir.insert(requester.clone()) {
-                        debug!("Rejected requester descriptor: {}", e);
+                    let blockers = {
+                        let mut dir = ctx.directory.write().await;
+                        match dir.insert(requester.clone()) {
+                            Ok(()) => Vec::new(),
+                            Err(e) => {
+                                debug!("Rejected requester descriptor: {}", e);
+                                dir.blocking_claims(requester)
+                            }
+                        }
+                    };
+                    if !blockers.is_empty() {
+                        Self::spawn_resolve_claim(&ctx, requester.clone(), blockers);
                     }
                 }
 
@@ -992,10 +1029,13 @@ impl NodeServer {
                 let response = PexResponse::decode(&payload)?;
                 let count = response.relays.len();
 
-                let added = {
+                let (added, conflicts) = {
                     let mut dir = ctx.directory.write().await;
-                    pex::absorb_response(&mut dir, response)
+                    pex::absorb_response_with_conflicts(&mut dir, response)
                 };
+                for (descriptor, blockers) in conflicts {
+                    Self::spawn_resolve_claim(&ctx, descriptor, blockers);
+                }
 
                 debug!("PEX: learned {} new relay(s) out of {}", added, count);
             },
@@ -1154,6 +1194,44 @@ impl NodeServer {
             }
         }
         Ok(())
+    }
+
+    /// アドレスの取り合い（同じ IP:port・IP ごとの上限）を到達確認で決着させる
+    ///
+    /// 登録は先着順なので、攻撃者が他人の IP を書いた記述子を先に配ると本物が締め出される。
+    /// 新しい記述子と、それを妨げている既存の記述子の両方へ NodeId を指定して接続し
+    /// （証明書が NodeId の鍵なので、接続できる＝鍵の持ち主がそこにいる）、
+    /// 応答しなかった既存のものを消してから、新しいものが応答していれば入れ直す。
+    ///
+    /// 衝突する記述子を作るにも NodeId PoW が要るので、確認の回数は自然に抑えられる。
+    /// 同じ NodeId の確認を同時に何本も走らせないようにだけしておく。
+    fn spawn_resolve_claim(ctx: &PacketContext, descriptor: RelayDescriptor, blockers: Vec<NodeId>) {
+        static IN_FLIGHT: std::sync::OnceLock<Mutex<std::collections::HashSet<NodeId>>> =
+            std::sync::OnceLock::new();
+        let in_flight = IN_FLIGHT.get_or_init(Default::default);
+        if !in_flight.lock().unwrap().insert(descriptor.node_id) {
+            return;
+        }
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            if ctx.router.probe_identity(descriptor.addr, descriptor.node_id).await {
+                for id in blockers {
+                    let target = ctx.directory.read().await.get(&id).map(|d| (d.addr, d.node_id));
+                    let Some((addr, node_id)) = target else { continue };
+                    if node_id == ctx.descriptor.node_id {
+                        continue; // 自分自身は消さない
+                    }
+                    if !ctx.router.probe_identity(addr, node_id).await {
+                        debug!("Relay {} did not answer at {}; dropping its claim", node_id, addr);
+                        ctx.directory.write().await.remove(&node_id);
+                    }
+                }
+                if let Err(e) = ctx.directory.write().await.insert(descriptor.clone()) {
+                    debug!("Descriptor for {} still rejected after probing: {}", descriptor.node_id, e);
+                }
+            }
+            in_flight.lock().unwrap().remove(&descriptor.node_id);
+        });
     }
 
     /// Dandelion++ の注入点 ── stem（1本道）で運ぶか fluff（放流）するか決める (3-2)
@@ -1669,6 +1747,8 @@ impl NodeServer {
         let mailbox = self.mailbox.clone();
         let gossip = self.gossip.clone();
         let hint_log = self.hint_log.clone();
+        let directory = self.directory.clone();
+        let node_id = self.descriptor.node_id;
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(GC_INTERVAL);
@@ -1690,6 +1770,49 @@ impl NodeServer {
                 if let Ok(mut log) = hint_log.lock() {
                     log.prune(current_timestamp());
                 }
+
+                // 期限切れの記述子を掃除する。死んだノードや大昔の記述子が
+                // 網に残り続け、PEX でも配られ続けるのを防ぐ。自分の記述子は
+                // （たとえ resign タスクが動いていなくても）消さない。
+                let removed = directory.write().await.prune_expired(current_timestamp(), &node_id);
+                if removed > 0 {
+                    info!("GC: removed {} expired relay descriptors", removed);
+                }
+            }
+        });
+    }
+
+    /// 自分の記述子を定期的に署名し直してディレクトリへ入れ直す
+    ///
+    /// [`RelayDescriptor::issued_at`] は起動時に決まったきり進まないと、
+    /// [`DESCRIPTOR_TTL_SECS`](crate::net::relay_list::DESCRIPTOR_TTL_SECS) を過ぎて
+    /// 期限切れ扱いになり、ディレクトリの GC や PEX から自分が消えてしまう
+    /// （常駐リレーのはずが、いつの間にか誰にも配られなくなる）。
+    ///
+    /// 署名し直す元はディレクトリ上の**最新の**記述子（`dir.get`）を使う。
+    /// フィルタ判定で Tier 0 へ昇格した記述子（[`refresh_descriptor`](Self::refresh_descriptor)
+    /// を経由せずディレクトリへ直接 `insert_unchecked` されることがある）を
+    /// 取りこぼさないため。
+    fn spawn_resign(&self) {
+        let identity = self.identity.clone();
+        let directory = self.directory.clone();
+        let node_id = self.descriptor.node_id;
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(DESCRIPTOR_RESIGN_INTERVAL);
+            // 起動直後は署名したてなので即時発火は捨てる
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+
+                let mut dir = directory.write().await;
+                let Some(mut latest) = dir.get(&node_id).cloned() else {
+                    // 万一自分の記述子が無ければ何もしない（起動時に必ず入れているはず）
+                    continue;
+                };
+                latest.resign(&identity);
+                dir.insert_unchecked(latest);
             }
         });
     }

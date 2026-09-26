@@ -56,6 +56,23 @@ const DESCRIPTOR_SIG_DOMAIN: &[u8] = b"aether_relay_descriptor_v1";
 /// 遠い未来の記述子を一度入れると、以後の正しい更新が全て「古い」として弾かれる。
 pub const MAX_DESCRIPTOR_CLOCK_SKEW_SECS: u64 = 600;
 
+/// 記述子の有効期限（秒）
+///
+/// これを過ぎた `issued_at` の記述子は死んでいるとみなす。ディレクトリは接触時の
+/// 死活除去しかしないため、これが無いと死んだノードや大昔の記述子が網に残り続け、
+/// PEX でも配られ続ける。常駐ノードはこの 1/3 の間隔で自分の記述子を署名し直して
+/// 延命するので（[`crate::node::server::NodeServer`] 参照）、生きているリレーは
+/// 期限切れにならない。
+pub const DESCRIPTOR_TTL_SECS: u64 = 3 * 3600;
+
+/// 1 つの IP に載せられるリレー（NodeId）の上限
+///
+/// 上限が無いと、1台のマシンが好きなだけ NodeId を名乗れる（Sybil）。また
+/// 他人の IP を書いた記述子を配ってその IP へトラフィックを向ける踏み台にもなる。
+/// ループバック・私用アドレス（試験網）には掛けない（テストは 127.0.0.1 に
+/// 何台も立てるため）。
+pub const MAX_RELAYS_PER_IP: usize = 2;
+
 impl RelayDescriptor {
     /// 自分の記述子を組み立てて署名する
     ///
@@ -152,6 +169,27 @@ pub fn same_subnet(a: &SocketAddr, b: &SocketAddr) -> bool {
     }
 }
 
+/// [`MAX_RELAYS_PER_IP`] を数える単位（IPv4 はアドレスそのもの・IPv6 は /64）
+///
+/// ループバック・私用アドレス（試験網）は `None`（上限を掛けない）。
+fn ip_cap_key(addr: &SocketAddr) -> Option<Vec<u8>> {
+    let ip = crate::net::addr::normalize(*addr).ip();
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            (!(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()))
+                .then(|| v4.octets().to_vec())
+        }
+        std::net::IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            let local = v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg0 & 0xfe00) == 0xfc00 // ULA
+                || (seg0 & 0xffc0) == 0xfe80; // リンクローカル
+            (!local).then(|| v6.octets()[..8].to_vec()) // /64
+        }
+    }
+}
+
 /// リレーリスト
 pub struct RelayDirectory {
     relays: HashMap<NodeId, RelayDescriptor>,
@@ -210,6 +248,16 @@ impl RelayDirectory {
             )));
         }
 
+        // **期限切れの記述子は入れない。** 死んだノードや大昔の記述子が網に
+        // 残り続け、PEX でも配られ続けるのを防ぐ（ディレクトリは接触時の
+        // 死活除去しかしないため）。
+        if descriptor.issued_at < now.saturating_sub(DESCRIPTOR_TTL_SECS) {
+            return Err(AetherError::Protocol(format!(
+                "RelayDescriptor for {} has expired",
+                descriptor.node_id
+            )));
+        }
+
         // **古い記述子で新しいものを上書きさせない。** 署名済みでも、過去に配った
         // 記述子（旧アドレス・旧 Tier）を攻撃者が再送すれば巻き戻せてしまう。
         if let Some(existing) = self.relays.get(&descriptor.node_id)
@@ -218,8 +266,107 @@ impl RelayDirectory {
             return Ok(());
         }
 
+        // **同じ IP:port を別 NodeId が名乗るのを拒否する。** 既存の記述子が
+        // まだ有効期限内なら、後から来た方（自称）を弾く。放置すると、
+        // 誰かの記述子の後追いでアドレスを乗っ取り、そのノード宛てのトラフィックを
+        // 横取りできてしまう。
+        if let Some(existing) = self
+            .relays
+            .values()
+            .find(|r| r.node_id != descriptor.node_id && r.addr == descriptor.addr)
+            && existing.issued_at >= now.saturating_sub(DESCRIPTOR_TTL_SECS)
+        {
+            return Err(AetherError::Protocol(format!(
+                "address {} is already claimed by another NodeId",
+                descriptor.addr
+            )));
+        }
+
+        // **1 つの IP に載せられる NodeId 数の上限。** これが無いと、1台のマシンが
+        // 好きなだけ NodeId を名乗れる（Sybil）し、他人の IP を書いた記述子を配って
+        // その IP へトラフィックを向ける踏み台にもなる。試験網（ループバック・私用
+        // アドレス）には掛けない。
+        if let Some(key) = ip_cap_key(&descriptor.addr) {
+            let holders: std::collections::HashSet<NodeId> = self
+                .relays
+                .values()
+                .filter(|r| {
+                    r.node_id != descriptor.node_id
+                        && ip_cap_key(&r.addr).as_deref() == Some(key.as_slice())
+                        && r.issued_at >= now.saturating_sub(DESCRIPTOR_TTL_SECS)
+                })
+                .map(|r| r.node_id)
+                .collect();
+            if holders.len() >= MAX_RELAYS_PER_IP {
+                return Err(AetherError::Protocol(format!(
+                    "IP already hosts {} relays (limit {})",
+                    holders.len(),
+                    MAX_RELAYS_PER_IP
+                )));
+            }
+        }
+
         self.store(descriptor);
         Ok(())
+    }
+
+    /// `descriptor` の登録を妨げている既存の NodeId（同じ IP:port の名乗り・IP ごとの上限）
+    ///
+    /// 登録は先着順なので、攻撃者が本物より先に偽の記述子（他人の IP を書いたもの）を
+    /// 配ると本物が締め出される。呼び出し側はここで得た相手と新しい記述子の両方に
+    /// NodeId を指定して接続し（証明書が NodeId の鍵で作られているので、接続できる＝
+    /// 鍵の持ち主がそのアドレスにいる）、応答しなかった方を消す。
+    pub fn blocking_claims(&self, descriptor: &RelayDescriptor) -> Vec<NodeId> {
+        let now = crate::protocol::hint::current_timestamp();
+        let fresh = |r: &&RelayDescriptor| r.issued_at >= now.saturating_sub(DESCRIPTOR_TTL_SECS);
+        let mut out: Vec<NodeId> = self
+            .relays
+            .values()
+            .filter(|r| r.node_id != descriptor.node_id && r.addr == descriptor.addr)
+            .filter(fresh)
+            .map(|r| r.node_id)
+            .collect();
+        if let Some(key) = ip_cap_key(&descriptor.addr) {
+            let same_ip: Vec<NodeId> = self
+                .relays
+                .values()
+                .filter(|r| {
+                    r.node_id != descriptor.node_id
+                        && ip_cap_key(&r.addr).as_deref() == Some(key.as_slice())
+                })
+                .filter(fresh)
+                .map(|r| r.node_id)
+                .collect();
+            if same_ip.len() >= MAX_RELAYS_PER_IP {
+                out.extend(same_ip);
+            }
+        }
+        out.sort_by_key(|id| *id.as_bytes());
+        out.dedup();
+        out
+    }
+
+    /// 期限切れの記述子を消す
+    ///
+    /// ディレクトリは接触時の死活除去しかしないので、死んだノードや大昔の
+    /// 記述子が残り続ける。これを定期的に呼んで掃除する。
+    ///
+    /// `keep` は消さない NodeId（通常は自分自身）。`insert_unchecked` で入れた
+    /// 自分の記述子は検証を経ていないため `insert` で延命されず、素通しで
+    /// 消えてしまうことがある。
+    pub fn prune_expired(&mut self, now: u64, keep: &NodeId) -> usize {
+        let cutoff = now.saturating_sub(DESCRIPTOR_TTL_SECS);
+        let expired: Vec<NodeId> = self
+            .relays
+            .iter()
+            .filter(|(id, r)| *id != keep && r.issued_at < cutoff)
+            .map(|(id, _)| *id)
+            .collect();
+        let removed = expired.len();
+        for id in expired {
+            self.remove(&id);
+        }
+        removed
     }
 
     /// 検証を省いて登録する（自ノードの記述子・テスト専用）
@@ -268,7 +415,7 @@ impl RelayDirectory {
 
     /// リレーのリング座標
     pub fn position_of(&self, descriptor: &RelayDescriptor) -> RingPosition {
-        ring::position_of_node(&descriptor.node_id, &self.epoch_seed)
+        ring::position_of_node(&descriptor.node_id, descriptor.pow_nonce, &self.epoch_seed)
     }
 
     /// 現在のエポックシード
@@ -465,6 +612,11 @@ mod tests {
             0,
             crate::net::reachability::Tier::Open,
         )
+    }
+
+    /// 任意のアドレスで署名する（IP 上限・アドレス衝突のテスト用）
+    fn signed_addr(identity: &crate::crypto::identity::Identity, addr: &str) -> RelayDescriptor {
+        RelayDescriptor::new_signed(identity, addr.parse().unwrap(), 0, crate::net::reachability::Tier::Open)
     }
 
     #[test]
@@ -745,5 +897,96 @@ mod tests {
 
         assert_ne!(before, after, "シード回転で座標が動く");
         assert_eq!(dir.epoch_seed(), [9u8; 32]);
+    }
+
+    #[test]
+    fn rejects_expired_descriptor() {
+        // 死んだノードや大昔の記述子が網に残り続けるのを防ぐ
+        let id = crate::crypto::identity::Identity::generate();
+        let mut d = signed_addr(&id, "203.0.113.10:9000");
+        d.issued_at = crate::protocol::hint::current_timestamp() - DESCRIPTOR_TTL_SECS - 1;
+        d.signature = id.sign(&d.signing_bytes());
+
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        assert!(dir.insert(d).is_err());
+    }
+
+    #[test]
+    fn prune_expired_removes_stale_but_keeps_self() {
+        let now = crate::protocol::hint::current_timestamp();
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+
+        let me = descriptor(1); // issued_at: 0（期限切れ）
+        let stranger = descriptor(2); // issued_at: 0（期限切れ）
+        dir.insert_unchecked(me.clone());
+        dir.insert_unchecked(stranger);
+
+        let removed = dir.prune_expired(now, &me.node_id);
+
+        assert_eq!(removed, 1);
+        assert!(dir.get(&me.node_id).is_some(), "自分の記述子は消さない");
+        assert!(dir.get(&NodeId([2u8; 32])).is_none(), "期限切れは消える");
+    }
+
+    #[test]
+    fn rejects_address_claimed_by_another_node_id() {
+        // 既に有効な記述子がある IP:port を、別の NodeId が名乗ってきた
+        let owner = crate::crypto::identity::Identity::generate();
+        let impostor = crate::crypto::identity::Identity::generate();
+
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        dir.insert(signed_addr(&owner, "203.0.113.10:9000")).unwrap();
+
+        let claim = signed_addr(&impostor, "203.0.113.10:9000");
+        assert!(dir.insert(claim).is_err());
+    }
+
+    #[test]
+    fn caps_relays_per_public_ip() {
+        // 1 つの公開 IP に MAX_RELAYS_PER_IP を超えて NodeId を載せられない
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        for port in 9000..9000 + MAX_RELAYS_PER_IP as u16 {
+            let id = crate::crypto::identity::Identity::generate();
+            dir.insert(signed_addr(&id, &format!("203.0.113.10:{}", port))).unwrap();
+        }
+
+        let one_too_many = crate::crypto::identity::Identity::generate();
+        let d = signed_addr(&one_too_many, &format!("203.0.113.10:{}", 9000 + MAX_RELAYS_PER_IP as u16));
+        assert!(dir.insert(d).is_err(), "上限を超えて同じ IP に載せられた");
+    }
+
+    #[test]
+    fn blocking_claims_names_who_holds_the_address_or_the_ip() {
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        let squatter = crate::crypto::identity::Identity::generate();
+        dir.insert(signed_addr(&squatter, "203.0.113.20:9000")).unwrap();
+
+        // 同じ IP:port を名乗る本物は、先に来た偽物に妨げられる
+        let real = crate::crypto::identity::Identity::generate();
+        let d = signed_addr(&real, "203.0.113.20:9000");
+        assert!(dir.insert(d.clone()).is_err());
+        assert_eq!(dir.blocking_claims(&d), vec![squatter.public_id()]);
+
+        // 妨げていなければ空
+        let other = crate::crypto::identity::Identity::generate();
+        assert!(dir.blocking_claims(&signed_addr(&other, "203.0.113.21:9000")).is_empty());
+    }
+
+    #[test]
+    fn ip_cap_does_not_apply_to_loopback_or_private_addresses() {
+        // 試験網はいくらでも同じ IP に載せられる（テストは 127.0.0.1 に何台も立てる）
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        for port in 9000..9000 + MAX_RELAYS_PER_IP as u16 + 3 {
+            let id = crate::crypto::identity::Identity::generate();
+            dir.insert(signed_addr(&id, &format!("127.0.0.1:{}", port))).unwrap();
+        }
+        assert_eq!(dir.len(), MAX_RELAYS_PER_IP + 3);
+
+        let mut dir2 = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        for port in 9000..9000 + MAX_RELAYS_PER_IP as u16 + 3 {
+            let id = crate::crypto::identity::Identity::generate();
+            dir2.insert(signed_addr(&id, &format!("10.0.0.5:{}", port))).unwrap();
+        }
+        assert_eq!(dir2.len(), MAX_RELAYS_PER_IP + 3);
     }
 }

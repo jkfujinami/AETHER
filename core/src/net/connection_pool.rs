@@ -29,6 +29,7 @@ use quinn::Connection;
 use crate::error::Result;
 use crate::net::quic::QuicClient;
 use crate::net::addr::normalize;
+use crate::crypto::identity::NodeId;
 use tokio::sync::mpsc;
 use std::sync::Mutex as StdMutex;
 
@@ -66,35 +67,51 @@ enum Dialer {
 }
 
 impl Dialer {
-    async fn connect(&self, addr: SocketAddr) -> Result<Connection> {
-        match self {
-            Dialer::Endpoint(ep) => ep
-                .connect(addr, &crate::net::quic::server_name_for(&addr))
-                .map_err(|e| crate::AetherError::Quic(e.to_string()))?
-                .await
-                .map_err(|e| crate::AetherError::Quic(e.to_string())),
-            Dialer::Client(c) => c.connect(addr).await,
-        }
-    }
-
-    async fn connect_keepalive(&self, addr: SocketAddr) -> Result<Connection> {
+    async fn connect(&self, addr: SocketAddr, expected: Option<NodeId>) -> Result<Connection> {
         match self {
             Dialer::Endpoint(ep) => ep
                 .connect_with(
-                    QuicClient::keepalive_config()?,
+                    QuicClient::client_config(expected)?,
                     addr,
                     &crate::net::quic::server_name_for(&addr),
                 )
                 .map_err(|e| crate::AetherError::Quic(e.to_string()))?
                 .await
                 .map_err(|e| crate::AetherError::Quic(e.to_string())),
-            Dialer::Client(c) => c.connect_keepalive(addr).await,
+            Dialer::Client(c) => c.connect_expecting(addr, expected).await,
+        }
+    }
+
+    async fn connect_keepalive(&self, addr: SocketAddr, expected: Option<NodeId>) -> Result<Connection> {
+        match self {
+            Dialer::Endpoint(ep) => ep
+                .connect_with(
+                    QuicClient::keepalive_config(expected)?,
+                    addr,
+                    &crate::net::quic::server_name_for(&addr),
+                )
+                .map_err(|e| crate::AetherError::Quic(e.to_string()))?
+                .await
+                .map_err(|e| crate::AetherError::Quic(e.to_string())),
+            Dialer::Client(c) => c.connect_keepalive_expecting(addr, expected).await,
         }
     }
 }
 
+/// 接続先アドレスから、相手であるはずの NodeId を引く（ディレクトリを見る）
+///
+/// 証明書の照合（[`crate::net::quic`] の NodeIdVerifier）に使う。分からなければ `None`
+/// （種ノードへの最初の接続など。その場合は照合しない）。
+pub type KeyResolver = Arc<
+    dyn Fn(SocketAddr) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<NodeId>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct ConnectionPool {
     dialer: Dialer,
+    /// 接続先の NodeId を引く口（[`KeyResolver`]）。未設定なら照合しない
+    key_resolver: StdMutex<Option<KeyResolver>>,
     /// 新しく張った outbound 接続の通知
     ///
     /// **ダイヤルした側も受信ストリームを読む必要がある。**
@@ -129,6 +146,30 @@ impl ConnectionPool {
     ///
     /// 受け取った側は `accept_uni()` を回すこと。
     /// これをしないと、相手が既存接続の上で押し返してきた応答を取りこぼす。
+    /// 接続先の NodeId を引く口を設定する（証明書の照合を有効にする）
+    pub fn set_key_resolver(&self, resolver: KeyResolver) {
+        *self.key_resolver.lock().unwrap() = Some(resolver);
+    }
+
+    /// `addr` に `expected` の鍵の持ち主がいるか（その NodeId を指定して接続できるか）
+    ///
+    /// 証明書は NodeId の鍵で作られ、ハンドシェイクの署名も検証するので、接続できれば
+    /// 鍵の持ち主がそのアドレスで応答している。接続はプールに入れずにすぐ閉じる。
+    pub async fn probe_identity(&self, addr: SocketAddr, expected: NodeId, timeout: Duration) -> bool {
+        match tokio::time::timeout(timeout, self.dialer.connect(addr, Some(expected))).await {
+            Ok(Ok(conn)) => {
+                conn.close(0u32.into(), b"");
+                true
+            }
+            _ => false,
+        }
+    }
+
+    async fn expected_key(&self, addr: SocketAddr) -> Option<NodeId> {
+        let resolver = self.key_resolver.lock().unwrap().clone()?;
+        resolver(addr).await
+    }
+
     pub fn subscribe_opened(&self) -> mpsc::UnboundedReceiver<Connection> {
         let (tx, rx) = mpsc::unbounded_channel();
         *self.opened_tx.lock().unwrap() = Some(tx);
@@ -138,6 +179,7 @@ impl ConnectionPool {
     fn with_dialer(dialer: Dialer) -> Self {
         Self {
             dialer,
+            key_resolver: StdMutex::new(None),
             opened_tx: StdMutex::new(None),
             connections: Arc::new(RwLock::new(HashMap::new())),
             ttl: Duration::from_secs(60),           // outbound の最大寿命
@@ -179,7 +221,8 @@ impl ConnectionPool {
         }
 
         // 生きた接続が無いのでダイヤルする
-        let connection = self.dialer.connect(addr).await?;
+        let expected = self.expected_key(addr).await;
+        let connection = self.dialer.connect(addr, expected).await?;
 
         // ダイヤルした接続も受信を回してもらう
         if let Some(tx) = self.opened_tx.lock().unwrap().as_ref() {
@@ -222,7 +265,8 @@ impl ConnectionPool {
             }
         }
 
-        let connection = self.dialer.connect_keepalive(addr).await?;
+        let expected = self.expected_key(addr).await;
+        let connection = self.dialer.connect_keepalive(addr, expected).await?;
 
         // 受信も回してもらう（返信はこの接続の上で届く）
         if let Some(tx) = self.opened_tx.lock().unwrap().as_ref() {
@@ -362,5 +406,40 @@ impl ConnectionPool {
         for (_, entry) in pool.drain() {
             entry.connection.close(0u32.into(), b"pool cleared");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::identity::Identity;
+    use crate::net::quic::QuicServer;
+
+    #[tokio::test]
+    async fn probe_identity_confirms_only_the_key_holder() {
+        let id = Identity::generate();
+        let server = QuicServer::with_identity(
+            &crate::Config { listen_port: 0, ..Default::default() },
+            Some(&id),
+        )
+        .unwrap();
+        let addr: SocketAddr = format!("127.0.0.1:{}", server.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = server.endpoint().accept().await {
+                tokio::spawn(async move {
+                    let _ = incoming.await;
+                });
+            }
+        });
+
+        let pool = ConnectionPool::new(Arc::new(QuicClient::new().unwrap()));
+        let t = Duration::from_secs(3);
+        assert!(pool.probe_identity(addr, id.public_id(), t).await, "本物の鍵の持ち主は確認できる");
+        assert!(
+            !pool.probe_identity(addr, Identity::generate().public_id(), t).await,
+            "別の NodeId を名乗る記述子はそのアドレスで確認できない"
+        );
     }
 }

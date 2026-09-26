@@ -14,6 +14,8 @@ const GUARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 
 pub struct RelayClient {
     quic_client: Arc<QuicClient>,
+    /// 入口への接続をノードの keepalive 接続に相乗りさせる（[`RelayClient::via_node`]）
+    entry_via: Option<Arc<crate::node::router::Router>>,
     connection_pool: ConnectionPool,
     entry_connection: Option<QuicConnection>,
     circuit: Option<OnionCircuit>,
@@ -21,11 +23,33 @@ pub struct RelayClient {
 }
 
 impl RelayClient {
+    /// ノードの待ち受けと同じソケット・同じ接続から送るクライアント
+    ///
+    /// 自分の送信・取得の回路を待ち受けと別のポートから出すと、観測者は中継の
+    /// 通信と見分けて「この人自身の送受信」だけを拾える。同じソケットから出して紛れさせる。
+    ///
+    /// **入口（ガード）への接続は、ノードが保つ keepalive 接続をそのまま使う。**
+    /// 同じソケットから 2 本目の接続を張ると、ガードは送り元アドレスで接続を管理して
+    /// いるので返信トンネル用の接続が上書きされ、こちらで受信を回していない接続へ
+    /// 返信が流れて失われる。
+    pub fn via_node(router: Arc<crate::node::router::Router>, endpoint: quinn::Endpoint) -> Self {
+        let quic_client = Arc::new(QuicClient::from_endpoint(endpoint));
+        let connection_pool = ConnectionPool::new(quic_client.clone());
+        Self {
+            quic_client,
+            entry_via: Some(router),
+            connection_pool,
+            entry_connection: None,
+            circuit: None,
+        }
+    }
+
     pub fn new() -> Result<Self> {
         let quic_client = Arc::new(QuicClient::new()?);
         let connection_pool = ConnectionPool::new(quic_client.clone());
         Ok(Self {
             quic_client,
+            entry_via: None,
             connection_pool,
             entry_connection: None,
             circuit: None,
@@ -39,8 +63,24 @@ impl RelayClient {
     /// 毎回ランダムな入口へ繋ぐと、攻撃者のリレー占有率 f に対して
     /// 「生涯に一度でも敵の入口を引く」確率が 1 に収束する。
     pub async fn connect_entry(&mut self, addr: SocketAddr) -> Result<()> {
-        // サーバー名は証明書検証をスキップしているので何でも良いが、将来的に重要
-        let conn = self.quic_client.connect(addr).await?;
+        self.connect_entry_expecting(addr, None).await
+    }
+
+    /// 入口（ガード）へ、証明書を `expected`（ガードの NodeId）と照合して接続する
+    ///
+    /// ガードへのリンクは「この人の IP」と「この人の onion」が同時に流れる唯一の区間で、
+    /// 経路上の能動的な攻撃者が最も狙う場所。照合しないと、なりすましたガードに
+    /// 取得の着信・時刻・量を見られる。
+    pub async fn connect_entry_expecting(
+        &mut self,
+        addr: SocketAddr,
+        expected: Option<crate::crypto::identity::NodeId>,
+    ) -> Result<()> {
+        let conn = match &self.entry_via {
+            // ノードの接続はディレクトリの NodeId と照合して張られる
+            Some(router) => router.pinned_connection(addr).await?,
+            None => self.quic_client.connect_expecting(addr, expected).await?,
+        };
         self.entry_connection = Some(conn);
         Ok(())
     }
@@ -71,7 +111,7 @@ impl RelayClient {
 
             // 死んだガードで QUIC のタイムアウトまで固まらないよう頭打ちにする。
             // 打ち切りも失敗として記録しないと、標本内の次へ進めない。
-            let attempt = tokio::time::timeout(GUARD_CONNECT_TIMEOUT, self.connect_entry(guard.addr));
+            let attempt = tokio::time::timeout(GUARD_CONNECT_TIMEOUT, self.connect_entry_expecting(guard.addr, Some(guard.node_id)));
             match attempt.await {
                 Ok(Ok(())) => {
                     guards.record_success(&guard.node_id);
