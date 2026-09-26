@@ -26,12 +26,29 @@ const SESSION_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const SESSION_GRACE: Duration = Duration::from_secs(3 * 60);
 /// 起動直後、最初のトンネルが張れるまで粘る時間
 const FIRST_SESSION_WAIT: Duration = Duration::from_secs(60);
-/// シャードが揃わないまま待つ上限（揃わない＝保持者が落ちた）
+/// シャードが揃わないまま待つ上限（揃わない＝保持者が落ちた）。取りに行った時点から数える
 const PENDING_TIMEOUT: Duration = Duration::from_secs(120);
 /// 公開コンテンツを保持者として維持する間隔（18.3-A,C）
 const REPUBLISH_INTERVAL: Duration = Duration::from_secs(600);
 /// プレキー束を再公開する間隔（保持者の入れ替わり・TTL に抗う）
 const PREKEY_REPUBLISH_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Hint を見つけてから本体を取りに行くまでの最大の遅れ
+const FETCH_JITTER_MAX: Duration = Duration::from_secs(60);
+/// ダミーの取得の平均間隔
+const COVER_FETCH_MEAN: Duration = Duration::from_secs(90);
+
+/// 取りに行くまでの遅れ（0〜FETCH_JITTER_MAX の一様乱数）
+fn fetch_jitter() -> Duration {
+    Duration::from_millis(rand::random::<u64>() % FETCH_JITTER_MAX.as_millis() as u64)
+}
+
+/// 次のダミー取得までの間隔（指数分布：いつ来るか予測できない）
+fn cover_interval() -> Duration {
+    let u: f64 = rand::random::<f64>().max(1e-9);
+    Duration::from_secs_f64(-u.ln() * COVER_FETCH_MEAN.as_secs_f64())
+        .min(COVER_FETCH_MEAN * 6)
+}
 
 /// 受信したい相手
 #[derive(Debug, Clone)]
@@ -219,22 +236,34 @@ impl AetherClient {
         let mut hints = self.node.gossip().subscribe();
         // シャードは順不同・重複で届く。mailbox_key ごとに束ね、異なる 3 枚が揃うまで貯める
         let mut pending: HashMap<[u8; 32], PendingBody> = HashMap::new();
+        let mut next_cover = tokio::time::Instant::now() + cover_interval();
 
         loop {
             tokio::select! {
                 hint = hints.recv() => match hint {
                     Ok(hint) => {
-                        let current = &sessions[0].mailbox;
-                        // 自分宛てでなければ何も起きない（手元だけで判定）。自分宛てなら取り寄せを出す
-                        if let Ok(Some(key)) = current.process_hint(&hint).await
-                            && let Some((nonce, secret)) = current.decrypt_hint(&hint)
+                        let current = sessions[0].mailbox.clone();
+                        // 自分宛てかは手元だけで判定する（網には何も出さない）
+                        if let Some((key, secret)) = current.try_decrypt_hint(&hint)
+                            && let Some((nonce, _)) = current.decrypt_hint(&hint)
+                            && !pending.contains_key(&key)
                         {
-                            events::progress(&self.events, "自分宛ての Hint を検出。本体を取り寄せます");
-                            pending.entry(key).or_insert_with(|| PendingBody {
+                            // **すぐには取りに行かない。** Hint の放流直後に取得が出ると、
+                            // 放流時刻とガードの観測を突き合わせて受信者を特定できる
+                            let delay = fetch_jitter();
+                            events::progress(
+                                &self.events,
+                                format!("自分宛ての Hint を検出。{} 秒後に本体を取り寄せます", delay.as_secs()),
+                            );
+                            pending.insert(key, PendingBody {
                                 secret,
                                 nonce,
                                 shards: Vec::new(),
-                                since: Instant::now(),
+                                since: Instant::now() + delay,
+                            });
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                let _ = current.request_object(&key, &secret).await;
                             });
                         }
                     }
@@ -243,6 +272,16 @@ impl AetherClient {
                     }
                     Err(_) => return Ok(()),
                 },
+                // **ダミーの取得。** 実在しない鍵を、本物と同じ形・同じ回路で取りに行く。
+                // ガードから見て「Hint の後に取得が出た」が受信の手掛かりにならないよう、
+                // 取得の流れを平時から途切れさせない
+                _ = tokio::time::sleep_until(next_cover) => {
+                    let current = sessions[0].mailbox.clone();
+                    tokio::spawn(async move {
+                        let _ = current.request_object(&rand::random(), &rand::random()).await;
+                    });
+                    next_cover = tokio::time::Instant::now() + cover_interval();
+                }
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             }
 
@@ -398,5 +437,28 @@ fn open_private_body(
             Ok(Some(pt))
         }
         Err(_) => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_jitter_stays_in_range_and_varies() {
+        let samples: Vec<Duration> = (0..200).map(|_| fetch_jitter()).collect();
+        assert!(samples.iter().all(|d| *d < FETCH_JITTER_MAX));
+        // 毎回同じ遅れだと、放流時刻から一定だけずらしただけになる
+        let distinct: std::collections::HashSet<_> = samples.iter().map(|d| d.as_millis()).collect();
+        assert!(distinct.len() > 150);
+    }
+
+    #[test]
+    fn cover_interval_is_bounded_with_the_expected_mean() {
+        let samples: Vec<f64> = (0..5000).map(|_| cover_interval().as_secs_f64()).collect();
+        assert!(samples.iter().all(|s| *s <= COVER_FETCH_MEAN.as_secs_f64() * 6.0));
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let target = COVER_FETCH_MEAN.as_secs_f64();
+        assert!((mean - target).abs() < target * 0.15, "平均 {} 秒", mean);
     }
 }
