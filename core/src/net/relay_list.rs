@@ -27,18 +27,108 @@ pub struct RelayDescriptor {
     pub x25519_pub: [u8; 32],
     /// NodeId PoW の解
     pub pow_nonce: u64,
-    /// 稼働実績（秒）。ガード選択の重み付けに使う
+    /// 稼働実績（秒）の自己申告
+    ///
+    /// **選択には使わない。** 誰でも好きな値を書けるので、これで重み付けすると
+    /// 大きく申告した Sybil がガード枠を独占する。ガードの重みは
+    /// [`RelayDirectory`] が自分で観測した在籍時間から作る。
     pub uptime_secs: u64,
     /// 到達性の等級
     ///
     /// **ガード候補の絞り込みと Mailbox 配置に使う。**
     /// 到達不能なノードを Mailbox に選ぶとデータが届かない。
     pub tier: crate::net::reachability::Tier,
+    /// 署名した時刻 (UNIX秒)。同じ NodeId の記述子は新しい方だけを採る
+    pub issued_at: u64,
+    /// 上の全フィールドへの Ed25519 署名（NodeId の鍵で）
+    ///
+    /// PoW は NodeId にしか掛かっていない。署名が無いと、他人の NodeId と
+    /// pow_nonce を写して自分のアドレスを書いた記述子で**そのノードに成り代われる**
+    /// （Onion 層も Mailbox の担当位置も奪われる）。
+    pub signature: Vec<u8>,
+}
+
+/// 記述子の署名に混ぜるドメイン分離タグ
+const DESCRIPTOR_SIG_DOMAIN: &[u8] = b"aether_relay_descriptor_v1";
+
+/// これより未来の `issued_at` は受け取らない（時計のずれの許容幅）
+///
+/// 遠い未来の記述子を一度入れると、以後の正しい更新が全て「古い」として弾かれる。
+pub const MAX_DESCRIPTOR_CLOCK_SKEW_SECS: u64 = 600;
+
+impl RelayDescriptor {
+    /// 自分の記述子を組み立てて署名する
+    ///
+    /// `x25519_pub` は identity から導出する（NodeId と一致しない鍵は受け手が弾く）。
+    pub fn new_signed(
+        identity: &crate::crypto::identity::Identity,
+        addr: SocketAddr,
+        pow_nonce: u64,
+        tier: crate::net::reachability::Tier,
+    ) -> Self {
+        let mut d = Self {
+            node_id: identity.public_id(),
+            addr,
+            x25519_pub: x25519_dalek::PublicKey::from(&identity.x25519_secret()).to_bytes(),
+            pow_nonce,
+            uptime_secs: 0,
+            tier,
+            issued_at: 0,
+            signature: Vec::new(),
+        };
+        d.resign(identity);
+        d
+    }
+
+    /// 内容を変えたあとに署名し直す
+    ///
+    /// `issued_at` は単調に進める。同じ秒に2回更新すると、2回目が「同じ古さ」として
+    /// 他ノードに無視されるため。
+    pub fn resign(&mut self, identity: &crate::crypto::identity::Identity) {
+        debug_assert_eq!(self.node_id, identity.public_id());
+        let now = crate::protocol::hint::current_timestamp();
+        self.issued_at = now.max(self.issued_at + 1);
+        self.signature = identity.sign(&self.signing_bytes());
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        let body = (
+            &self.node_id,
+            &self.addr,
+            &self.x25519_pub,
+            self.pow_nonce,
+            self.uptime_secs,
+            &self.tier,
+            self.issued_at,
+        );
+        let mut buf = DESCRIPTOR_SIG_DOMAIN.to_vec();
+        buf.extend_from_slice(&bincode::serialize(&body).expect("固定形のタプルは直列化できる"));
+        buf
+    }
+
+    /// 記述子が NodeId の持ち主によって書かれたものか確かめる
+    ///
+    /// - 署名が NodeId の鍵で通ること
+    /// - `x25519_pub` が NodeId から導出した鍵と一致すること（Onion 層を包む鍵のすり替え防止）
+    pub fn verify_authenticity(&self) -> Result<()> {
+        let expected = crate::crypto::identity::x25519_public_from_node_id(&self.node_id)?;
+        if expected != self.x25519_pub {
+            return Err(AetherError::Crypto(format!(
+                "RelayDescriptor for {} carries an X25519 key not derived from its NodeId",
+                self.node_id
+            )));
+        }
+        crate::crypto::identity::verify_signature(&self.node_id, &self.signing_bytes(), &self.signature)
+    }
 }
 
 /// リレーリスト
 pub struct RelayDirectory {
     relays: HashMap<NodeId, RelayDescriptor>,
+    /// 各リレーを最初に見た時刻 (UNIX秒)。**自分で観測した値なので偽れない**
+    ///
+    /// ガードの重み付けに使う。自己申告の `uptime_secs` は使わない。
+    first_seen: HashMap<NodeId, u64>,
     epoch_seed: [u8; 32],
     /// NodeId PoW に要求する難易度
     pow_difficulty: u32,
@@ -54,6 +144,7 @@ impl RelayDirectory {
     pub fn new(epoch_seed: [u8; 32], pow_difficulty: u32) -> Self {
         Self {
             relays: HashMap::new(),
+            first_seen: HashMap::new(),
             epoch_seed,
             pow_difficulty,
         }
@@ -64,6 +155,7 @@ impl RelayDirectory {
     /// **NodeId PoW を検証してから入れる。**
     /// 検証を省くと、攻撃者が Ed25519 鍵を大量生成して
     /// 狙った mailbox_key の隣に着地する NodeId を選べてしまう (18.5.3)。
+    /// **署名も検証する**（NodeId の鍵で署名され、X25519 鍵が NodeId 由来であること）。
     pub fn insert(&mut self, descriptor: RelayDescriptor) -> Result<()> {
         let valid = pow::node_id::verify(
             descriptor.node_id.as_bytes(),
@@ -78,17 +170,54 @@ impl RelayDirectory {
             )));
         }
 
-        self.relays.insert(descriptor.node_id, descriptor);
+        descriptor.verify_authenticity()?;
+
+        let now = crate::protocol::hint::current_timestamp();
+        if descriptor.issued_at > now + MAX_DESCRIPTOR_CLOCK_SKEW_SECS {
+            return Err(AetherError::Protocol(format!(
+                "RelayDescriptor for {} is dated in the future",
+                descriptor.node_id
+            )));
+        }
+
+        // **古い記述子で新しいものを上書きさせない。** 署名済みでも、過去に配った
+        // 記述子（旧アドレス・旧 Tier）を攻撃者が再送すれば巻き戻せてしまう。
+        if let Some(existing) = self.relays.get(&descriptor.node_id)
+            && existing.issued_at >= descriptor.issued_at
+        {
+            return Ok(());
+        }
+
+        self.store(descriptor);
         Ok(())
     }
 
-    /// PoW 検証を省いて登録する（テスト・ブートストラップ専用）
+    /// 検証を省いて登録する（自ノードの記述子・テスト専用）
+    ///
+    /// **網から受け取った記述子には使わないこと。**
     pub fn insert_unchecked(&mut self, descriptor: RelayDescriptor) {
+        self.store(descriptor);
+    }
+
+    fn store(&mut self, descriptor: RelayDescriptor) {
+        self.first_seen
+            .entry(descriptor.node_id)
+            .or_insert_with(crate::protocol::hint::current_timestamp);
         self.relays.insert(descriptor.node_id, descriptor);
     }
 
     pub fn remove(&mut self, node_id: &NodeId) -> Option<RelayDescriptor> {
+        self.first_seen.remove(node_id);
         self.relays.remove(node_id)
+    }
+
+    /// 自分が観測した在籍時間（秒）
+    pub fn observed_age(&self, node_id: &NodeId) -> u64 {
+        let now = crate::protocol::hint::current_timestamp();
+        self.first_seen
+            .get(node_id)
+            .map(|t| now.saturating_sub(*t))
+            .unwrap_or(0)
     }
 
     pub fn get(&self, node_id: &NodeId) -> Option<&RelayDescriptor> {
@@ -199,6 +328,8 @@ impl RelayDirectory {
     ///
     /// **Tier 0 だけを返す。** punch が要る相手をガードにすると、
     /// 仲介役にクライアントとガードの対応が漏れる。
+    ///
+    /// 稼働実績は**自分が観測した在籍時間**を渡す（自己申告の `uptime_secs` は偽れる）。
     pub fn guard_candidates(&self) -> Vec<crate::net::guard::GuardCandidate> {
         self.relays
             .values()
@@ -206,9 +337,46 @@ impl RelayDirectory {
             .map(|r| crate::net::guard::GuardCandidate {
                 node_id: r.node_id,
                 addr: r.addr,
-                uptime_secs: r.uptime_secs,
+                x25519_pub: r.x25519_pub,
+                uptime_secs: self.observed_age(&r.node_id),
             })
             .collect()
+    }
+
+    /// ガードの後ろに続く中間・出口リレーを選ぶ（3ホップ回路 = ガード → 中間 → 出口）
+    ///
+    /// - **中間を挟むのが要点。** 1ホップだと入口が出口を兼ね、
+    ///   「発信者の IP」と「復号した中身」が同じ1台に揃う。
+    /// - 中間・出口は**見知らぬ相手を受けられる**ノードに限る。到達不能ノードを
+    ///   挟むと黙って落ちるが、出口の生死を発信者が直接確かめると
+    ///   出口に発信者の IP を晒すので、事前に絞るしかない。
+    /// - `exclude` は一切使わない相手（自分など）、`avoid_exit` は出口にだけ
+    ///   使わない相手（回路分離で他の回路が使った出口）。
+    ///
+    /// 候補が足りなければ `None`。**短い回路へ黙って落とさない**（fail closed）。
+    pub fn circuit_hops(
+        &self,
+        guard: &NodeId,
+        exclude: &[NodeId],
+        avoid_exit: &[NodeId],
+    ) -> Option<(RelayDescriptor, RelayDescriptor)> {
+        use rand::seq::SliceRandom;
+
+        let mut pool: Vec<&RelayDescriptor> = self
+            .relays
+            .values()
+            .filter(|r| {
+                r.node_id != *guard
+                    && !exclude.contains(&r.node_id)
+                    && r.tier.accepts_strangers()
+            })
+            .collect();
+        pool.shuffle(&mut rand::thread_rng());
+
+        let exit_idx = pool.iter().position(|r| !avoid_exit.contains(&r.node_id))?;
+        let exit = pool.remove(exit_idx).clone();
+        let middle = pool.first()?;
+        Some(((*middle).clone(), exit))
     }
 
     /// Onion 回路用にランダムな `hops` 台を選ぶ
@@ -240,16 +408,27 @@ mod tests {
             pow_nonce: 0,
             uptime_secs: u64::from(n) * 3600,
             tier: crate::net::reachability::Tier::Open,
+            issued_at: 0,
+            signature: Vec::new(),
         }
     }
 
+    /// 選択ロジックを試すためのディレクトリ（検証は下の専用テストで見る）
     fn directory(count: u8) -> RelayDirectory {
-        // PoW 難易度 0 = 検証を通す（テスト用）
         let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
         for n in 1..=count {
-            dir.insert(descriptor(n)).unwrap();
+            dir.insert_unchecked(descriptor(n));
         }
         dir
+    }
+
+    fn signed(identity: &crate::crypto::identity::Identity, port: u16) -> RelayDescriptor {
+        RelayDescriptor::new_signed(
+            identity,
+            format!("10.0.0.1:{}", port).parse().unwrap(),
+            0,
+            crate::net::reachability::Tier::Open,
+        )
     }
 
     #[test]
@@ -266,8 +445,14 @@ mod tests {
         let difficulty = 6;
         let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, difficulty);
 
-        let mut d = descriptor(1);
-        d.pow_nonce = pow::node_id::solve(d.node_id.as_bytes(), difficulty, 100_000).unwrap();
+        let id = crate::crypto::identity::Identity::generate();
+        let nonce = pow::node_id::solve(id.public_id().as_bytes(), difficulty, 100_000).unwrap();
+        let d = RelayDescriptor::new_signed(
+            &id,
+            "10.0.0.1:9000".parse().unwrap(),
+            nonce,
+            crate::net::reachability::Tier::Open,
+        );
 
         dir.insert(d).unwrap();
         assert_eq!(dir.len(), 1);
@@ -352,12 +537,127 @@ mod tests {
     }
 
     #[test]
-    fn guard_candidates_carry_uptime() {
-        let dir = directory(5);
-        let candidates = dir.guard_candidates();
+    fn circuit_hops_are_distinct_from_guard_and_each_other() {
+        let dir = directory(10);
+        let guard = NodeId([1u8; 32]);
+        let me = NodeId([2u8; 32]);
+        for _ in 0..50 {
+            let (middle, exit) = dir.circuit_hops(&guard, &[me], &[]).unwrap();
+            assert_ne!(middle.node_id, exit.node_id);
+            for hop in [&middle, &exit] {
+                assert_ne!(hop.node_id, guard, "ガードを中間・出口に再利用しない");
+                assert_ne!(hop.node_id, me);
+            }
+        }
+    }
 
-        assert_eq!(candidates.len(), 5);
-        assert!(candidates.iter().any(|c| c.uptime_secs > 0));
+    #[test]
+    fn circuit_hops_honour_avoid_exit() {
+        // 回路分離：他の回路の出口は出口に選ばない（中間には使ってよい）
+        let dir = directory(4);
+        let guard = NodeId([1u8; 32]);
+        let other_exit = NodeId([3u8; 32]);
+        for _ in 0..50 {
+            let (_, exit) = dir.circuit_hops(&guard, &[], &[other_exit]).unwrap();
+            assert_ne!(exit.node_id, other_exit);
+        }
+    }
+
+    #[test]
+    fn circuit_hops_fail_closed_when_too_few_relays() {
+        // ガード以外に1台しか無ければ 3 ホップは組めない。短い回路に落とさない
+        let dir = directory(2);
+        assert!(dir.circuit_hops(&NodeId([1u8; 32]), &[], &[]).is_none());
+    }
+
+    #[test]
+    fn circuit_hops_skip_unreachable_relays() {
+        let mut dir = directory(3);
+        let mut hidden = descriptor(9);
+        hidden.tier = crate::net::reachability::Tier::Reversed;
+        dir.insert_unchecked(hidden);
+        for _ in 0..50 {
+            let (middle, exit) = dir.circuit_hops(&NodeId([1u8; 32]), &[], &[]).unwrap();
+            assert_ne!(middle.node_id, NodeId([9u8; 32]));
+            assert_ne!(exit.node_id, NodeId([9u8; 32]));
+        }
+    }
+
+    #[test]
+    fn guard_candidates_ignore_self_reported_uptime() {
+        // 自己申告を信じると、大きな値を書いた Sybil がガード枠を独占する
+        let mut dir = directory(5);
+        let mut liar = descriptor(6);
+        liar.uptime_secs = u64::MAX;
+        dir.insert_unchecked(liar);
+        // 古参 1 台だけは、ずっと前から見えていたことにする
+        dir.first_seen.insert(NodeId([1u8; 32]), 0);
+
+        let candidates = dir.guard_candidates();
+        assert_eq!(candidates.len(), 6);
+        let liar_c = candidates.iter().find(|c| c.node_id == NodeId([6u8; 32])).unwrap();
+        let old_c = candidates.iter().find(|c| c.node_id == NodeId([1u8; 32])).unwrap();
+        assert!(liar_c.uptime_secs < 60, "自己申告が重みに漏れている");
+        assert!(old_c.uptime_secs > liar_c.uptime_secs);
+    }
+
+    #[test]
+    fn accepts_a_properly_signed_descriptor() {
+        let id = crate::crypto::identity::Identity::generate();
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        dir.insert(signed(&id, 9000)).unwrap();
+        assert!(dir.get(&id.public_id()).is_some());
+    }
+
+    #[test]
+    fn rejects_a_hijacked_address() {
+        // 他人の NodeId・PoW を写し、アドレスだけ自分に書き換えた記述子
+        let victim = crate::crypto::identity::Identity::generate();
+        let mut forged = signed(&victim, 9000);
+        forged.addr = "203.0.113.66:9000".parse().unwrap();
+
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        assert!(dir.insert(forged).is_err());
+        assert!(dir.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_substituted_onion_key() {
+        // 署名し直せても（＝持ち主本人でも）NodeId 由来でない X25519 鍵は受けない。
+        // 鍵を差し替えられると、そのノード宛ての Onion 層を別の誰かが開ける
+        let id = crate::crypto::identity::Identity::generate();
+        let mut d = signed(&id, 9000);
+        d.x25519_pub = [0x42; 32];
+        d.resign(&id);
+
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        assert!(dir.insert(d).is_err());
+    }
+
+    #[test]
+    fn stale_descriptor_does_not_roll_back_a_newer_one() {
+        let id = crate::crypto::identity::Identity::generate();
+        let old = signed(&id, 9000);
+        let mut new = old.clone();
+        new.addr = "10.0.0.1:9001".parse().unwrap();
+        new.resign(&id);
+
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        dir.insert(new.clone()).unwrap();
+        dir.insert(old).unwrap(); // 古い方の再送は黙って無視
+        assert_eq!(dir.get(&id.public_id()).unwrap().addr, new.addr);
+    }
+
+    #[test]
+    fn rejects_future_dated_descriptor() {
+        // 遠い未来の記述子を一度入れると、以後の正しい更新が全部「古い」扱いになる
+        let id = crate::crypto::identity::Identity::generate();
+        let mut d = signed(&id, 9000);
+        d.issued_at = crate::protocol::hint::current_timestamp() + 10 * MAX_DESCRIPTOR_CLOCK_SKEW_SECS;
+        d.signature = id.sign(&d.signing_bytes());
+
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        assert!(dir.insert(d).is_err());
     }
 
     #[test]

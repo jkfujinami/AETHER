@@ -6,6 +6,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
+/// 保ち続ける接続の keepalive 間隔（quinn の既定アイドル上限 30 秒より十分短く）
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct QuicServer {
     endpoint: Endpoint,
     /// QUIC が使っているソケット
@@ -191,6 +194,27 @@ impl QuicClient {
              .map_err(|e| AetherError::Config(format!("Failed to convert rustls config: {:?}", e)))?;
 
         Ok(quinn::ClientConfig::new(Arc::new(quic_config)))
+    }
+
+    /// 保ち続ける接続用の設定（keepalive 付き）
+    ///
+    /// 通常の接続はアイドルで切れてよいが、返信トンネルの終端（ガード → 自分）は
+    /// **自分が張った接続だけが唯一の戻り道**になる。切れると NAT の内側へは
+    /// 二度と届かないので、無通信でも keepalive で生かしておく。
+    pub(crate) fn keepalive_config() -> Result<quinn::ClientConfig> {
+        let mut config = Self::skip_verify_config()?;
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
+        config.transport_config(Arc::new(transport));
+        Ok(config)
+    }
+
+    /// keepalive 付きで接続する
+    pub async fn connect_keepalive(&self, addr: SocketAddr, server_name: &str) -> Result<quinn::Connection> {
+        let connecting = self.endpoint.connect_with(Self::keepalive_config()?, addr, server_name)
+            .map_err(|e| AetherError::Quic(e.to_string()))?;
+
+        connecting.await.map_err(|e| AetherError::Quic(e.to_string()))
     }
 
     pub async fn connect(&self, addr: SocketAddr, server_name: &str) -> Result<quinn::Connection> {

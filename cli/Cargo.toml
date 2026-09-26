@@ -9,6 +9,7 @@ description = "AETHER Protocol CLI Tool"
 
 [dependencies]
 aether-core = { path = "../core" }
+aether-client = { path = "../client" }
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true

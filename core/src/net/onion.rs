@@ -19,6 +19,31 @@ pub struct ReplyBlock {
 /// Onion Circuit の最大ホップ数
 pub const MAX_HOPS: usize = 3;
 
+/// パディング後の最小サイズ（最内層）
+///
+/// Hint・MailboxGet・小さな私信シャードは全部この 1 バケットに収まり、
+/// 中継から見て区別できなくなる。
+const MIN_PADDED_LEN: usize = 1024;
+
+/// これを超えるとバケットを 2 の冪でなくこの刻みにする（大きな本体で倍近く膨らませない）
+const LARGE_PAD_STEP: usize = 256 * 1024;
+
+/// 最内層を切り上げるバケットの大きさ
+///
+/// **中継は転送するパケットの長さを見ている。** 長さが中身そのままだと
+/// 「Hint（数十B）か、本体シャード（数百KB）か、GET（数十B）か」が
+/// 長さだけで分かり、役割の分類とセッション相関の足場になる。
+/// 1KB から 2 の冪、256KB 超は 256KB 刻みに正規化する。
+pub fn padded_len(n: usize) -> usize {
+    if n <= MIN_PADDED_LEN {
+        MIN_PADDED_LEN
+    } else if n <= LARGE_PAD_STEP {
+        n.next_power_of_two()
+    } else {
+        n.div_ceil(LARGE_PAD_STEP) * LARGE_PAD_STEP
+    }
+}
+
 /// 回路内の各Hopの情報
 #[derive(Debug)]
 struct Hop {
@@ -75,10 +100,20 @@ impl OnionCircuit {
     /// (`InnerPacketType::MailboxForward`) が持つ。
     /// 出口リレーだけがそれを読める。
     pub fn wrap_packet(&self, final_payload: &[u8]) -> Result<Vec<u8>> {
-        // 最深部 (Final Layer): Flag 0x00 + Payload
-        let mut current_data = Vec::with_capacity(1 + final_payload.len());
+        // 最深部 (Final Layer): Flag 0x00 + Len(u32 BE) + Payload + 乱数パディング
+        //
+        // パディングは暗号文の内側に入るので、出口以外は真の長さを知れない。
+        // 外側の層が足す分はホップごとに一定なので、どのホップでもバケットが保たれる。
+        let payload_len = u32::try_from(final_payload.len())
+            .map_err(|_| AetherError::Protocol("Onion payload too large".into()))?;
+        let unpadded = 1 + 4 + final_payload.len();
+        let mut current_data = Vec::with_capacity(padded_len(unpadded));
         current_data.push(0x00);
+        current_data.extend_from_slice(&payload_len.to_be_bytes());
         current_data.extend_from_slice(final_payload);
+        let mut pad = vec![0u8; padded_len(unpadded) - unpadded];
+        rand::Rng::fill(&mut rand::thread_rng(), &mut pad[..]);
+        current_data.extend_from_slice(&pad);
 
         // 内側から外側へ暗号化
         for (i, hop) in self.hops.iter().enumerate().rev() {
@@ -139,8 +174,16 @@ impl OnionCircuit {
 
         match flag {
             0x00 => {
-                // Final destination: Return payload directly
-                let inner_payload = plaintext.split_off(1);
+                // Final destination: 長さで切り出してパディングを捨てる
+                let len_bytes: [u8; 4] = plaintext
+                    .get(1..5)
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or_else(|| AetherError::Protocol("Final layer too short".into()))?;
+                let len = u32::from_be_bytes(len_bytes) as usize;
+                let inner_payload = plaintext
+                    .get(5..5 + len)
+                    .ok_or_else(|| AetherError::Protocol("Final layer length out of range".into()))?
+                    .to_vec();
                 Ok((None, inner_payload))
             },
             0x01 => {
@@ -212,5 +255,49 @@ mod tests {
 
         assert!(next_addr3.is_none());
         assert_eq!(payload3, msg);
+    }
+
+    /// 1ホップ回路を作り、(回路, 中継側の共有秘密) を返す
+    fn single_hop() -> (OnionCircuit, [u8; 32]) {
+        let mut circuit = OnionCircuit::new(1);
+        let relay_static = key_exchange::StaticKey::generate();
+        let client_ephemeral = key_exchange::EphemeralKey::generate();
+        let shared = relay_static.diffie_hellman(&client_ephemeral.public_key());
+        circuit
+            .add_hop("10.0.0.1:8080".parse().unwrap(), relay_static.public_key().to_bytes(), client_ephemeral)
+            .unwrap();
+        (circuit, shared)
+    }
+
+    #[test]
+    fn small_payloads_are_indistinguishable_by_length() {
+        // Hint（数十B）と GET（百B弱）が同じ長さに見えること。
+        // 長さで役割を分類されると中継に相関の足場を与える。
+        let (circuit, _) = single_hop();
+        let hint_like = circuit.wrap_packet(&[0x10; 40]).unwrap();
+        let get_like = circuit.wrap_packet(&[0x21; 180]).unwrap();
+        assert_eq!(hint_like.len(), get_like.len());
+    }
+
+    #[test]
+    fn padding_is_stripped_at_the_exit() {
+        let (circuit, shared) = single_hop();
+        for size in [0usize, 1, 1019, 1020, 5000, 300 * 1024] {
+            let msg: Vec<u8> = (0..size).map(|i| i as u8).collect();
+            let wrapped = circuit.wrap_packet(&msg).unwrap();
+            let (next, out) = OnionCircuit::unwrap_packet(&shared, &wrapped).unwrap();
+            assert!(next.is_none());
+            assert_eq!(out, msg, "size {}", size);
+        }
+    }
+
+    #[test]
+    fn padded_len_buckets() {
+        assert_eq!(padded_len(0), 1024);
+        assert_eq!(padded_len(1024), 1024);
+        assert_eq!(padded_len(1025), 2048);
+        assert_eq!(padded_len(200 * 1024), 256 * 1024);
+        assert_eq!(padded_len(256 * 1024 + 1), 512 * 1024);
+        assert_eq!(padded_len(1024 * 1024 + 1), 1024 * 1024 + 256 * 1024);
     }
 }

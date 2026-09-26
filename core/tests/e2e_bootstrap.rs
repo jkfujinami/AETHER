@@ -117,7 +117,8 @@ async fn network_self_organises_from_a_single_seed() {
     let chosen = client
         .connect_guard(&mut guards, &candidates, &guard_path)
         .await
-        .expect("発見したリレーにガードとして接続できない");
+        .expect("発見したリレーにガードとして接続できない")
+        .addr;
 
     assert!(
         candidates.iter().any(|c| c.addr == chosen),
@@ -178,6 +179,8 @@ async fn pex_rejects_descriptors_with_bad_pow() {
         pow_nonce: 0,
         uptime_secs: 999_999,
         tier: aether_core::net::reachability::Tier::Open,
+        issued_at: 0,
+        signature: Vec::new(),
     };
 
     assert_eq!(absorb_response(&mut dir, PexResponse { relays: vec![forged] }), 0);

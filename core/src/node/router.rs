@@ -1,6 +1,7 @@
 use crate::error::{Result, AetherError};
 use crate::crypto::identity::Identity;
 use crate::net::onion::OnionCircuit;
+use crate::net::seen_cache::SeenCache;
 use crate::net::quic::QuicClient;
 use crate::net::connection_pool::ConnectionPool;
 use crate::protocol::wire::{self, PacketType};
@@ -17,17 +18,37 @@ pub enum RoutingAction {
     LocalProcessing(Vec<u8>),
 }
 
+/// Onion 層のリプレイを覚えておく時間
+///
+/// 確認攻撃（ガードが同じパケットを繰り返し流し、出口側に同じ中身の
+/// まとまりが現れるのを見て回路の両端を確かめる）はその場で行うので、
+/// この窓で主な脅威は塞がる。層に時刻を持たないため、窓を過ぎた再送までは防げない。
+const ONION_REPLAY_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// リプレイ検出に覚えておく件数（1世代あたり）
+const ONION_REPLAY_CAPACITY: usize = 1_000_000;
+
 /// Onion Routing のパケット処理を担当するコンポーネント
 pub struct Router {
     identity: Arc<Identity>,
     connection_pool: ConnectionPool,
+    /// 剥いた Onion 層の (一時公開鍵, nonce)。同じ層を二度処理しない
+    seen_layers: std::sync::Mutex<SeenCache>,
+}
+
+fn replay_cache() -> std::sync::Mutex<SeenCache> {
+    std::sync::Mutex::new(SeenCache::with_params(
+        ONION_REPLAY_CAPACITY,
+        ONION_REPLAY_TTL,
+        1e-6,
+    ))
 }
 
 impl Router {
     pub fn new(identity: Arc<Identity>) -> Result<Self> {
         let quic_client = Arc::new(QuicClient::new()?);
         let connection_pool = ConnectionPool::new(quic_client);
-        Ok(Self { identity, connection_pool })
+        Ok(Self { identity, connection_pool, seen_layers: replay_cache() })
     }
 
     /// 待ち受けと同じエンドポイントから発信する Router
@@ -39,6 +60,7 @@ impl Router {
         Ok(Self {
             identity,
             connection_pool: ConnectionPool::from_endpoint(endpoint),
+            seen_layers: replay_cache(),
         })
     }
 
@@ -62,6 +84,18 @@ impl Router {
         // 復号とルーティング情報の取得
         // unwrap_packet 内部で先頭32バイト(Pubkey)はスキップされる
         let (next_hop, payload) = OnionCircuit::unwrap_packet(&shared_secret_bytes, packet)?;
+
+        // **リプレイは捨てる。** 同じ層を何度でも処理すると、ガードが同じパケットを
+        // N 回流して出口側の反応を数え、回路の両端を突き合わせられる。
+        // 記録は復号に成功してから（偽パケットでキャッシュを埋めさせない）。
+        // 鍵は (一時公開鍵, nonce)。同じ回路の別パケットは nonce が違う。
+        let layer_id: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&packet[..32 + crate::crypto::cipher::NONCE_SIZE]).into()
+        };
+        if !self.seen_layers.lock().unwrap().insert(layer_id) {
+            return Err(AetherError::Protocol("Replayed onion layer dropped".into()));
+        }
 
         match next_hop {
             Some(addr) => {
@@ -134,6 +168,12 @@ impl Router {
         Ok(())
     }
 
+    /// `addr` への keepalive 付き接続を張って保つ（返信トンネルの戻り道）
+    pub async fn pin_connection(&self, addr: SocketAddr) -> Result<()> {
+        self.connection_pool.pin_connection(addr, "aether-node").await?;
+        Ok(())
+    }
+
     /// 接続プールの掃除を走らせる
     pub async fn maintain_connections(&self) {
         self.connection_pool.maintain().await;
@@ -170,5 +210,38 @@ impl Router {
     /// 次のホップへパケットを転送する (OnionPacket用)
     async fn forward_packet(&self, addr: SocketAddr, payload: &[u8]) -> Result<()> {
         self.send_packet(addr, PacketType::OnionPacket, payload).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::key_exchange::EphemeralKey;
+
+    /// 自分宛て（出口）の1層パケットを作る
+    fn packet_for(identity: &Identity) -> Vec<u8> {
+        let mut circuit = OnionCircuit::new(1);
+        let pubkey = PublicKey::from(&identity.x25519_secret()).to_bytes();
+        circuit
+            .add_hop("127.0.0.1:9000".parse().unwrap(), pubkey, EphemeralKey::generate())
+            .unwrap();
+        circuit.wrap_packet(b"payload").unwrap()
+    }
+
+    #[tokio::test]
+    async fn replayed_onion_layer_is_dropped() {
+        let identity = Arc::new(Identity::generate());
+        let router = Router::new(identity.clone()).unwrap();
+        let packet = packet_for(&identity);
+
+        assert!(matches!(
+            router.handle_packet(&packet).await.unwrap(),
+            RoutingAction::LocalProcessing(_)
+        ));
+        assert!(router.handle_packet(&packet).await.is_err(), "同じ層を二度処理した");
+
+        // 同じ回路でも別パケット（nonce が違う）は通る
+        let other = packet_for(&identity);
+        assert!(router.handle_packet(&other).await.is_ok());
     }
 }

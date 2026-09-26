@@ -57,7 +57,10 @@ pub struct TunnelHeader {
 /// 各ホップが持つ、次のホップへの転送情報
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HopInstruction {
-    /// 次のホップのアドレス (None = 最終宛先)
+    /// 次のホップのアドレス
+    ///
+    /// `None` は「この TunnelBuild を運んできた接続の相手へ返す」。
+    /// 終端の手前（ガード）が、NAT の内側にいる構築者へ届けるのに使う。
     pub next_hop: Option<SocketAddr>,
 
     /// 次のホップ用の tunnel_id
@@ -78,6 +81,34 @@ impl InboundTunnel {
     pub fn build(
         path: Vec<SocketAddr>,
         hop_pubkeys: Vec<[u8; 32]>,
+    ) -> BuildResult {
+        Self::build_inner(path, hop_pubkeys, false)
+    }
+
+    /// 終端（自分）の手前のホップが「構築指示を送ってきた接続」へ返す Inbound Tunnel
+    ///
+    /// `path` の最後は自分。その手前（通常はガード）の指示は `next_hop = None` になり、
+    /// 受けたノードは**TunnelBuild を運んできた接続の送信元**へ転送する
+    /// （[`HopInstruction::next_hop`] 参照）。そのホップへの指示は自分で直接送ること。
+    ///
+    /// 自分の広告アドレスが無い／NAT の内側でも受信できる。アドレス宛てに返させると、
+    /// 一回限りのクライアント（広告アドレス 127.0.0.1）には届かない。
+    pub fn build_to_builder(
+        path: Vec<SocketAddr>,
+        hop_pubkeys: Vec<[u8; 32]>,
+    ) -> BuildResult {
+        if path.len() < 3 {
+            return Err(AetherError::Config(
+                "Builder-terminated tunnel needs at least one relay before the last hop".into(),
+            ));
+        }
+        Self::build_inner(path, hop_pubkeys, true)
+    }
+
+    fn build_inner(
+        path: Vec<SocketAddr>,
+        hop_pubkeys: Vec<[u8; 32]>,
+        return_to_builder: bool,
     ) -> BuildResult {
         if path.len() < 2 {
             return Err(AetherError::Config("Tunnel path must have at least 2 hops".into()));
@@ -120,7 +151,9 @@ impl InboundTunnel {
             }
 
             // 次のホップ情報
-            let next_hop = if i + 1 < path.len() {
+            let next_hop = if return_to_builder && i + 2 == path.len() {
+                None
+            } else if i + 1 < path.len() {
                 Some(path[i + 1])
             } else {
                 // Last hop (Alice) - next_hop is self
@@ -385,5 +418,43 @@ mod tests {
         let decrypted_msg = alice_tunnel.decrypt(&alice_out).unwrap();
 
         assert_eq!(decrypted_msg, original_msg);
+    }
+
+    #[test]
+    fn builder_terminated_tunnel_returns_over_the_builders_connection() {
+        // ガード（終端の手前）の指示だけが next_hop = None になり、
+        // それ以外は通常どおり次のアドレスを指す
+        let secrets: Vec<x25519_dalek::StaticSecret> = (0..4)
+            .map(|_| x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng))
+            .collect();
+        let pubkeys: Vec<[u8; 32]> = secrets
+            .iter()
+            .map(|s| x25519_dalek::PublicKey::from(s).to_bytes())
+            .collect();
+        let path: Vec<SocketAddr> = (1..=4)
+            .map(|n| format!("10.0.0.{}:9000", n).parse().unwrap())
+            .collect();
+
+        let (_, instructions) = InboundTunnel::build_to_builder(path.clone(), pubkeys).unwrap();
+
+        let next_hops: Vec<Option<SocketAddr>> = instructions
+            .iter()
+            .zip(&secrets)
+            .map(|((_, data), secret)| {
+                let eph: [u8; 32] = data[32..64].try_into().unwrap();
+                let nonce: [u8; 12] = data[64..76].try_into().unwrap();
+                let shared = secret.diffie_hellman(&PublicKey::from(eph)).to_bytes();
+                let plain = cipher::decrypt(&shared, &nonce, &data[76..]).unwrap();
+                bincode::deserialize::<HopInstruction>(&plain).unwrap().next_hop
+            })
+            .collect();
+
+        assert_eq!(next_hops, vec![Some(path[1]), Some(path[2]), None, Some(path[3])]);
+    }
+
+    #[test]
+    fn builder_terminated_tunnel_needs_a_relay() {
+        let path = vec!["10.0.0.1:9000".parse().unwrap(), "10.0.0.2:9000".parse().unwrap()];
+        assert!(InboundTunnel::build_to_builder(path, vec![[1; 32], [2; 32]]).is_err());
     }
 }

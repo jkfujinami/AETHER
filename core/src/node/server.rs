@@ -87,7 +87,14 @@ pub struct NodeServer {
     pub peers: Arc<PeerManager>,
     pub batcher: Arc<HintBatcher>,
     /// 自分の記述子。PEX で配る
+    ///
+    /// **直接書き換えないこと。** 署名が崩れて他ノードに弾かれる。
+    /// 変更は [`refresh_descriptor`](Self::refresh_descriptor) 経由で署名し直す。
     pub descriptor: RelayDescriptor,
+    /// 記述子に署名する鍵
+    identity: Arc<Identity>,
+    /// 自分をリレーとして広告するか（一回限りのクライアントは false）
+    advertise_self: bool,
     /// ローカルに保持するリレーリスト
     pub directory: Arc<RwLock<RelayDirectory>>,
     /// フィルタ判定の待ち状態
@@ -136,6 +143,21 @@ pub struct PacketContext {
     pub stem_acks: Arc<Mutex<HashMap<[u8; 32], Arc<Notify>>>>,
 }
 
+impl PacketContext {
+    /// `addr` が自ノードを指しているか
+    ///
+    /// **ポートだけで比べてはいけない。** 実網では皆が既定ポートで待ち受けるので、
+    /// 別ホストの同じポートを自分と誤認し、中継すべきパケットを自分で飲み込む
+    /// （多段回路・多段トンネルが localhost の試験では通り、実網でだけ壊れる）。
+    /// 広告アドレスと一致するか、ループバック宛てでポートが一致する（ローカル試験）
+    /// 場合だけ自分とみなす。
+    fn is_self(&self, addr: SocketAddr) -> bool {
+        addr == self.descriptor.addr
+            || (addr.port() == self.local_addr.port()
+                && (addr.ip().is_loopback() || addr.ip().is_unspecified()))
+    }
+}
+
 impl NodeServer {
     pub fn new(port: u16, identity: Identity, db_path: &Path) -> Result<Self> {
         Self::with_config(port, identity, db_path, &Config { listen_port: port, ..Default::default() })
@@ -180,31 +202,32 @@ impl NodeServer {
         let peers = Arc::new(PeerManager::new());
         let batcher = Arc::new(HintBatcher::new());
 
-        // 自分の記述子を組み立てる。NodeId PoW はここで1回だけ解く
+        // 自分の記述子を組み立てる。NodeId PoW は保存済みの解があれば検証だけで済ませる
         let node_id = identity.public_id();
-        let x25519_pub = x25519_dalek::PublicKey::from(&identity.x25519_secret()).to_bytes();
-        let pow_nonce = pow::node_id::solve(
-            node_id.as_bytes(),
-            config.node_id_pow_difficulty,
-            1 << 24,
-        )?;
+        let cached = match config.node_id_pow_nonce {
+            Some(n) => pow::node_id::verify(node_id.as_bytes(), n, config.node_id_pow_difficulty)?
+                .then_some(n),
+            None => None,
+        };
+        let pow_nonce = match cached {
+            Some(n) => n,
+            None => pow::node_id::solve(node_id.as_bytes(), config.node_id_pow_difficulty, 1 << 24)?,
+        };
 
         // **引数の port ではなく実際にバインドされたポートを使う。**
         // port=0 を渡した場合、引数は 0 のままなので広告が壊れる。
         let bound_port = server.local_addr()?.port();
 
-        let descriptor = RelayDescriptor {
-            node_id,
-            addr: format!("127.0.0.1:{}", bound_port).parse()
+        let descriptor = RelayDescriptor::new_signed(
+            &identity,
+            format!("127.0.0.1:{}", bound_port).parse()
                 .map_err(|e| crate::AetherError::Config(format!("Invalid advertise address: {}", e)))?,
-            x25519_pub,
             pow_nonce,
-            uptime_secs: 0,
             // 到達性は起動後に調べる。判明するまでは最も控えめな等級。
             // 楽観的に Open と広告すると、届かないノードが
             // Mailbox やガードに選ばれて配送が落ちる
-            tier: Tier::Reversed,
-        };
+            Tier::Reversed,
+        );
 
         // 自分自身もリレーとしてリストに入れる。
         //
@@ -212,11 +235,15 @@ impl NodeServer {
         // K最近接が他ノードと食い違う。** 自分が担当に選ばれていることに
         // 気づけず、置かれたはずのシャードを取りに来た相手に応答できない。
         // MailboxForward は既に「宛先が自分」の場合をローカル保存で処理している。
+        //
+        // 検証難易度は網全体の値（directory_pow_difficulty）。自分が解いた難易度とは別。
+        // 自分の記述子は自分で作ったものなので検証を通さずに入れる
+        // （一回限りのクライアントは PoW を解かないため、検証すると自分を弾く）。
         let mut initial = RelayDirectory::new(
             crate::net::ring::EPOCH_SEED_PLACEHOLDER,
-            config.node_id_pow_difficulty,
+            config.directory_pow_difficulty,
         );
-        initial.insert(descriptor.clone())?;
+        initial.insert_unchecked(descriptor.clone());
         let directory = Arc::new(RwLock::new(initial));
 
         Ok(Self {
@@ -228,6 +255,8 @@ impl NodeServer {
             peers,
             batcher,
             descriptor,
+            identity,
+            advertise_self: config.advertise_self,
             directory,
             filter_check_pending: Arc::new(AtomicBool::new(false)),
             filtering: Arc::new(RwLock::new(NatFiltering::Unknown)),
@@ -238,9 +267,19 @@ impl NodeServer {
         })
     }
 
+    /// 記述子を署名し直し、自分のディレクトリにも反映する
+    ///
+    /// 記述子を変えたら必ず呼ぶ。署名が古いままだと他ノードに弾かれ、
+    /// 発行時刻が進まないと他ノードが古い記述子を持ち続ける。
+    async fn refresh_descriptor(&mut self) {
+        self.descriptor.resign(&self.identity);
+        self.directory.write().await.insert_unchecked(self.descriptor.clone());
+    }
+
     /// 広告するアドレスを差し替える（STUN で外部アドレスが判明した場合など）
-    pub fn set_advertised_addr(&mut self, addr: SocketAddr) {
+    pub async fn set_advertised_addr(&mut self, addr: SocketAddr) {
         self.descriptor.addr = addr;
+        self.refresh_descriptor().await;
     }
 
     /// 到達性が既知の場合に宣言する
@@ -254,9 +293,7 @@ impl NodeServer {
     pub async fn declare_reachable(&mut self, addr: SocketAddr) {
         self.descriptor.addr = addr;
         self.descriptor.tier = Tier::Open;
-
-        let mut dir = self.directory.write().await;
-        dir.insert_unchecked(self.descriptor.clone());
+        self.refresh_descriptor().await;
     }
 
     /// 到達性を調べて記述子へ反映する
@@ -292,10 +329,7 @@ impl NodeServer {
 
         // 自分の記述子はディレクトリにも入っているので更新する。
         // ここを忘れると自分だけ古い Tier を見続ける
-        {
-            let mut dir = self.directory.write().await;
-            dir.insert_unchecked(self.descriptor.clone());
-        }
+        self.refresh_descriptor().await;
 
         // リースが切れると到達性を失うので更新を回し続ける
         if let Some(mapping) = result.port_mapping.clone() {
@@ -320,10 +354,62 @@ impl NodeServer {
     /// その受信を回すのは `run()` が立てるタスクなので、
     /// **`run()` より前に呼ぶと応答が黙って捨てられる。**
     pub async fn bootstrap(&self, seed: SocketAddr) -> Result<()> {
-        let request = PexRequest::new(self.descriptor.clone()).encode()?;
+        let request = self.pex_request().encode()?;
         self.router
             .send_packet(seed, PacketType::PexRequest, &request)
             .await
+    }
+
+    /// 自分宛ての TunnelBuild をネットワークを通さずに登録する
+    ///
+    /// Inbound Tunnel の終端（＝自分）への構築指示を自分の広告アドレスへ送ると、
+    /// 経路上に「このアドレスがトンネルを作った」という足跡が残るだけで得るものが無い。
+    pub async fn accept_own_tunnel_build(&self, payload: &[u8]) -> Result<()> {
+        Self::register_tunnel_build(&self.router, &self.tunnel_relay, payload, None).await
+    }
+
+    /// TunnelBuild を登録する
+    ///
+    /// `builder` はこの指示を運んできた接続の相手。`next_hop = None` の指示は
+    /// そこへ返す（終端の手前のホップが、NAT 内の構築者へ届けるため）。
+    async fn register_tunnel_build(
+        router: &Router,
+        tunnel_relay: &RwLock<TunnelRelay>,
+        payload: &[u8],
+        builder: Option<SocketAddr>,
+    ) -> Result<()> {
+        let (tid, shared_secret, inst) = router.process_tunnel_build(payload)?;
+        let Some(next) = inst.next_hop.or(builder) else {
+            tracing::warn!("TunnelBuild to return to its builder, but the builder is unknown. Ignoring.");
+            return Ok(());
+        };
+        tunnel_relay
+            .write()
+            .await
+            .register_tunnel(tid, shared_secret, next, inst.next_tunnel_id);
+        debug!("Tunnel registered: ID={:?} -> {}", tid, next);
+        Ok(())
+    }
+
+    /// PEX 要求。広告しないノードは自分の記述子を載せない
+    fn pex_request(&self) -> PexRequest {
+        if self.advertise_self {
+            PexRequest::new(self.descriptor.clone())
+        } else {
+            PexRequest::anonymous()
+        }
+    }
+
+    /// 自分の待ち受けと同じソケットから、`addr` へ keepalive 付き接続を張って保つ
+    ///
+    /// 返信トンネルの終端に使う。相手はこの接続の上で返信を届ける。
+    pub async fn pin_connection(&self, addr: SocketAddr) -> Result<()> {
+        self.router.pin_connection(addr).await
+    }
+
+    /// 自分の待ち受けと同じソケットから `addr` へ直接送る
+    pub async fn send_direct(&self, addr: SocketAddr, packet_type: PacketType, payload: &[u8]) -> Result<()> {
+        self.router.send_packet(addr, packet_type, payload).await
     }
 
     /// 既知のリレー数
@@ -479,7 +565,7 @@ impl NodeServer {
                                 let (dest, payload) = wire::parse_mailbox_forward(body)?;
                                 debug!("Forwarding mailbox payload to {}", dest);
 
-                                if dest.port() == ctx.local_addr.port() {
+                                if ctx.is_self(dest) {
                                     // 自分自身が Mailbox に選ばれている場合は素直に保存する
                                     ctx.mailbox.handle_put(payload).await?;
                                 } else {
@@ -493,7 +579,7 @@ impl NodeServer {
                                 let (dest, packet_type, inner) = wire::parse_typed_forward(body)?;
                                 debug!("Forwarding {:?} to {}", packet_type, dest);
 
-                                if dest.port() == ctx.local_addr.port() {
+                                if ctx.is_self(dest) {
                                     Box::pin(Self::process_packet(packet_type, inner.to_vec(), ctx.clone())).await?;
                                 } else {
                                     ctx.router.send_packet(dest, packet_type, inner).await?;
@@ -589,12 +675,22 @@ impl NodeServer {
             },
             PacketType::PexRequest => {
                 let request = PexRequest::decode(&payload)?;
-                let requester_addr = request.requester.addr;
+
+                // **応答は観測した送信元へ、要求者が乗ってきた接続の上で返す。**
+                // 記述子に書かれたアドレスへ返すと、第三者のアドレスを書いた要求で
+                // 他人に応答を撃たせる増幅の踏み台になる（FilterCheck と同じ理由）。
+                // 一回限りのクライアントの記述子は 127.0.0.1 のままなので、実網では
+                // そもそも申告アドレスへは届かない。
+                let Some(requester_addr) = ctx.remote_addr else {
+                    debug!("PexRequest without an observed source");
+                    return Ok(());
+                };
 
                 // 要求者自身を取り込む。これで一方向の要求だけで相互に知り合える
-                {
+                // （一回限りのクライアントは記述子を載せてこない）
+                if let Some(requester) = &request.requester {
                     let mut dir = ctx.directory.write().await;
-                    if let Err(e) = dir.insert(request.requester.clone()) {
+                    if let Err(e) = dir.insert(requester.clone()) {
                         debug!("Rejected requester descriptor: {}", e);
                     }
                 }
@@ -778,20 +874,15 @@ impl NodeServer {
                 }
             },
             PacketType::TunnelBuild => {
-                match ctx.router.process_tunnel_build(&payload) {
-                    Ok((tid, shared_secret, inst)) => {
-                        if let Some(next) = inst.next_hop {
-                            let mut relay = ctx.tunnel_relay.write().await;
-                            relay.register_tunnel(tid, shared_secret, next, inst.next_tunnel_id);
-                            debug!("Tunnel registered: ID={:?} -> {}", tid, next);
-                        } else {
-                            // Inbound Tunnel では自分自身も「次のホップ」として指定されるはず
-                             tracing::warn!("TunnelBuild with no next_hop received. Ignoring.");
-                        }
-                    },
-                    Err(e) => {
-                        error!("Failed to process TunnelBuild: {}", e);
-                    }
+                if let Err(e) = Self::register_tunnel_build(
+                    &ctx.router,
+                    &ctx.tunnel_relay,
+                    &payload,
+                    ctx.remote_addr,
+                )
+                .await
+                {
+                    error!("Failed to process TunnelBuild: {}", e);
                 }
             },
             PacketType::TunnelData => {
@@ -808,8 +899,7 @@ impl NodeServer {
                 match relay.process_tunnel_data(&tunnel_id, data) {
                     Ok(Some((next_hop, next_tunnel_id, forwarded_data))) => {
                         // Check if we are the destination (Inbound Tunnel Endpoint)
-                        // Compare by port since local_addr might be 0.0.0.0 while next_hop is 127.0.0.1
-                        if next_hop.port() == ctx.local_addr.port() {
+                        if ctx.is_self(next_hop) {
                              debug!("Tunnel: reached endpoint (self), storing message for ID {:?}", tunnel_id);
                              // Store raw tunnel data. The client will fetch and decrypt it later.
                              // Not using next_tunnel_id, but the original tunnel_id as key.
@@ -1286,8 +1376,7 @@ impl NodeServer {
 
         if result.accepts_unsolicited() {
             self.descriptor.tier = Tier::Open;
-            let mut dir = self.directory.write().await;
-            dir.insert_unchecked(self.descriptor.clone());
+            self.refresh_descriptor().await;
             info!("Promoted to Tier 0: filtering is endpoint-independent");
         }
 
@@ -1302,6 +1391,7 @@ impl NodeServer {
         let router = self.router.clone();
         let directory = self.directory.clone();
         let descriptor = self.descriptor.clone();
+        let request = self.pex_request();
 
         tokio::spawn(async move {
             // 進捗ベースのバックオフ。
@@ -1330,7 +1420,7 @@ impl NodeServer {
                     continue;
                 }
 
-                let Ok(request) = PexRequest::new(descriptor.clone()).encode() else {
+                let Ok(request) = request.encode() else {
                     continue;
                 };
 

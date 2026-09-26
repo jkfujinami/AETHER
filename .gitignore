@@ -13,3 +13,10 @@ debug
 .idea/
 .docs/
 .sim/
+# GUI (Tauri)
+gui/node_modules/
+gui/src-tauri/gen/
+!gui/package.json
+!gui/package-lock.json
+!gui/src-tauri/tauri.conf.json
+!gui/src-tauri/capabilities/*.json

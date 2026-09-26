@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "メインウィンドウに許す操作（イベント購読だけ）",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

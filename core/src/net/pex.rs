@@ -36,11 +36,16 @@ pub const MIN_HEALTHY_DIRECTORY: usize = 32;
 
 /// 「知っているリレーを教えて」
 ///
-/// 自分の記述子を同梱するので、要求した時点で相手にも自分が伝わる。
+/// リレーは自分の記述子を同梱するので、要求した時点で相手にも自分が伝わる。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PexRequest {
-    /// 要求者自身の記述子。応答の返送先でもある
-    pub requester: RelayDescriptor,
+    /// 要求者自身の記述子。`None` は「自分を登録しないで」（一回限りのクライアント）
+    ///
+    /// 一回限りのクライアントが記述子を載せると、種ノードとその先の網に
+    /// 「この IP の誰かが AETHER を使った」記録が残り、回路の候補にも混ざる
+    /// （リレーではないので中継できない）。応答は観測した送信元へ返るので、
+    /// 記述子が無くても受け取れる。
+    pub requester: Option<RelayDescriptor>,
     /// 欲しい件数（上限は [`MAX_DESCRIPTORS_PER_RESPONSE`] で頭打ち）
     pub want: u16,
 }
@@ -52,9 +57,18 @@ pub struct PexResponse {
 }
 
 impl PexRequest {
+    /// 自分をリレーとして登録してもらう要求
     pub fn new(requester: RelayDescriptor) -> Self {
         Self {
-            requester,
+            requester: Some(requester),
+            want: MAX_DESCRIPTORS_PER_RESPONSE as u16,
+        }
+    }
+
+    /// 自分を登録させない要求（一回限りのクライアント）
+    pub fn anonymous() -> Self {
+        Self {
+            requester: None,
             want: MAX_DESCRIPTORS_PER_RESPONSE as u16,
         }
     }
@@ -99,18 +113,19 @@ pub fn select_response(
     self_descriptor: Option<&RelayDescriptor>,
 ) -> PexResponse {
     let want = (request.want as usize).min(MAX_DESCRIPTORS_PER_RESPONSE);
+    let requester = request.requester.as_ref().map(|r| r.node_id);
 
     let mut pool: Vec<RelayDescriptor> = directory
         .all()
         .into_iter()
         // 要求者自身を返しても情報にならない
-        .filter(|r| r.node_id != request.requester.node_id)
+        .filter(|r| Some(r.node_id) != requester)
         .cloned()
         .collect();
 
     // 自分自身も候補に含める（そうしないと自分の存在が広まらない）
     if let Some(me) = self_descriptor
-        && me.node_id != request.requester.node_id
+        && Some(me.node_id) != requester
         && !pool.iter().any(|r| r.node_id == me.node_id)
     {
         pool.push(me.clone());
@@ -151,14 +166,26 @@ mod tests {
             pow_nonce: 0,
             uptime_secs: 3600,
             tier: crate::net::reachability::Tier::Open,
+            issued_at: 0,
+            signature: Vec::new(),
         }
     }
 
-    /// PoW 検証を無効にした（難易度0）ディレクトリ
+    /// 署名済みの記述子（取り込みの検証を通るもの）
+    fn signed(identity: &crate::crypto::identity::Identity, pow_nonce: u64) -> RelayDescriptor {
+        RelayDescriptor::new_signed(
+            identity,
+            "127.0.0.1:9000".parse().unwrap(),
+            pow_nonce,
+            crate::net::reachability::Tier::Open,
+        )
+    }
+
+    /// 選択ロジック用のディレクトリ（検証は absorb 系のテストで見る）
     fn directory(count: u8) -> RelayDirectory {
         let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
         for n in 1..=count {
-            dir.insert(descriptor(n)).unwrap();
+            dir.insert_unchecked(descriptor(n));
         }
         dir
     }
@@ -167,7 +194,7 @@ mod tests {
     fn request_survives_wire_roundtrip() {
         let req = PexRequest::new(descriptor(1));
         let decoded = PexRequest::decode(&req.encode().unwrap()).unwrap();
-        assert_eq!(decoded.requester.node_id, req.requester.node_id);
+        assert_eq!(decoded.requester.unwrap().node_id, req.requester.unwrap().node_id);
     }
 
     #[test]
@@ -246,7 +273,9 @@ mod tests {
     fn absorb_counts_new_entries() {
         let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
         let response = PexResponse {
-            relays: (1..=5u8).map(descriptor).collect(),
+            relays: (0..5)
+                .map(|_| signed(&crate::crypto::identity::Identity::generate(), 0))
+                .collect(),
         };
 
         assert_eq!(absorb_response(&mut dir, response.clone()), 5);
@@ -258,11 +287,12 @@ mod tests {
         // 1件の不正で応答全体を捨てると、攻撃者が1件混ぜるだけで PEX を止められる
         let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 8); // PoW 必須
 
-        let mut good = descriptor(1);
-        good.pow_nonce =
-            crate::crypto::pow::node_id::solve(good.node_id.as_bytes(), 8, 1_000_000).unwrap();
+        let id = crate::crypto::identity::Identity::generate();
+        let nonce =
+            crate::crypto::pow::node_id::solve(id.public_id().as_bytes(), 8, 1_000_000).unwrap();
+        let good = signed(&id, nonce);
 
-        let bad = descriptor(2); // pow_nonce = 0 のまま
+        let bad = descriptor(2); // pow_nonce = 0 のまま・署名なし
 
         let added = absorb_response(
             &mut dir,

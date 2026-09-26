@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AETHER</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <nav class="sidebar" aria-label="メニュー">
+      <div class="brand">
+        <img src="icon.png" alt="" width="28" height="28">
+        <span>AETHER</span>
+      </div>
+      <button class="nav-item active" data-view="connect">接続</button>
+      <button class="nav-item" data-view="bbs" data-needs-connection>掲示板</button>
+      <button class="nav-item" data-view="talk" data-needs-connection>トーク<span class="badge" id="talk-badge" hidden></span></button>
+      <button class="nav-item" data-view="log">ログ</button>
+      <div class="sidebar-foot">
+        <div class="conn-state" id="conn-state">未接続</div>
+        <div class="muted small" id="relay-count"></div>
+      </div>
+    </nav>
+
+    <main class="content">
+      <!-- 接続 -->
+      <section class="view active" id="view-connect">
+        <div class="page">
+          <h1>網に参加する</h1>
+
+          <div class="card" id="identity-card" hidden>
+            <h2>自分の鍵を作る</h2>
+            <p class="muted">トークの宛先になる鍵です。掲示板だけなら無くても使えます。</p>
+            <label>パスフレーズ（鍵と保存データを暗号化します）
+              <input type="password" id="id-pass" autocomplete="new-password">
+            </label>
+            <button class="primary" id="btn-create-id">鍵を作る</button>
+          </div>
+
+          <form class="card" id="connect-form">
+            <label>種ノード
+              <input id="seed" placeholder="例: 127.0.0.1:19001" required spellcheck="false">
+            </label>
+            <label>パスフレーズ
+              <input type="password" id="passphrase" autocomplete="current-password">
+              <span class="hint">未設定だと鍵・友だち・保持データが平文でディスクに残ります</span>
+            </label>
+
+            <fieldset>
+              <legend>参加のしかた</legend>
+              <label class="choice"><input type="radio" name="mode" value="relay" checked>
+                <span><strong>常駐</strong> ── トークを受け取れます。中継役として網に広告されます</span></label>
+              <label class="choice"><input type="radio" name="mode" value="ephemeral">
+                <span><strong>一回限り</strong> ── 掲示板と送信だけ。網に自分を広告しません（トークは受け取れません）</span></label>
+            </fieldset>
+
+            <label id="advertise-row">到達可能と宣言するアドレス（空なら自動判定）
+              <input id="advertise" placeholder="例: 127.0.0.1:19010" spellcheck="false">
+            </label>
+
+            <button class="primary" type="submit" id="btn-connect">参加する</button>
+          </form>
+        </div>
+      </section>
+
+      <!-- 掲示板（2ch 風） -->
+      <section class="view" id="view-bbs">
+        <div class="bbs-layout">
+          <aside class="board-menu">
+            <div class="menu-title">板一覧</div>
+            <div class="menu-sec">公式</div>
+            <ul id="builtin-boards"></ul>
+            <div class="menu-sec">お気に入り</div>
+            <ul id="fav-boards"></ul>
+            <p class="menu-empty" id="fav-empty">入った板・作った板がここに並びます</p>
+            <div class="menu-actions">
+              <button id="btn-join-board">ID で板に入る</button>
+              <button id="btn-create-board">非公開板を作る</button>
+            </div>
+          </aside>
+
+          <div class="bbs">
+            <!-- 板を選ぶ前 -->
+            <div id="bbs-empty" class="bbs-empty">
+              <p>左の板一覧から板を選んでください。</p>
+              <p>公式の板は、アプリを持っている人なら誰でも読めます（5ch と同じ）。守られるのは「誰が書いたか」です。<br>
+                 非公開板は、ID を渡された人だけが入れます。</p>
+            </div>
+
+            <!-- ID で板に入る -->
+            <form id="bbs-join" class="bbs-panel" hidden>
+              <h1 class="board-title">ID で板に入る</h1>
+              <label>板の ID（aether-board:…）
+                <input id="join-uri" required spellcheck="false">
+              </label>
+              <label>板の名前（自分の端末にだけ保存）
+                <input id="join-label" required maxlength="40">
+              </label>
+              <button type="submit">入る</button>
+            </form>
+
+            <!-- 非公開板を作る -->
+            <form id="bbs-create" class="bbs-panel" hidden>
+              <h1 class="board-title">非公開板を作る</h1>
+              <p class="bbs-note">乱数の ID で板を作ります。ID を渡した人だけが入れます。名前は自分の端末にだけ保存されます。</p>
+              <label>板の名前
+                <input id="create-label" required maxlength="40">
+              </label>
+              <button type="submit">作る</button>
+            </form>
+
+            <!-- 共有（QR と ID） -->
+            <div id="bbs-share" class="bbs-panel" hidden>
+              <h1 class="board-title" id="share-title"></h1>
+              <p class="bbs-note">この QR か ID を渡すと、相手も同じ板に入れます。ID を知っている人は誰でも読み書きできるので、渡す相手に注意してください。</p>
+              <div class="qr-block">
+                <img id="share-qr" alt="板の QR コード" width="200" height="200">
+                <div>
+                  <code id="share-uri"></code>
+                  <button type="button" id="btn-copy-board">ID をコピー</button>
+                  <button type="button" id="btn-share-back">板に戻る</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- スレ一覧 -->
+            <div id="bbs-list" hidden>
+              <div class="board-head">
+                <h1 class="board-title"><span id="board-title"></span> <span class="fp" id="board-fp"></span></h1>
+                <div class="board-tools">
+                  <button type="button" id="btn-new-thread">スレッドを立てる</button>
+                  <button type="button" id="btn-reload-list">更新</button>
+                  <button type="button" id="btn-share-board">共有</button>
+                </div>
+              </div>
+              <form class="new-thread" id="new-thread-form" hidden>
+                <label>タイトル <input id="nt-title" maxlength="120" required></label>
+                <div class="bbs-note">名前：名無しさん</div>
+                <textarea id="nt-body" rows="6" required placeholder="本文"></textarea>
+                <div>
+                  <button type="submit">新規スレッド作成</button>
+                  <button type="button" id="btn-cancel-thread">やめる</button>
+                </div>
+              </form>
+              <p class="bbs-note" id="list-state"></p>
+              <ol class="thread-list" id="thread-list"></ol>
+            </div>
+
+            <!-- スレ本体 -->
+            <div id="bbs-thread" hidden>
+              <div class="thread-nav">
+                <a href="#" class="back" id="back-to-list">■ 掲示板に戻る ■</a>
+                <button type="button" id="btn-reload-thread">更新</button>
+              </div>
+              <h1 class="thread-title" id="thread-title"></h1>
+              <dl class="posts" id="posts"></dl>
+              <form class="write" id="write-form">
+                <div class="bbs-note">名前：名無しさん　（レス番号を押すと &gt;&gt;n を挿入します）</div>
+                <textarea id="write-body" rows="5" required></textarea>
+                <button type="submit">書き込む</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- トーク（LINE 風） -->
+      <section class="view" id="view-talk">
+        <div class="talk">
+          <aside class="talk-list">
+            <div class="talk-list-head">
+              <span>トーク</span>
+              <button id="btn-add-friend" title="友だち追加">友だち追加</button>
+            </div>
+            <div class="receive-warn" id="receive-warn" hidden>
+              受け取るには「常駐」で参加し、自分の鍵が必要です
+            </div>
+            <ul id="friend-list"></ul>
+            <p class="muted small pad" id="friend-empty">まだ友だちがいません</p>
+          </aside>
+
+          <section class="chat" id="chat" hidden>
+            <header class="chat-head" id="chat-name"></header>
+            <div class="bubbles" id="bubbles"></div>
+            <form class="chat-input" id="chat-form">
+              <textarea id="chat-text" rows="1" placeholder="メッセージを入力（Enter で送信、Shift+Enter で改行）"></textarea>
+              <button class="send" type="submit">送信</button>
+            </form>
+          </section>
+
+          <section class="add-friend" id="add-friend" hidden>
+            <h2>友だち追加</h2>
+            <div class="qr-block">
+              <img id="my-qr" alt="自分の QR コード" width="200" height="200">
+              <div>
+                <p class="muted small">相手にこの QR か ID を渡してください。</p>
+                <code id="my-uri"></code>
+                <button id="btn-copy-uri">ID をコピー</button>
+              </div>
+            </div>
+            <form id="add-friend-form">
+              <label>相手の ID（aether:… または 64 文字）
+                <input id="friend-id" required spellcheck="false">
+              </label>
+              <label>表示名（自分の端末にだけ保存）
+                <input id="friend-name" required maxlength="40">
+              </label>
+              <button class="primary" type="submit">追加する</button>
+            </form>
+          </section>
+
+          <p class="talk-empty" id="talk-empty">トークを選ぶか、友だちを追加してください</p>
+        </div>
+      </section>
+
+      <!-- ログ -->
+      <section class="view" id="view-log">
+        <div class="page">
+          <h1>ログ</h1>
+          <p class="muted">画面上だけに表示し、ディスクには保存しません。</p>
+          <ol class="log" id="log"></ol>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="popup" id="popup" hidden></div>
+  <div class="busy" id="busy" hidden>
+    <div class="busy-box">
+      <div class="spinner"></div>
+      <div id="busy-text">処理中…</div>
+      <div class="muted small" id="busy-detail"></div>
+    </div>
+  </div>
+  <div class="toast" id="toast" hidden></div>
+</body>
+</html>

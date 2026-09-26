@@ -16,6 +16,24 @@ pub struct Config {
     /// リング座標のグラインディング対策 (設計書 18.5.3)。
     /// 高いほど Sybil コストが上がるが、起動時に1回だけその時間がかかる。
     pub node_id_pow_difficulty: u32,
+    /// 前回解いた NodeId PoW の解（あれば検証だけして使う）
+    ///
+    /// PoW は NodeId に対して一度解けば変わらない。起動のたびに解き直すと
+    /// 難易度 16 で十数秒〜かかる。呼び出し側が保存しておいて渡す。
+    /// 検証に通らない（鍵や難易度が変わった）ときは解き直す。
+    pub node_id_pow_nonce: Option<u64>,
+    /// 受け取った記述子に要求する NodeId PoW 難易度
+    ///
+    /// **自分が解く難易度とは別。** 一回限りのクライアントは自分の PoW を省くが、
+    /// 回路を組むのはまさにそのクライアントなので、ここを 0 にすると
+    /// PoW 無しの偽リレーを無制限に取り込み、回路を Sybil で埋められる。
+    /// 網全体で揃える値（テスト以外で下げないこと）。
+    pub directory_pow_difficulty: u32,
+    /// 自分をリレーとして網に広告するか
+    ///
+    /// **一回限りのクライアントは `false`。** PEX 要求に自分の記述子を載せず、
+    /// 他ノードのディレクトリに残らない（PoW の有無に頼らず明示的に）。
+    pub advertise_self: bool,
 
     // 到達性
     /// ルータへのポートマッピング要求を許可するか
@@ -59,7 +77,10 @@ impl Default for Config {
             mailbox_capacity_mb: 100,
             message_ttl_hours: 168, // 1 week
             pow_difficulty: 10,
-            node_id_pow_difficulty: 16,
+            node_id_pow_difficulty: crate::crypto::pow::node_id::DEFAULT_DIFFICULTY,
+            node_id_pow_nonce: None,
+            directory_pow_difficulty: crate::crypto::pow::node_id::DEFAULT_DIFFICULTY,
+            advertise_self: true,
             enable_port_mapping: false,
             active_poll_interval_secs: 10,
             ghost_poll_interval_secs: 60,

@@ -159,6 +159,8 @@ async fn stem_delivery_survives_a_black_hole_successor() {
             pow_nonce: 0,
             uptime_secs: 0,
             tier: Tier::Open,
+            issued_at: 0,
+            signature: Vec::new(),
         };
         a.directory().write().await.insert_unchecked(dead);
     }

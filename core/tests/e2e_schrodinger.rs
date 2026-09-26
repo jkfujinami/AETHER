@@ -61,6 +61,8 @@ fn descriptor(n: &Node) -> RelayDescriptor {
         pow_nonce: 0,
         uptime_secs: 3600,
         tier: aether_core::net::reachability::Tier::Open,
+        issued_at: 0,
+        signature: Vec::new(),
     }
 }
 
@@ -97,10 +99,10 @@ async fn message_travels_from_alice_to_bob_through_the_mailbox() {
         storage.push(node(port).await);
     }
 
-    // 全員が同じリレーリストを持つ（PoW 難易度 0 = テスト用）
+    // 全員が同じリレーリストを持つ（記述子の検証は relay_list の単体テストで見る）
     let mut dir = RelayDirectory::new(aether_core::net::ring::EPOCH_SEED_PLACEHOLDER, 0);
     for n in &storage {
-        dir.insert(descriptor(n)).unwrap();
+        dir.insert_unchecked(descriptor(n));
     }
     let directory = Arc::new(RwLock::new(dir));
 

@@ -39,6 +39,8 @@ enum Origin {
     Outbound,
     /// 相手から来た。**NAT 内ノードへの唯一の経路になりうる**
     Inbound,
+    /// 自分からダイヤルし、keepalive で保ち続ける（返信トンネルの戻り道）
+    Pinned,
 }
 
 struct ConnectionEntry {
@@ -72,6 +74,17 @@ impl Dialer {
                 .await
                 .map_err(|e| crate::AetherError::Quic(e.to_string())),
             Dialer::Client(c) => c.connect(addr, server_name).await,
+        }
+    }
+
+    async fn connect_keepalive(&self, addr: SocketAddr, server_name: &str) -> Result<Connection> {
+        match self {
+            Dialer::Endpoint(ep) => ep
+                .connect_with(QuicClient::keepalive_config()?, addr, server_name)
+                .map_err(|e| crate::AetherError::Quic(e.to_string()))?
+                .await
+                .map_err(|e| crate::AetherError::Quic(e.to_string())),
+            Dialer::Client(c) => c.connect_keepalive(addr, server_name).await,
         }
     }
 }
@@ -188,6 +201,44 @@ impl ConnectionPool {
         Ok(connection)
     }
 
+    /// keepalive 付きの接続を張り、寿命で捨てずに保つ
+    ///
+    /// 返信トンネルの終端に使う。相手（ガード）はこの接続の上でしか
+    /// 自分へ返信を届けられない（自分が NAT の内側でも、広告アドレスが無くても）。
+    /// 既に保っている生きた接続があればそれを返す。
+    pub async fn pin_connection(&self, addr: SocketAddr, server_name: &str) -> Result<Connection> {
+        let addr = normalize(addr);
+        {
+            let pool = self.connections.read().await;
+            if let Some(entry) = pool.get(&addr)
+                && entry.origin == Origin::Pinned
+                && entry.is_alive()
+            {
+                return Ok(entry.connection.clone());
+            }
+        }
+
+        let connection = self.dialer.connect_keepalive(addr, server_name).await?;
+
+        // 受信も回してもらう（返信はこの接続の上で届く）
+        if let Some(tx) = self.opened_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(connection.clone());
+        }
+
+        let now = Instant::now();
+        let mut pool = self.connections.write().await;
+        if pool.len() >= self.max_connections {
+            Self::evict_lru(&mut pool);
+        }
+        pool.insert(addr, ConnectionEntry {
+            connection: connection.clone(),
+            origin: Origin::Pinned,
+            last_used: now,
+            created_at: now,
+        });
+        Ok(connection)
+    }
+
     /// 生きた接続があるか（診断用）
     pub async fn has_live_connection(&self, addr: SocketAddr) -> bool {
         self.take_live(addr).await.is_some()
@@ -258,8 +309,8 @@ impl ConnectionPool {
                 return false;
             }
 
-            // inbound は相手が閉じるまで保持する
-            if entry.origin == Origin::Inbound {
+            // inbound と pinned は相手が閉じるまで保持する
+            if entry.origin != Origin::Outbound {
                 return true;
             }
 

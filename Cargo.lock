@@ -22,12 +22,30 @@ dependencies = [
 name = "aether-cli"
 version = "0.1.0"
 dependencies = [
+ "aether-client",
  "aether-core",
  "clap",
  "hex",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "aether-client"
+version = "0.1.0"
+dependencies = [
+ "aether-core",
+ "bincode",
+ "hex",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

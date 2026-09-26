@@ -48,6 +48,8 @@ pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 pub struct GuardCandidate {
     pub node_id: NodeId,
     pub addr: SocketAddr,
+    /// Onion 層の鍵導出に使う X25519 公開鍵
+    pub x25519_pub: [u8; 32],
     /// 稼働実績（秒）。重み付け抽選に使う
     pub uptime_secs: u64,
 }
@@ -57,6 +59,11 @@ pub struct GuardCandidate {
 pub struct Guard {
     pub node_id: NodeId,
     pub addr: SocketAddr,
+    /// Onion の第1層を包む鍵
+    ///
+    /// ガードと一緒に永続化する。ディレクトリ任せにすると、起動直後で PEX が
+    /// まだガードを運んできていない時に回路を組めず、別の入口へ逃げたくなる。
+    pub x25519_pub: [u8; 32],
     /// 選択した時刻 (UNIX秒)
     pub selected_at: u64,
     /// 連続失敗回数
@@ -68,6 +75,7 @@ impl Guard {
         Self {
             node_id: c.node_id,
             addr: c.addr,
+            x25519_pub: c.x25519_pub,
             selected_at: now,
             consecutive_failures: 0,
         }
@@ -150,7 +158,11 @@ impl GuardSet {
         }
 
         // 稼働実績で重み付け（実績0でも最低1の重みは与える）
+        // 同じ実績どうしは無作為に並べる（安定ソートなので先に混ぜておく）。
+        // 起動直後は全員の観測在籍時間がほぼ同じで、並びがディレクトリの内部順に
+        // 引きずられると、選ばれ方が偏る。
         let mut rng = rand::thread_rng();
+        pool.shuffle(&mut rng);
         pool.sort_by_key(|c| std::cmp::Reverse(c.uptime_secs));
 
         let mut added = 0;
@@ -211,6 +223,7 @@ mod tests {
         GuardCandidate {
             node_id: NodeId([n; 32]),
             addr: format!("127.0.0.{}:9000", n).parse().unwrap(),
+            x25519_pub: [n; 32],
             uptime_secs,
         }
     }

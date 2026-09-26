@@ -3,11 +3,15 @@ use crate::net::quic::{QuicClient, QuicConnection};
 use crate::net::connection_pool::ConnectionPool;
 use crate::protocol::wire::{self, InnerPacketType, PacketType};
 use crate::net::onion::OnionCircuit;
-use crate::net::guard::{GuardCandidate, GuardSet, GUARD_SAMPLE_SIZE};
+use crate::net::guard::{Guard, GuardCandidate, GuardSet, GUARD_SAMPLE_SIZE};
+use crate::crypto::key_exchange::EphemeralKey;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
+/// ガード1本への接続を諦めるまでの時間
+const GUARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 
 pub struct RelayClient {
     quic_client: Arc<QuicClient>,
@@ -54,7 +58,7 @@ impl RelayClient {
         guards: &mut GuardSet,
         candidates: &[GuardCandidate],
         path: &Path,
-    ) -> Result<SocketAddr> {
+    ) -> Result<Guard> {
         let now = crate::protocol::hint::current_timestamp();
         guards.replenish(candidates, now);
 
@@ -62,20 +66,29 @@ impl RelayClient {
 
         // 標本を順に試す。1本目が落ちていても、すぐ再抽選はしない
         for _ in 0..GUARD_SAMPLE_SIZE {
-            let Some(guard) = guards.current(now) else {
+            let Some(guard) = guards.current(now).cloned() else {
                 break;
             };
-            let (node_id, addr) = (guard.node_id, guard.addr);
 
-            match self.connect_entry(addr).await {
-                Ok(()) => {
-                    guards.record_success(&node_id);
+            // 死んだガードで QUIC のタイムアウトまで固まらないよう頭打ちにする。
+            // 打ち切りも失敗として記録しないと、標本内の次へ進めない。
+            let attempt = tokio::time::timeout(GUARD_CONNECT_TIMEOUT, self.connect_entry(guard.addr));
+            match attempt.await {
+                Ok(Ok(())) => {
+                    guards.record_success(&guard.node_id);
                     guards.save(path)?;
-                    return Ok(addr);
+                    return Ok(guard);
                 }
-                Err(e) => {
-                    guards.record_failure(&node_id);
+                Ok(Err(e)) => {
+                    guards.record_failure(&guard.node_id);
                     last_err = Some(e);
+                }
+                Err(_) => {
+                    guards.record_failure(&guard.node_id);
+                    last_err = Some(AetherError::Config(format!(
+                        "Guard {} timed out",
+                        guard.addr
+                    )));
                 }
             }
         }
@@ -89,6 +102,19 @@ impl RelayClient {
     /// 回路を手動で設定（テスト用・デバッグ用）
     pub fn set_circuit(&mut self, circuit: OnionCircuit) {
         self.circuit = Some(circuit);
+    }
+
+    /// 接続済みの入口から始まる経路で回路を組む
+    ///
+    /// `hops` は入口（接続済みのガード）から出口までの `(アドレス, X25519 公開鍵)`。
+    /// ホップごとに使い捨ての一時鍵を使う（回路間で鍵を使い回すと中継が回路を突き合わせられる）。
+    pub fn set_path(&mut self, hops: &[(SocketAddr, [u8; 32])]) -> Result<()> {
+        let mut circuit = OnionCircuit::new(1);
+        for (addr, pubkey) in hops {
+            circuit.add_hop(*addr, *pubkey, EphemeralKey::generate())?;
+        }
+        self.circuit = Some(circuit);
+        Ok(())
     }
 
     /// 汎用パケット送信

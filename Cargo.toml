@@ -2,8 +2,12 @@
 resolver = "2"
 members = [
     "core",
+    "client",
     "cli",
 ]
+# GUI は重い依存（Tauri / WebView）を持つので別ワークスペースにする。
+# ここに入れると core のテストのたびに Tauri までビルドされる。
+exclude = ["gui/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -54,3 +58,10 @@ socket2 = "0.5"  # デュアルスタック bind (v6only=false)
 
 # CLI用
 clap = { version = "4", features = ["derive"] }
+
+# テスト・開発ビルドでも鍵導出（Argon2）だけは最適化する。
+# 未最適化の Argon2 は 1 回で数秒かかり、暗号化まわりの単体テストが重くなる。
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

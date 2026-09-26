@@ -1,0 +1,31 @@
+[package]
+name = "aether-desktop"
+version = "0.1.0"
+edition = "2024"
+description = "AETHER デスクトップ（Tauri）"
+license = "MIT OR Apache-2.0"
+
+# 本体のワークスペースとは分ける（Tauri を core のテストに巻き込まない）
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+aether-client = { path = "../../client" }
+aether-core = { path = "../../core" }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.43", features = ["full"] }
+hex = "0.4"
+# 友だち追加用の QR（SVG だけ。画像ライブラリは引かない）
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+# 開発ビルドでも鍵導出・NodeId PoW（Argon2）だけは最適化する。
+# 本体のワークスペースと別なので、ここにも書かないと効かない。
+# 未最適化だと初回の PoW が数十分かかる。
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
