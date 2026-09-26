@@ -336,7 +336,7 @@ aether init [--force]                             鍵を生成（既存を上書
 aether id                                         保存済み NodeId を表示
 
 aether start [オプション]                          常駐（リレー兼受信）
-    --port <u16>            待ち受けポート（既定 9000）
+    --port <u16>            待ち受けポート（既定 0 = 初回にランダムに選んで保存）
     --connect <host:port>  種ノード
     --advertise <host:port> 到達可能アドレスを宣言（省略時 STUN 自動判定）
     --allow-port-mapping   ルータへのポートマッピングを許可（痕跡が残る・既定オフ）

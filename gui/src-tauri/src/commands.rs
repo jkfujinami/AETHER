@@ -257,7 +257,7 @@ pub async fn qr_svg(text: String) -> CmdResult<String> {
     {
         return Err("共有できない文字列です".into());
     }
-    Ok(render_qr(&text)?)
+    render_qr(&text)
 }
 
 fn render_qr(text: &str) -> CmdResult<String> {

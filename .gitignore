@@ -20,3 +20,6 @@ gui/src-tauri/gen/
 !gui/package-lock.json
 !gui/src-tauri/tauri.conf.json
 !gui/src-tauri/capabilities/*.json
+
+# Claude Code の作業ツリー
+.claude/worktrees/
