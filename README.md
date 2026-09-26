@@ -21,7 +21,7 @@
   - [5. Dandelion++（放流元の秘匿）](#5-dandelion放流元の秘匿)
   - [6. Inbound Tunnel（匿名の返信）](#6-inbound-tunnel匿名の返信)
   - [7. 私信の全体フロー](#7-私信の全体フローsend--receive)
-  - [8. 公開モード（keyword / 索引 / チャンク / 掲示板）](#8-公開モードkeyword--索引--チャンク--掲示板)
+  - [8. 公開モード（板 / 索引 / チャンク / 掲示板）](#8-公開モード板--索引--チャンク--掲示板)
   - [9. 前方秘匿と X3DH](#9-前方秘匿と-x3dh)
   - [10. エポックビーコン](#10-エポックビーコン)
   - [11. ピア発見と NAT 越え](#11-ピア発見と-nat-越え)
@@ -54,6 +54,14 @@ AETHER が想定する敵は **日本の警察型の攻撃者**です：
 
 ## クイックスタート
 
+**手元で試す（テスト網を一発で立てる）**
+
+```bash
+scripts/local-net.sh          # 127.0.0.1 に到達可能なリレーを 5 台立てる（種は 127.0.0.1:19001）
+```
+
+**CLI で使う**
+
 ```bash
 # ビルド
 cargo build --release
@@ -64,16 +72,16 @@ cargo run -p aether-cli -- init
 # 自分の NodeId を確認
 cargo run -p aether-cli -- id
 
-# 種ノードに参加して常駐（リレー兼受信）
-cargo run -p aether-cli -- start --connect <種>:<port>
+# 種ノードに参加して常駐（リレー兼受信）。板を購読すると、その板の投稿を拾って表示する
+cargo run -p aether-cli -- start --connect <種>:<port> --subscribe 雑談
 
-# 私信を送る（相手の NodeId を知っていれば秘密の事前共有は不要）
+# 私信を送る（相手の NodeId を知っていれば事前共有は不要。X3DH で自動鍵合意）
 cargo run -p aether-cli -- send --to <NodeId> --message "やあ" --connect <種>:<port>
 
-# 公開キーワードで投稿・検索・取得
-cargo run -p aether-cli -- send   --keyword アニメ --file movie.mkv --connect <種>:<port>
-cargo run -p aether-cli -- search --keyword アニメ                  --connect <種>:<port>
-cargo run -p aether-cli -- get    --keyword アニメ --ref <ref> --out movie.mkv --connect <種>:<port>
+# 公開の板に投稿・検索・取得（公式の板は名前で指定。非公開板は aether-board:<ID>）
+cargo run -p aether-cli -- send   --board 雑談 --file movie.mkv --connect <種>:<port>
+cargo run -p aether-cli -- search --board 雑談                  --connect <種>:<port>
+cargo run -p aether-cli -- get    --board 雑談 --ref <ref> --out movie.mkv --connect <種>:<port>
 ```
 
 > バイナリ名は `aether-cli` ですが CLI 上は `aether` として振る舞います。`cargo install --path cli` 後は `aether ...` で起動できます。
@@ -84,6 +92,16 @@ cargo run -p aether-cli -- get    --keyword アニメ --ref <ref> --out movie.mk
 export AETHER_PASSPHRASE='あなたのパスフレーズ'
 cargo run -p aether-cli -- start --connect <種>:<port>
 ```
+
+**GUI（デスクトップ）で使う**
+
+```bash
+cd gui
+npm install   # Tauri CLI（画面は素の HTML/JS でバンドラを使わない）
+npm run dev   # 開発起動
+```
+
+種ノードのアドレスを入れて「参加する」を押すだけ。詳しくは [`gui/README.md`](gui/README.md)。
 
 ---
 
@@ -155,7 +173,7 @@ Alice ──[3層暗号]──▶ ホップ1 ──[2層]──▶ ホップ2 �
 
 ```
 1. nonce ← 乱数32B ;  mailbox_key = SHA256(nonce)
-2. 本体を鍵で暗号化（私信は前方秘匿ラチェット / 公開は静的 K_pub）
+2. 本体を鍵で暗号化（私信は前方秘匿ラチェット / 公開は板の静的 board_key）
 3. Reed-Solomon で 5 シャードに分割
 4. 各シャードに HMAC の「封」をする（mailbox_key を含む）
      └─ 封が無いと、保持者1台が偽シャードを返すだけで復元が止まる（RS は消失訂正）
@@ -247,17 +265,17 @@ sequenceDiagram
 
 **この間、ネットワーク上のどこにも「Alice→Bob」という関係は現れません。** 出口リレーは発信元を知らず、保持者は宛先も中身も読めず、Gossip 観測者には宛先が見えず、Mailbox には受信者の IP が Gateway でマスクされます。
 
-### 8. 公開モード（keyword / 索引 / チャンク / 掲示板）
+### 8. 公開モード（板 / 索引 / チャンク / 掲示板）
 
-私信は「特定の相手」宛てですが、公開共有には特定の宛先がありません。そこで **キーワード自体を鍵**にします：
+私信は「特定の相手」宛てですが、公開共有には特定の宛先がありません。そこで**板（board）を乱数 32 バイトの ID** で表します：
 
 ```
-K_pub = derive_public_key("アニメ")   ← キーワードを知る全員が同じ鍵に到達
+board_key = H("aether_board_key_v1" ‖ BoardId)   ← BoardId（ID）を知る全員が同じ鍵に到達
 ```
 
-`K_pub` を私信の `K` と同じ位置に使うので、**同じ機構がそのまま公開共有になります**（キーワードを知る＝復号鍵を持つ＝保持者位置を計算できる）。ただし公開鍵は辞書攻撃可能なので保持者位置も割れる ── これは公開検索可能性との交換不能なトレードオフ。
+`board_key` を私信の `K` と同じ位置に使うので、**同じ機構がそのまま公開共有になります**（BoardId を知る＝復号鍵を持つ＝保持者位置を計算できる）。BoardId は乱数なので辞書攻撃で当てられません。**推測ではなく ID を渡された者だけが板に入れます**（公式の板は ID をアプリに埋め込んであるので誰でも読める。5ch と同じで「誰が書いたか」だけを守る）。ラベル（表示名）は重複しうるので、ID から作る短い指紋を必ず並べて見せます。
 
-- **索引層（pull 発見）**：`H(index_key ‖ K_pub)` に、**K_pub で封じた記述子**（本体へのポインタ・数十バイト）を追記。購読して待たなくても、キーワードの索引を**引きに行けば**発見できる。保持者は記述子を暗号文のまましか持たない（ファイル名も見えない）。各記述子は **スパム対策 PoW** を持ち、`search` はこれを**熱量ランク**（PoW を積んだ議論が上位）に使う。
+- **索引層（pull 発見）**：`H(index_key ‖ board_key)` に、**board_key で封じた記述子**（本体へのポインタ・数十バイト）を追記。購読して待たなくても、板の索引を**引きに行けば**発見できる。保持者は記述子を暗号文のまましか持たない（ファイル名も見えない）。各記述子は **スパム対策 PoW** を持ち、`search` はこれを**熱量ランク**（PoW を積んだ議論が上位）に使う。
 - **チャンク化（大容量・swarm）**：`CHUNK_SIZE=256KB` で分割し、**収束暗号**（nonce = H(secret‖平文)）で content-address 化。同一ファイルの再公開は**重複排除**され、複数保持者から**並列取得**できる。Manifest がチャンク列を束ねる。
 - **掲示板 DAG**：記述子が親の `content_ref` を参照して **DAG** を成す（木ではなく DAG ＝ 同時に書かれた複数の先端を後続がまとめられる）。全ノードが**決定論的トポロジカル順**（Kahn 法）で同じスレッド並びを再現し、HN 式スコア（累積 PoW ÷ 時間の重力）で熱量順に表示する。
 
@@ -324,21 +342,21 @@ aether start [オプション]                          常駐（リレー兼受
     --allow-port-mapping   ルータへのポートマッピングを許可（痕跡が残る・既定オフ）
     --pow-difficulty <u32> NodeId PoW 難易度（既定 16）
     --contact <NodeId[:hex]>  受信したい相手（複数可。秘密省略で自動鍵合意）
-    --subscribe <keyword>     購読する公開キーワード（複数可）
+    --subscribe <board>       購読する板（公式の板の名前か aether-board:…、複数可）
     --epoch-beacon            エポックビーコンを有効化（網全体で揃える必要あり）
 
 aether send [オプション]                           送信（私信 or 公開）
     --to <NodeId>          私信の宛先（--secret 省略で自動鍵合意 → X3DH 初回接触）
     --secret <hex>         事前共有秘密を明示（任意）
-    --keyword <word>       公開モードで投稿（--to と排他）
+    --board <雑談 | aether-board:…>   板への書き込み（--to と排他）
     --message <text> | --file <path>   本文 or ファイル
     --name <text>          索引の見出し（省略時は本文先頭 or ファイル名）
     --reply-to <ref[,ref]> 掲示板のスレッド返信（親の content_ref）
     --connect <host:port>  種ノード（必須）
     --min-relays <n>       この台数を超えるまで待つ（既定 3）
 
-aether search --keyword <word> --connect <host:port>   索引を引いてスレッド DAG 表示
-aether get --keyword <word> --ref <hex> [--out <path>] --connect <host:port>   取得
+aether search --board <雑談 | aether-board:…> --connect <host:port>   索引を引いてスレッド DAG 表示
+aether get --board <雑談 | aether-board:…> --ref <hex> [--out <path>] --connect <host:port>   取得
 
 環境変数 AETHER_PASSPHRASE   設定すると identity / keystore / mailbox を保存時暗号化
 ```
@@ -356,7 +374,7 @@ aether get --keyword <word> --ref <hex> [--out <path>] --connect <host:port>   �
 
 **守れない / 未対応（正直に）**
 - **グローバル受動盗聴者**（全リンク同時観測でのタイミング相関）は脅威モデル外
-- 公開キーワードは辞書攻撃可能＝公開コンテンツの保持者位置は割れる（検索可能性との交換）
+- 公式の板の ID はアプリに埋め込んであり、公開コンテンツの保持者位置は誰でも計算できる（検索可能性との交換。非公開板は乱数 ID なので、ID を渡された者以外は保持者位置を計算できない）
 - エポックビーコン取得・STUN は外部への接続の足跡を残す（将来 Tor/網内伝播で軽減可）
 - **未承諾の初回接触**は現状 v1 では相互 `--contact` 前提（受信箱チャネルは follow-on）
 - セキュリティ監査・実 NAT 環境での大規模検証はこれから
@@ -377,7 +395,7 @@ aether get --keyword <word> --ref <hex> [--out <path>] --connect <host:port>   �
 
 **残り（roadmap）**：使い捨てプレキー（OPK）プール / 未承諾初回接触の受信箱チャネル / エポックの BLS 検証 or 網内伝播（drand 足跡の除去）/ FU ボタン / 実 NAT 検証 / セキュリティ監査。
 
-278 テスト（254 lib + 24 integration）/ clippy 0。
+lib + integration テストと clippy 0 を CI 前提にしている（`cargo test` / `cargo clippy --all-targets`）。
 
 ---
 
@@ -397,15 +415,25 @@ cargo test -p aether-core --lib epoch -- --ignored   # drand 実疎通（要ネ�
 ## リポジトリ構成
 
 ```
-core/                Rust ライブラリ本体
-  src/crypto/        identity(Ed25519/PoW) · ratchet · session · x3dh · keyword · cipher · pow
+core/                Rust ライブラリ本体（部品：回路・Mailbox・トンネル）
+  src/crypto/        identity(Ed25519/PoW) · ratchet · session · x3dh · keyword(板の識別子) · cipher · pow
   src/net/           quic · onion · relay · tunnel · gossip(_server) · dandelion · ring
                      relay_list(directory) · epoch(drand) · pex · punch · reachability · guard …
+  src/node/          server(パケット処理) · router · peer
   src/mailbox/       schrodinger(配置/取得) · sharding(RS) · index · chunk · board(DAG) · server(sled)
   src/storage/       keystore(ラチェット/プレキー永続化) · at_rest(Argon2id+ChaCha20)
   src/protocol/      wire(パケット型) · hint
   tests/             e2e_*（gossip 伝播 / トンネル / 回路分離 / bootstrap …）
-cli/                 aether-cli（init/id/start/send/search/get）
+client/              aether-client（送る・探す・取る・受けるの手順。CLI と GUI が共有）
+  src/keys.rs        鍵ファイルと、暗号化して小さな設定を保存する write_secure/read_secure
+  src/friends.rs     友だち一覧（表示名は自分の端末にだけ置く）
+  src/boards.rs      板・お気に入り（公式の板 + 入った/作った非公開板）
+  src/talks.rs       トーク履歴の暗号化保存
+cli/                 aether-cli（init/id/start/send/search/get）。引数解析と表示だけ
+gui/                 AETHER デスクトップ（Tauri 2）。詳しくは gui/README.md
+  src-tauri/         画面から呼べるコマンド（別ワークスペース。本体には含めない）
+  ui/                素の HTML/JS 画面（バンドラを使わない）
+scripts/local-net.sh 手元で試すテスト網を一発で立てる（127.0.0.1 に到達可能なリレー N 台）
 .docs/               設計文書（詳細実装計画・設計判断の「なぜ」）
 ```
 
