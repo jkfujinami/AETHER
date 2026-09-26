@@ -312,19 +312,6 @@
 
 ---
 
-## 6. 参考文献
-
-- Serjantov, A., & Danezis, G. (2002). *Towards an Information Theoretic Metric for Anonymity*. Privacy Enhancing Technologies (PET).
-- Díaz, C., Seys, S., Claessens, J., & Preneel, B. (2002). *Towards Measuring Anonymity*. Privacy Enhancing Technologies (PET).
-- Fanti, G., Venkatakrishnan, S. B., Bakshi, S., & Denby, B. (2018). *Dandelion++: Lightweight Cryptocurrency Networking with Formal Anonymity Guarantees*. SIGMETRICS.
-- Danezis, G., & Goldberg, I. (2009). *Sphinx: A Compact and Provably Secure Mix Format*. IEEE Symposium on Security and Privacy.
-- Johnson, A., Wacek, C., Jansen, R., Sherr, M., & Syverson, P. (2013). *Users Get Routed: Traffic Correlation on Tor by Realistic Adversaries*. ACM CCS.（Tor の固定ガード方式の実証研究。ガード運用の議論の背景として参照）
-- drand (League of Entropy) — 分散乱数ビーコン。`core/src/net/epoch.rs` のコメントで言及されている公開の乱数源。
-
-**確実に実在するかどうか自信が持てなかった文献は本節に含めていない。**
-
----
-
 ## 6. 数値から導いた設計上の結論
 
 数値にすると、コアの 3 機構（Broadcast Veil・Schrödinger Mailbox・Ring+K）が守る性質（受信者の受動的な匿名性、保持者の無知性、私信の検閲耐性）は非常に強い一方、**周辺の 3 か所が全体の強さを決めている**ことが分かる。
@@ -351,3 +338,18 @@
 4. **エポックビーコン**: 既定で無効（`epoch_beacon: false`）。位置は固定シード。§3.7 と 6-1 のとおり、有効にしても在籍期間の要件がなければ狙い撃ちは防げない。
 5. **1 日の回路数**: コードに規定値はない。1 回の送信で本体用と Hint 用の 2 本、1 回の取得で 1 本（組み直しで最大 3 本）張るので、10 本/日は「1 日に数回やりとりする利用者」の目安として妥当。
 6. **Dandelion の配線**: Onion の出口が `InnerPacketType::GossipHint` を受け取ると `inject_hint` を呼び、そこから stem が始まる（`core/src/node/server.rs` の `process_packet`）。したがって stem の起点は出口リレーで、送信者本人ではない。
+
+---
+
+## 8. 参考文献
+
+- Serjantov, A., & Danezis, G. (2002). *Towards an Information Theoretic Metric for Anonymity*. Privacy Enhancing Technologies (PET).
+- Díaz, C., Seys, S., Claessens, J., & Preneel, B. (2002). *Towards Measuring Anonymity*. Privacy Enhancing Technologies (PET).
+- Fanti, G., Venkatakrishnan, S. B., Bakshi, S., & Denby, B. (2018). *Dandelion++: Lightweight Cryptocurrency Networking with Formal Anonymity Guarantees*. SIGMETRICS.
+- Danezis, G., & Goldberg, I. (2009). *Sphinx: A Compact and Provably Secure Mix Format*. IEEE Symposium on Security and Privacy.
+- Johnson, A., Wacek, C., Jansen, R., Sherr, M., & Syverson, P. (2013). *Users Get Routed: Traffic Correlation on Tor by Realistic Adversaries*. ACM CCS.（Tor の固定ガード方式の実証研究。ガード運用の議論の背景として参照）
+- drand (League of Entropy) — 分散乱数ビーコン。`core/src/net/epoch.rs` のコメントで言及されている公開の乱数源。
+
+**確実に実在するかどうか自信が持てなかった文献は本節に含めていない。**
+
+---
