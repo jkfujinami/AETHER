@@ -75,6 +75,24 @@ impl KeyFiles {
         self.save_friends(&friends)?;
         Ok(friend)
     }
+
+    /// 友だちを削除する
+    ///
+    /// トーク履歴も一緒に消す（相手の記録だけ残っていると、削除した意味が薄れる）。
+    /// 受信中の購読から即座に外す API は無いので、実際に受信対象から外れるのは
+    /// 次回の接続から（呼び出し側の画面でその旨を示すこと）。
+    pub fn remove_friend(&self, node_id: &NodeId) -> Result<()> {
+        let hex_id = hex::encode(node_id.as_bytes());
+        let mut friends = self.load_friends()?;
+        let before = friends.len();
+        friends.retain(|f| f.node_id != hex_id);
+        if friends.len() == before {
+            return Err(ClientError::invalid("その友だちは登録されていません"));
+        }
+        self.save_friends(&friends)?;
+        self.delete_talk(node_id)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -96,6 +114,28 @@ mod tests {
         assert_eq!(friends.len(), 1);
         assert_eq!(friends[0].nickname, "たろう");
         assert!(KeyFiles::new(dir.path(), Some("wrong".into())).load_friends().is_err());
+    }
+
+    #[test]
+    fn remove_friend_deletes_friend_and_talk_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyFiles::new(dir.path(), None);
+        let id = NodeId([8; 32]);
+        keys.add_friend(&id, "たろう").unwrap();
+        keys.append_talk_message(&id, crate::talks::TalkMessage { mine: true, text: "hi".into(), time: 1 })
+            .unwrap();
+
+        keys.remove_friend(&id).unwrap();
+
+        assert!(keys.load_friends().unwrap().is_empty());
+        assert!(keys.load_talks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_friend_errs_if_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyFiles::new(dir.path(), None);
+        assert!(keys.remove_friend(&NodeId([1; 32])).is_err());
     }
 
     #[test]

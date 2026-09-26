@@ -78,6 +78,62 @@ const PEX_FANOUT: usize = 3;
 /// 拡散全体が止まらないようにする。
 const GOSSIP_RELAY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `addr` がディレクトリに載っているリレーのアドレスか（正規化して比較）
+///
+/// [`crate::net::addr::normalize`] を通す ── デュアルスタックだと同じノードが
+/// IPv4-mapped IPv6 として観測され、素通しで比べると常に不一致になる。
+fn is_known_relay_addr(dir: &RelayDirectory, addr: SocketAddr) -> bool {
+    let want = crate::net::addr::normalize(addr);
+    dir.all()
+        .into_iter()
+        .any(|d| crate::net::addr::normalize(d.addr) == want)
+}
+
+/// `gateway` がディレクトリに載っている、かつ知らない相手を受け入れる Tier のリレーか
+///
+/// MailboxGet / IndexQuery の返信先はここでしか検証されない。任意のアドレスへ
+/// 返信させられると、第三者への増幅攻撃の踏み台になる（FilterCheck と同じ理由）。
+fn is_trusted_reply_gateway(dir: &RelayDirectory, gateway: SocketAddr) -> bool {
+    let want = crate::net::addr::normalize(gateway);
+    dir.all()
+        .into_iter()
+        .any(|d| crate::net::addr::normalize(d.addr) == want && d.tier.accepts_strangers())
+}
+
+/// IPv4/IPv6 のマルチキャスト・ブロードキャストアドレスか
+fn is_multicast_or_broadcast(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_multicast() || v4.is_broadcast(),
+        std::net::IpAddr::V6(v6) => v6.is_multicast(),
+    }
+}
+
+/// PunchNotify の候補アドレスを絞る
+///
+/// 認証なしで任意の宛先へ UDP を撃たせられる踏み台にしないため:
+/// - 未指定・マルチキャスト・ブロードキャストは常に除く
+/// - ループバックは**送り主自身もループバックの場合だけ**許す
+///   （テストでは 127.0.0.1 を使うため。実網の送り主がループバックのはずはない）
+/// - 最大 4 件に切り詰める
+fn sanitize_punch_candidates(candidates: &[SocketAddr], sender_is_loopback: bool) -> Vec<SocketAddr> {
+    const MAX_PUNCH_CANDIDATES: usize = 4;
+    candidates
+        .iter()
+        .filter(|addr| {
+            let ip = addr.ip();
+            if ip.is_unspecified() || is_multicast_or_broadcast(ip) {
+                return false;
+            }
+            if ip.is_loopback() && !sender_is_loopback {
+                return false;
+            }
+            true
+        })
+        .take(MAX_PUNCH_CANDIDATES)
+        .copied()
+        .collect()
+}
+
 pub struct NodeServer {
     pub server: QuicServer,
     pub router: Arc<Router>,
@@ -749,8 +805,32 @@ impl NodeServer {
                 }
             },
             PacketType::PunchNotify => {
+                // **送り主がディレクトリ上の既知リレーでなければ無視する。**
+                // 認証なしで通れば、任意の第三者が任意の宛先へ UDP を撃たせる
+                // 踏み台になる（PunchRequest は本来仲介役のリレーしか出さない）。
+                let Some(sender_addr) = ctx.remote_addr else {
+                    debug!("PunchNotify without an observed source; ignoring");
+                    return Ok(());
+                };
+                let known_sender = {
+                    let dir = ctx.directory.read().await;
+                    is_known_relay_addr(&dir, sender_addr)
+                };
+                if !known_sender {
+                    debug!("PunchNotify from {} which is not a known relay; ignoring", sender_addr);
+                    return Ok(());
+                }
+
                 let notify = PunchNotify::decode(&payload)?;
-                debug!("Punching towards {} candidate(s)", notify.candidates.len());
+
+                // 送り主自身がループバックのときだけ、候補のループバックも許す（試験用）。
+                let sender_is_loopback = crate::net::addr::normalize(sender_addr).ip().is_loopback();
+                let candidates = sanitize_punch_candidates(&notify.candidates, sender_is_loopback);
+                if candidates.is_empty() {
+                    debug!("PunchNotify from {} has no usable candidates after filtering", sender_addr);
+                    return Ok(());
+                }
+                debug!("Punching towards {} candidate(s)", candidates.len());
 
                 // 通知を受けたら一定時間プローブし続ける。
                 // 双方が同じことをするので、時計を合わせなくても窓が重なる
@@ -760,7 +840,7 @@ impl NodeServer {
                     let deadline = tokio::time::Instant::now() + punch::PROBE_WINDOW;
 
                     while tokio::time::Instant::now() < deadline {
-                        let _ = session.probe_round(&socket, &notify.candidates).await;
+                        let _ = session.probe_round(&socket, &candidates).await;
                         tokio::time::sleep(punch::PROBE_INTERVAL).await;
                     }
                 });
@@ -825,6 +905,18 @@ impl NodeServer {
                 // 索引の列挙。返信は Inbound Tunnel 経由（検索者の IP を隠す）。
                 let (index_key, reply_to) = wire::parse_mailbox_get(&payload)?;
 
+                let trusted = {
+                    let dir = ctx.directory.read().await;
+                    is_trusted_reply_gateway(&dir, reply_to.gateway)
+                };
+                if !trusted {
+                    debug!(
+                        "IndexQuery reply_to.gateway {} is not a known relay accepting strangers; discarding",
+                        reply_to.gateway
+                    );
+                    return Ok(());
+                }
+
                 let records = ctx.mailbox.handle_index_list(&index_key).await?;
                 if !records.is_empty() {
                     // 1メッセージにまとめて返す: [TunnelID(32)][bincode(Vec<record>)]
@@ -848,6 +940,18 @@ impl NodeServer {
                 // uni-directional stream なので直接は返せず、
                 // また直接返せてしまうと要求者の IP が割れる。
                 let (key, reply_to) = wire::parse_mailbox_get(&payload)?;
+
+                let trusted = {
+                    let dir = ctx.directory.read().await;
+                    is_trusted_reply_gateway(&dir, reply_to.gateway)
+                };
+                if !trusted {
+                    debug!(
+                        "MailboxGet reply_to.gateway {} is not a known relay accepting strangers; discarding",
+                        reply_to.gateway
+                    );
+                    return Ok(());
+                }
 
                 match ctx.mailbox.handle_get(&key).await? {
                     Some(value) => {
@@ -1606,4 +1710,79 @@ impl NodeServer {
     pub fn gossip(&self) -> Arc<GossipServer> { self.gossip.clone() }
     pub fn peers(&self) -> Arc<PeerManager> { self.peers.clone() }
     pub fn directory(&self) -> Arc<RwLock<RelayDirectory>> { self.directory.clone() }
+}
+
+#[cfg(test)]
+mod reply_guard_tests {
+    use super::*;
+    use crate::crypto::identity::Identity;
+
+    fn descriptor(addr: &str, tier: Tier) -> RelayDescriptor {
+        let id = Identity::generate();
+        RelayDescriptor::new_signed(&id, addr.parse().unwrap(), 0, tier)
+    }
+
+    fn dir_with(descriptors: Vec<RelayDescriptor>) -> RelayDirectory {
+        let mut dir = RelayDirectory::new([0u8; 32], 0);
+        for d in descriptors {
+            dir.insert_unchecked(d);
+        }
+        dir
+    }
+
+    #[test]
+    fn trusted_reply_gateway_requires_known_and_open() {
+        let open = descriptor("127.0.0.1:9001", Tier::Open);
+        let reversed = descriptor("127.0.0.1:9002", Tier::Reversed);
+        let dir = dir_with(vec![open.clone(), reversed.clone()]);
+
+        assert!(is_trusted_reply_gateway(&dir, open.addr));
+        assert!(!is_trusted_reply_gateway(&dir, reversed.addr));
+        assert!(!is_trusted_reply_gateway(&dir, "203.0.113.5:1".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_reply_gateway_normalizes_ipv4_mapped_addr() {
+        let open = descriptor("127.0.0.1:9001", Tier::Open);
+        let dir = dir_with(vec![open.clone()]);
+        let mapped: SocketAddr = format!("[::ffff:127.0.0.1]:{}", open.addr.port()).parse().unwrap();
+        assert!(is_trusted_reply_gateway(&dir, mapped));
+    }
+
+    #[test]
+    fn known_relay_addr_ignores_tier() {
+        let reversed = descriptor("127.0.0.1:9003", Tier::Reversed);
+        let dir = dir_with(vec![reversed.clone()]);
+        assert!(is_known_relay_addr(&dir, reversed.addr));
+        assert!(!is_known_relay_addr(&dir, "203.0.113.5:1".parse().unwrap()));
+    }
+
+    #[test]
+    fn sanitize_candidates_drops_dangerous_addresses() {
+        let candidates: Vec<SocketAddr> = vec![
+            "203.0.113.5:1".parse().unwrap(),
+            "0.0.0.0:1".parse().unwrap(),
+            "239.255.0.1:1".parse().unwrap(),
+            "255.255.255.255:1".parse().unwrap(),
+            "127.0.0.1:1".parse().unwrap(),
+        ];
+        // 送り主がループバックでない → ループバック候補も落とす
+        let kept = sanitize_punch_candidates(&candidates, false);
+        assert_eq!(kept, vec!["203.0.113.5:1".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn sanitize_candidates_allows_loopback_when_sender_is_loopback() {
+        let candidates: Vec<SocketAddr> = vec!["127.0.0.1:1".parse().unwrap()];
+        let kept = sanitize_punch_candidates(&candidates, true);
+        assert_eq!(kept, candidates);
+    }
+
+    #[test]
+    fn sanitize_candidates_caps_at_four() {
+        let candidates: Vec<SocketAddr> = (1u16..=6)
+            .map(|p| format!("203.0.113.5:{}", p).parse().unwrap())
+            .collect();
+        assert_eq!(sanitize_punch_candidates(&candidates, false).len(), 4);
+    }
 }

@@ -119,14 +119,11 @@ document.querySelectorAll('input[name="mode"]').forEach((r) =>
   }),
 );
 
-let plaintextConfirmed = false;
 $("btn-create-id").addEventListener("click", async () => {
   const pass = $("id-pass").value;
-  // パスフレーズ無しは 2 度押しで確認する（ブラウザの confirm は使わない）
-  if (!pass && !plaintextConfirmed) {
-    plaintextConfirmed = true;
-    $("btn-create-id").textContent = "平文のまま作る";
-    toast("パスフレーズなしだと、押収されたとき鍵が平文で読まれます。それでよければもう一度押してください", "warn");
+  // パスフレーズ無しは、平文保存を理解したチェックを入れない限り進めない
+  if (!pass && !$("id-plaintext-ok").checked) {
+    toast("パスフレーズを設定しないなら、チェックを入れて理解したことを示してください", "warn");
     return;
   }
   const id = await busy("鍵を生成しています…", () => invoke("create_identity", { passphrase: pass || null }));
@@ -139,9 +136,14 @@ $("btn-create-id").addEventListener("click", async () => {
 $("connect-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const relay = document.querySelector('input[name="mode"]:checked').value === "relay";
+  const passphrase = $("passphrase").value;
+  if (!passphrase && !$("passphrase-plaintext-ok").checked) {
+    toast("パスフレーズを設定しないなら、チェックを入れて理解したことを示してください", "warn");
+    return;
+  }
   const params = {
     seed: $("seed").value,
-    passphrase: $("passphrase").value || null,
+    passphrase: passphrase || null,
     relay,
     advertise: relay ? $("advertise").value || null : null,
   };
@@ -154,6 +156,7 @@ $("connect-form").addEventListener("submit", async (ev) => {
   toast("参加しました");
   refreshStatus();
   await Promise.all([loadFriends(), loadBoards()]);
+  await loadTalks();
   show("bbs");
 });
 
@@ -198,11 +201,39 @@ async function loadBoards() {
 }
 
 function boardItem(b) {
-  return el(
-    "li",
-    { class: state.board?.uri === b.uri ? "active" : "", onclick: () => openBoard(b) },
-    [document.createTextNode(b.label), el("span", { class: "fp", text: `#${b.fingerprint}` })],
-  );
+  const label = el("span", { class: "board-label", onclick: () => openBoard(b) }, [
+    document.createTextNode(b.label),
+    el("span", { class: "fp", text: `#${b.fingerprint}` }),
+  ]);
+  const children = [label];
+  if (!b.builtin) {
+    // 公式の板は削除できない（ここには来ない：favorites にしか無い）
+    children.push(
+      el("button", {
+        type: "button",
+        class: "board-del",
+        title: "お気に入りから削除",
+        text: "×",
+        onclick: (ev) => {
+          ev.stopPropagation();
+          removeFavoriteBoard(b);
+        },
+      }),
+    );
+  }
+  return el("li", { class: state.board?.uri === b.uri ? "active" : "" }, children);
+}
+
+async function removeFavoriteBoard(b) {
+  const ok = await busy("削除しています…", () => invoke("remove_favorite_board", { uri: b.uri }));
+  if (ok === undefined) return;
+  if (state.board?.uri === b.uri) {
+    state.board = null;
+    state.thread = null;
+    showBbs("empty");
+  }
+  await loadBoards();
+  toast(`${b.label} をお気に入りから削除しました`);
 }
 
 function renderBoardMenu(boards) {
@@ -469,11 +500,38 @@ function openTalk(nodeId) {
   state.active = nodeId;
   state.unread.delete(nodeId);
   $("chat-name").textContent = friendName(nodeId);
+  deleteFriendConfirm = null;
+  $("btn-delete-friend").textContent = "削除";
   renderBubbles();
   renderFriendList();
   showTalkPane("chat");
   $("chat-text").focus();
 }
+
+let deleteFriendConfirm = null;
+$("btn-delete-friend").addEventListener("click", async () => {
+  const nodeId = state.active;
+  if (!nodeId) return;
+  // 2 度押しで確認する（ブラウザの confirm は使わない）
+  if (deleteFriendConfirm !== nodeId) {
+    deleteFriendConfirm = nodeId;
+    $("btn-delete-friend").textContent = "本当に削除";
+    toast("もう一度押すと削除します。トーク履歴も消え、次回の接続からは受信しなくなります", "warn");
+    return;
+  }
+  deleteFriendConfirm = null;
+  $("btn-delete-friend").textContent = "削除";
+  const ok = await busy("削除しています…", () => invoke("remove_friend", { nodeId }));
+  if (ok === undefined) return;
+  const name = friendName(nodeId);
+  state.talks.delete(nodeId);
+  state.unread.delete(nodeId);
+  state.friends = state.friends.filter((f) => f.node_id !== nodeId);
+  state.active = null;
+  renderFriendList();
+  showTalkPane("empty");
+  toast(`${name} を削除しました（次回の接続からは受信しません）`);
+});
 
 const STATUS_TEXT = {
   sending: "送信中…",
@@ -508,7 +566,9 @@ function pushTalk(nodeId, msg) {
 }
 
 function receiveTalk(nodeId, text) {
-  pushTalk(nodeId, { mine: false, text, time: Date.now() });
+  const time = Date.now();
+  pushTalk(nodeId, { mine: false, text, time });
+  persistTalk(nodeId, false, text, time);
   const viewing = state.active === nodeId && $("view-talk").classList.contains("active");
   if (viewing) renderBubbles();
   else {
@@ -516,6 +576,35 @@ function receiveTalk(nodeId, text) {
     toast(`${friendName(nodeId)} からトークが届きました`);
   }
   renderFriendList();
+}
+
+/** トークの保存先（talks.bin）へ 1 件追記する。失敗しても画面表示は止めない */
+async function persistTalk(peer, mine, text, time) {
+  try {
+    await invoke("record_talk_message", { peer, mine, text, time });
+  } catch (e) {
+    log(`トーク履歴の保存に失敗しました: ${e}`, "warn");
+  }
+}
+
+/** 保存済みのトーク履歴を読み込む（接続後、起動時に1回） */
+async function loadTalks() {
+  let talks;
+  try {
+    talks = await invoke("talks");
+  } catch (e) {
+    log(`トーク履歴の読み込みに失敗しました: ${e}`, "warn");
+    return;
+  }
+  for (const [nodeId, list] of Object.entries(talks)) {
+    // 送信状態は保存していない。自分の発言は「送信済み」として出す
+    state.talks.set(
+      nodeId,
+      list.map((m) => ({ mine: m.mine, text: m.text, time: m.time, status: m.mine ? "sent" : undefined })),
+    );
+  }
+  renderFriendList();
+  if (state.active) renderBubbles();
 }
 
 function findByTicket(ticket) {
@@ -540,11 +629,13 @@ $("chat-form").addEventListener("submit", (ev) => {
   if (!text.trim() || !state.active) return;
   const to = state.active;
   const ticket = state.nextTicket++;
-  const msg = { mine: true, text, time: Date.now(), ticket, status: "sending" };
+  const time = Date.now();
+  const msg = { mine: true, text, time, ticket, status: "sending" };
   pushTalk(to, msg);
   $("chat-text").value = "";
   renderBubbles();
   renderFriendList();
+  persistTalk(to, true, text, time);
   // 送信は待たない（遅延放流で数分かかることがある）。状態は SendStatus で更新される
   invoke("send_talk", { to, text, ticket })
     .then(() => {

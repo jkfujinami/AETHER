@@ -5,9 +5,11 @@
 use aether_client::bbs::{ReplyContext, Res, ThreadSummary, ThreadView};
 use aether_client::{
     AetherClient, BoardId, BoardInfo, ClientConfig, Contact, Friend, KeyFiles, NodeMode,
-    RelayOptions, SendReport, Status, builtin_boards, event_channel, friend_uri, parse_friend_id,
+    RelayOptions, SendReport, Status, TalkMessage, builtin_boards, event_channel, friend_uri,
+    parse_friend_id,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -235,6 +237,17 @@ pub async fn create_board(state: State<'_, AppState>, label: String) -> CmdResul
         .map_err(err)
 }
 
+/// お気に入りの板を削除する（公式の板は削除できない）
+#[tauri::command]
+pub async fn remove_favorite_board(state: State<'_, AppState>, uri: String) -> CmdResult<()> {
+    let client = state.client().await?;
+    let id = BoardId::parse(&uri).map_err(err)?;
+    if builtin_boards().into_iter().any(|b| b.uri == id.uri()) {
+        return Err("公式の板は削除できません".into());
+    }
+    client.keys().remove_favorite_board(&id).map_err(err)
+}
+
 /// 共有用の QR（SVG）
 #[tauri::command]
 pub async fn qr_svg(text: String) -> CmdResult<String> {
@@ -337,6 +350,17 @@ pub async fn add_friend(
     Ok(friend)
 }
 
+/// 友だちを削除する（トーク履歴も一緒に消える）
+///
+/// 受信中の購読から即座に外す API は無いので、実際に受信対象から外れるのは
+/// 次回の接続から（画面側でその旨を示すこと）。
+#[tauri::command]
+pub async fn remove_friend(state: State<'_, AppState>, node_id: String) -> CmdResult<()> {
+    let client = state.client().await?;
+    let id = parse_friend_id(&node_id).map_err(err)?;
+    client.keys().remove_friend(&id).map_err(err)
+}
+
 #[derive(Serialize)]
 pub struct MyQr {
     /// QR に入れた文字列（そのまま共有にも使える）
@@ -370,5 +394,30 @@ pub async fn send_talk(
     client
         .send_private_tracked(to, None, text.as_bytes(), ticket)
         .await
+        .map_err(err)
+}
+
+// ---------------------------------------------------------------- トーク履歴の保存
+
+/// 保存済みのトーク履歴を読む（相手の ID(hex) -> 履歴）。起動時（接続後）に呼ぶ
+#[tauri::command]
+pub async fn talks(state: State<'_, AppState>) -> CmdResult<HashMap<String, Vec<TalkMessage>>> {
+    state.client().await?.keys().load_talks().map_err(err)
+}
+
+/// トークを1件保存する。送信状態は含めない（再起動をまたぐと意味を失うため）
+#[tauri::command]
+pub async fn record_talk_message(
+    state: State<'_, AppState>,
+    peer: String,
+    mine: bool,
+    text: String,
+    time: u64,
+) -> CmdResult<()> {
+    let client = state.client().await?;
+    let node_id = parse_friend_id(&peer).map_err(err)?;
+    client
+        .keys()
+        .append_talk_message(&node_id, TalkMessage { mine, text, time })
         .map_err(err)
 }

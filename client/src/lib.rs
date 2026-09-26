@@ -46,6 +46,7 @@ pub mod keys;
 mod pull;
 mod receive;
 mod send;
+pub mod talks;
 
 pub use board::{Board, Post, Thread};
 pub use boards::{BoardId, BoardInfo, builtin_boards, resolve_board};
@@ -58,6 +59,7 @@ pub use friends::{Friend, friend_uri, parse_friend_id};
 pub use keys::KeyFiles;
 pub use receive::Contact;
 pub use send::{PublicPost, SendReport};
+pub use talks::TalkMessage;
 
 /// hex 64 文字を 32 バイトにする（NodeId・共有秘密・content_ref の入力用）
 pub fn parse_hex32(s: &str, what: &str) -> Result<[u8; 32]> {
