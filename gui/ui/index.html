@@ -36,6 +36,8 @@
             <label>パスフレーズ（鍵と保存データを暗号化します）
               <input type="password" id="id-pass" autocomplete="new-password">
             </label>
+            <label class="choice"><input type="checkbox" id="id-plaintext-ok">
+              <span>パスフレーズを設定しません。押収されたとき鍵・保存データが平文で読まれることを理解しました</span></label>
             <button class="primary" id="btn-create-id">鍵を作る</button>
           </div>
 
@@ -47,6 +49,8 @@
               <input type="password" id="passphrase" autocomplete="current-password">
               <span class="hint">未設定だと鍵・友だち・保持データが平文でディスクに残ります</span>
             </label>
+            <label class="choice"><input type="checkbox" id="passphrase-plaintext-ok">
+              <span>パスフレーズを設定しません。押収されたとき鍵・友だち・保持データが平文で読まれることを理解しました</span></label>
 
             <fieldset>
               <legend>参加のしかた</legend>
@@ -182,7 +186,10 @@
           </aside>
 
           <section class="chat" id="chat" hidden>
-            <header class="chat-head" id="chat-name"></header>
+            <header class="chat-head">
+              <span id="chat-name"></span>
+              <button type="button" id="btn-delete-friend" class="chat-delete">削除</button>
+            </header>
             <div class="bubbles" id="bubbles"></div>
             <form class="chat-input" id="chat-form">
               <textarea id="chat-text" rows="1" placeholder="メッセージを入力（Enter で送信、Shift+Enter で改行）"></textarea>

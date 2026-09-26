@@ -25,6 +25,7 @@ fn main() {
             commands::boards,
             commands::join_board,
             commands::create_board,
+            commands::remove_favorite_board,
             commands::qr_svg,
             commands::bbs_threads,
             commands::bbs_open_thread,
@@ -32,8 +33,11 @@ fn main() {
             commands::bbs_reply,
             commands::friends,
             commands::add_friend,
+            commands::remove_friend,
             commands::my_qr,
             commands::send_talk,
+            commands::talks,
+            commands::record_talk_message,
         ])
         .run(tauri::generate_context!())
         .expect("AETHER の起動に失敗しました");
