@@ -77,6 +77,22 @@ const PEX_MAX_INTERVAL: Duration = Duration::from_secs(30);
 /// 1回の PEX で何台に問い合わせるか
 const PEX_FANOUT: usize = 3;
 
+/// 他のリレーの生死を確かめる間隔（常駐ノードだけ）
+///
+/// 落ちたノードの記述子は期限（[`DESCRIPTOR_TTL_SECS`](crate::net::relay_list::DESCRIPTOR_TTL_SECS)）
+/// まで全員の一覧に「到達可能」のまま残り、回路や保持者に選ばれ続ける。
+/// 一覧から無作為に数台ずつ確かめて、応答しないものを自分の一覧から外す。
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 1 回に確かめる台数（全員が全員を確かめると台数の 2 乗で増える）
+///
+/// 一覧をシャッフルして順に巡回するので、どのリレーも `台数 / LIVENESS_SAMPLE` 回以内に
+/// 必ず 1 度は確かめる（毎回無作為に引くと、いつまでも引かれない相手が出る）。
+const LIVENESS_SAMPLE: usize = 3;
+
+/// 応答しなかったとき、外す前にもう一度確かめるまでの間（一時的な不調で外さない）
+const LIVENESS_RECHECK: Duration = Duration::from_secs(5);
+
 /// 1ピアへの Hint 拡散を諦めるまでの時間
 ///
 /// 到達不能なピア（クライアント専用ノード等）が混ざっていても
@@ -216,6 +232,33 @@ impl PacketContext {
         addr == self.descriptor.addr
             || (addr.port() == self.local_addr.port()
                 && (addr.ip().is_loopback() || addr.ip().is_unspecified()))
+    }
+
+    /// `addr` への中継に失敗した。そのリレーが生きているか確かめ、死んでいれば一覧から外す
+    ///
+    /// リレー同士の直接の接続なので、利用者について新たに漏れるものは無い。
+    fn suspect_unreachable(&self, addr: SocketAddr) {
+        if self.is_self(addr) {
+            return;
+        }
+        let router = self.router.clone();
+        let directory = self.directory.clone();
+        let me = self.descriptor.node_id;
+        tokio::spawn(async move {
+            let want = crate::net::addr::normalize(addr);
+            let node_id = directory
+                .read()
+                .await
+                .all()
+                .into_iter()
+                .find(|d| crate::net::addr::normalize(d.addr) == want)
+                .map(|d| d.node_id);
+            if let Some(node_id) = node_id
+                && node_id != me
+            {
+                NodeServer::check_liveness(&router, &directory, node_id).await;
+            }
+        });
     }
 }
 
@@ -531,6 +574,8 @@ impl NodeServer {
         }
         if self.advertise_self {
             self.spawn_resign();
+            // 一回限りのクライアントは確かめない（リレーへの直接の接続で利用者の IP を見せる）
+            self.spawn_liveness();
         }
 
         // **自分がダイヤルした接続も受信を回す。**
@@ -659,12 +704,28 @@ impl NodeServer {
                         .map(|d| crate::net::addr::normalize(d.addr))
                         .collect()
                 };
-                let action = ctx
+                let forwarding_to = Mutex::new(None);
+                let action = match ctx
                     .router
                     .handle_packet(&payload, |next| {
-                        ctx.is_self(next) || known.contains(&crate::net::addr::normalize(next))
+                        let allowed =
+                            ctx.is_self(next) || known.contains(&crate::net::addr::normalize(next));
+                        if allowed {
+                            *forwarding_to.lock().unwrap() = Some(next);
+                        }
+                        allowed
                     })
-                    .await?;
+                    .await
+                {
+                    Ok(action) => action,
+                    Err(e) => {
+                        // 次ホップへ渡せなかった（復号・再送検出の失敗では次ホップは決まらない）
+                        if let Some(next) = *forwarding_to.lock().unwrap() {
+                            ctx.suspect_unreachable(next);
+                        }
+                        return Err(e);
+                    }
+                };
 
                 match action {
                     RoutingAction::Forwarded => {
@@ -691,9 +752,14 @@ impl NodeServer {
                                     // 自分自身が Mailbox に選ばれている場合は素直に保存する
                                     ctx.mailbox.handle_put(payload).await?;
                                 } else if is_known_relay_addr(&*ctx.directory.read().await, dest) {
-                                    ctx.router
+                                    if let Err(e) = ctx
+                                        .router
                                         .send_packet(dest, PacketType::MailboxPut, payload)
-                                        .await?;
+                                        .await
+                                    {
+                                        ctx.suspect_unreachable(dest);
+                                        return Err(e);
+                                    }
                                 } else {
                                     // **転送先は既知リレーに限る。** そうでないと、出口リレーが
                                     // 踏み台や内部アドレスへの任意ダイヤルに使われる。
@@ -708,7 +774,10 @@ impl NodeServer {
                                 if ctx.is_self(dest) {
                                     Box::pin(Self::process_packet(packet_type, inner.to_vec(), ctx.clone())).await?;
                                 } else if is_known_relay_addr(&*ctx.directory.read().await, dest) {
-                                    ctx.router.send_packet(dest, packet_type, inner).await?;
+                                    if let Err(e) = ctx.router.send_packet(dest, packet_type, inner).await {
+                                        ctx.suspect_unreachable(dest);
+                                        return Err(e);
+                                    }
                                 } else {
                                     // **転送先は既知リレーに限る**（MailboxForward と同じ理由）。
                                     debug!("TypedForward dest {} is not a known relay; discarding", dest);
@@ -1172,6 +1241,7 @@ impl NodeServer {
 
                              if let Err(e) = ctx.router.send_packet(next_hop, PacketType::TunnelData, &next_payload).await {
                                   error!("Tunnel forwarding failed: {}", e);
+                                  ctx.suspect_unreachable(next_hop);
                              }
                              return Ok(()); // Lock already dropped or not needed
                         }
@@ -1780,6 +1850,92 @@ impl NodeServer {
                 }
             }
         });
+    }
+
+    /// 一覧のリレーを数台ずつ巡回して確かめ、応答しないものを外す（常駐ノードだけ）
+    fn spawn_liveness(&self) {
+        use rand::seq::SliceRandom;
+
+        let router = self.router.clone();
+        let directory = self.directory.clone();
+        let me = self.descriptor.node_id;
+
+        tokio::spawn(async move {
+            // 1 巡ぶんの順番。空になったら、その時点の一覧をシャッフルして詰め直す
+            let mut round: Vec<NodeId> = Vec::new();
+            loop {
+                tokio::time::sleep(LIVENESS_INTERVAL).await;
+                if round.is_empty() {
+                    round = directory
+                        .read()
+                        .await
+                        .all()
+                        .into_iter()
+                        .map(|d| d.node_id)
+                        .filter(|id| *id != me)
+                        .collect();
+                    round.shuffle(&mut rand::thread_rng());
+                }
+                let take = round.len().min(LIVENESS_SAMPLE);
+                for node_id in round.split_off(round.len() - take) {
+                    let router = router.clone();
+                    let directory = directory.clone();
+                    tokio::spawn(async move {
+                        Self::check_liveness(&router, &directory, node_id).await;
+                    });
+                }
+            }
+        });
+    }
+
+    /// `node_id` のリレー（Tier 0 のみ）が応答するか確かめ、2 回続けて応答しなければ自分の一覧から外す
+    ///
+    /// NodeId を指定して接続する（証明書が NodeId の鍵なので、つながれば鍵の持ち主が
+    /// そこにいる）。外すのは自分の一覧だけで、「死んでいる」とは誰にも配らない
+    /// （[`RelayDirectory::evict`]）。
+    async fn check_liveness(router: &Router, directory: &RwLock<RelayDirectory>, node_id: NodeId) {
+        // 同じ相手の確認を同時に何本も走らせない（中継の失敗が続くと何度も呼ばれる）。
+        // 記録はノード（一覧）ごと。1 プロセスに複数ノードがいても互いに邪魔しない
+        static IN_FLIGHT: std::sync::OnceLock<Mutex<std::collections::HashSet<(usize, NodeId)>>> =
+            std::sync::OnceLock::new();
+        let in_flight = IN_FLIGHT.get_or_init(Default::default);
+        let key = (directory as *const RwLock<RelayDirectory> as usize, node_id);
+        if !in_flight.lock().unwrap().insert(key) {
+            return;
+        }
+
+        // **確かめるのは Tier 0（誰からでも受けられるはず）のリレーだけ。** Punchable・
+        // Reversed はこちらから直接つながらないのが正常で、つながらないことは死んでいる
+        // 証拠にならない（外すと Connection Reversal で保持者になっているノードを消す）
+        let addr = directory
+            .read()
+            .await
+            .get(&node_id)
+            .filter(|d| d.tier == Tier::Open)
+            .map(|d| d.addr);
+        if let Some(addr) = addr
+            && !router.has_live_connection(addr).await
+        {
+            let mut alive = false;
+            for attempt in 0..2 {
+                if router.probe_identity(addr, node_id).await {
+                    alive = true;
+                    break;
+                }
+                if attempt == 0 {
+                    tokio::time::sleep(LIVENESS_RECHECK).await;
+                }
+            }
+            if !alive {
+                let mut dir = directory.write().await;
+                // 確かめている間に別のアドレスで署名し直した記述子が届いていれば外さない
+                if dir.get(&node_id).map(|d| d.addr) == Some(addr) {
+                    dir.evict(&node_id);
+                    info!("Relay {} did not answer at {}; removed from the directory", node_id, addr);
+                }
+            }
+        }
+        in_flight.lock().unwrap().remove(&key);
     }
 
     /// 自分の記述子を定期的に署名し直してディレクトリへ入れ直す

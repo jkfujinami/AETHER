@@ -200,6 +200,11 @@ pub struct RelayDirectory {
     epoch_seed: [u8; 32],
     /// NodeId PoW に要求する難易度
     pow_difficulty: u32,
+    /// 生死の確認で応答せず外したリレーと、外したときの記述子の発行時刻
+    ///
+    /// 外しても、まだ持っている他のノードが PEX で同じ記述子を配ってくる。
+    /// これより新しい（本人が署名し直した＝生きている）記述子だけを受け入れる。
+    evicted: HashMap<NodeId, u64>,
 }
 
 impl Default for RelayDirectory {
@@ -215,6 +220,7 @@ impl RelayDirectory {
             first_seen: HashMap::new(),
             epoch_seed,
             pow_difficulty,
+            evicted: HashMap::new(),
         }
     }
 
@@ -256,6 +262,19 @@ impl RelayDirectory {
                 "RelayDescriptor for {} has expired",
                 descriptor.node_id
             )));
+        }
+
+        // **生死の確認で外したリレーは、署名し直した記述子が届くまで戻さない。**
+        // 同じ記述子を他のノードが PEX で配り続けるので、ここで止めないと
+        // 外しても外しても戻ってくる。
+        if let Some(&evicted_at) = self.evicted.get(&descriptor.node_id) {
+            if descriptor.issued_at <= evicted_at {
+                return Err(AetherError::Protocol(format!(
+                    "RelayDescriptor for {} was evicted as unreachable",
+                    descriptor.node_id
+                )));
+            }
+            self.evicted.remove(&descriptor.node_id);
         }
 
         // **古い記述子で新しいものを上書きさせない。** 署名済みでも、過去に配った
@@ -366,13 +385,28 @@ impl RelayDirectory {
         for id in expired {
             self.remove(&id);
         }
+        // 期限切れの記述子はどのみち受け入れないので、外した記録も要らない
+        self.evicted.retain(|_, issued_at| *issued_at >= cutoff);
         removed
+    }
+
+    /// 生死の確認で応答しなかったリレーを外す
+    ///
+    /// [`remove`](Self::remove) と違い、同じ記述子が PEX で戻ってきても受け入れない
+    /// （本人が署名し直した新しい記述子なら受け入れる）。**外すのは自分の一覧だけ。**
+    /// 「このリレーは死んでいる」を他のノードへ配ると、生きている正直なリレーを
+    /// 網から消せてしまう。
+    pub fn evict(&mut self, node_id: &NodeId) -> Option<RelayDescriptor> {
+        let removed = self.remove(node_id)?;
+        self.evicted.insert(*node_id, removed.issued_at);
+        Some(removed)
     }
 
     /// 検証を省いて登録する（自ノードの記述子・テスト専用）
     ///
     /// **網から受け取った記述子には使わないこと。**
     pub fn insert_unchecked(&mut self, descriptor: RelayDescriptor) {
+        self.evicted.remove(&descriptor.node_id);
         self.store(descriptor);
     }
 
@@ -909,6 +943,23 @@ mod tests {
 
         let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
         assert!(dir.insert(d).is_err());
+    }
+
+    #[test]
+    fn evicted_relay_returns_only_with_a_newer_descriptor() {
+        let id = crate::crypto::identity::Identity::generate();
+        let d = signed_addr(&id, "203.0.113.10:9000");
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        dir.insert(d.clone()).unwrap();
+
+        assert!(dir.evict(&d.node_id).is_some());
+        assert!(dir.insert(d.clone()).is_err(), "PEX で同じ記述子が戻ってきても入れない");
+        assert!(dir.get(&d.node_id).is_none());
+
+        let mut resigned = d.clone();
+        resigned.resign(&id);
+        dir.insert(resigned).expect("署名し直した記述子（＝生きている）は受け入れる");
+        assert!(dir.get(&d.node_id).is_some());
     }
 
     #[test]
