@@ -63,6 +63,7 @@ impl KeyFiles {
         if nickname.is_empty() {
             return Err(ClientError::invalid("表示名を入れてください"));
         }
+        let _lock = crate::keys::settings_lock();
         let hex_id = hex::encode(node_id.as_bytes());
         let mut friends = self.load_friends()?;
         friends.retain(|f| f.node_id != hex_id);
@@ -82,14 +83,18 @@ impl KeyFiles {
     /// 受信中の購読から即座に外す API は無いので、実際に受信対象から外れるのは
     /// 次回の接続から（呼び出し側の画面でその旨を示すこと）。
     pub fn remove_friend(&self, node_id: &NodeId) -> Result<()> {
-        let hex_id = hex::encode(node_id.as_bytes());
-        let mut friends = self.load_friends()?;
-        let before = friends.len();
-        friends.retain(|f| f.node_id != hex_id);
-        if friends.len() == before {
-            return Err(ClientError::invalid("その友だちは登録されていません"));
+        {
+            let _lock = crate::keys::settings_lock();
+            let hex_id = hex::encode(node_id.as_bytes());
+            let mut friends = self.load_friends()?;
+            let before = friends.len();
+            friends.retain(|f| f.node_id != hex_id);
+            if friends.len() == before {
+                return Err(ClientError::invalid("その友だちは登録されていません"));
+            }
+            self.save_friends(&friends)?;
         }
-        self.save_friends(&friends)?;
+        // delete_talk は自分でロックを取るので、ここでは外してから呼ぶ
         self.delete_talk(node_id)?;
         Ok(())
     }

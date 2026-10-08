@@ -156,6 +156,7 @@ impl KeyFiles {
         if label.is_empty() {
             return Err(ClientError::invalid("板の名前を入れてください"));
         }
+        let _lock = crate::keys::settings_lock();
         let mut favs: Vec<Favorite> = match self.read_secure(&self.favorites_path())? {
             Some(json) => serde_json::from_slice(&json).unwrap_or_default(),
             None => Vec::new(),
@@ -177,6 +178,7 @@ impl KeyFiles {
     /// 公式の板はそもそもお気に入りに入っていないので、ここには来ない
     /// （呼び出し側で公式かどうかを確認すること）。
     pub fn remove_favorite_board(&self, id: &BoardId) -> Result<()> {
+        let _lock = crate::keys::settings_lock();
         let uri = id.uri();
         let mut favs: Vec<Favorite> = match self.read_secure(&self.favorites_path())? {
             Some(json) => serde_json::from_slice(&json).unwrap_or_default(),

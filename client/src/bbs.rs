@@ -175,6 +175,7 @@ impl KeyFiles {
     /// [`BBS_THREAD_SECRET_TTL`] を過ぎて書き込みの無い他スレの秘密を掃除する
     /// （書き込み時・読み込み時どちらでも掃除されるよう、ここで一括して行う）。
     fn thread_secret(&self, thread: &[u8; 32]) -> Result<[u8; 32]> {
+        let _lock = crate::keys::settings_lock();
         let now = aether_core::protocol::hint::current_timestamp();
         let mut secrets = self.load_thread_secrets()?;
         secrets

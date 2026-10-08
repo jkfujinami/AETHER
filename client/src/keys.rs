@@ -258,6 +258,17 @@ impl KeyFiles {
     }
 }
 
+/// 設定ファイル（友だち・トーク履歴・お気に入りの板など）の「読む → 変える → 書く」を 1 本ずつにする
+///
+/// GUI のコマンドは 1 プロセスの中で並行に走る（受信が続けて届くと、トーク履歴の保存が
+/// 同時に何本も来る）。並行に読み書きすると、後から書いた方が先の変更を上書きして消す。
+/// 書き換える関数はこれを取ってから読むこと。**取ったまま別の書き換え関数を呼ばない**
+/// （同じロックを二重に取って止まる）。
+pub(crate) fn settings_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `bytes` を `path` へ原子的に書く（unix では所有者だけが読める権限で）
 ///
 /// 書いてから `chmod` すると、書き込みから権限変更までの一瞬 0644 (誰でも読める) の
@@ -271,20 +282,29 @@ fn write_private_atomic(data_dir: &Path, path: &Path, bytes: &[u8]) -> Result<()
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
 
-        // 同時に複数プロセスが書かないので固定名で十分。同じディレクトリに置いて
+        // **一時ファイルは書き込みごとに別の名前にする。** 同じプロセスの中でも同じ
+        // ファイルへの書き込みが同時に走る（GUI のコマンドは並行に動く）。固定名だと
+        // 片方が rename で一時ファイルを持ち去り、もう片方の rename が
+        // 「No such file or directory」で失敗する。同じディレクトリに置いて
         // rename が同一ファイルシステム内で完結するようにする。
-        let tmp_path = path.with_extension("tmp-write");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp_path, path)?;
-        Ok(())
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("tmp-{}-{}", std::process::id(), seq));
+        let written = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp_path)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp_path, path)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        Ok(written?)
     }
 
     #[cfg(not(unix))]

@@ -50,6 +50,7 @@ impl KeyFiles {
     ///
     /// 相手ごとに [`MAX_MESSAGES_PER_PEER`] 件を超えたら、古い方から捨てる。
     pub fn append_talk_message(&self, node_id: &NodeId, message: TalkMessage) -> Result<()> {
+        let _lock = crate::keys::settings_lock();
         let hex_id = hex::encode(node_id.as_bytes());
         let mut talks = self.load_talks()?;
         let list = talks.entry(hex_id).or_default();
@@ -65,6 +66,7 @@ impl KeyFiles {
     ///
     /// 友だちを削除したときに呼ぶ（相手の情報が残っていると、削除した意味が薄れる）。
     pub fn delete_talk(&self, node_id: &NodeId) -> Result<()> {
+        let _lock = crate::keys::settings_lock();
         let hex_id = hex::encode(node_id.as_bytes());
         let mut talks = self.load_talks()?;
         if talks.remove(&hex_id).is_some() {
@@ -127,5 +129,31 @@ mod tests {
         assert!(keys.load_talks().unwrap().is_empty());
         // 存在しない相手を消してもエラーにしない
         keys.delete_talk(&id).unwrap();
+    }
+
+    /// GUI のコマンドは並行に走る。同時に保存しても失敗せず、どの発言も消えない
+    #[test]
+    fn concurrent_appends_keep_every_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = NodeId([6; 32]);
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let path = dir.path();
+                s.spawn(move || {
+                    let keys = KeyFiles::new(path, None);
+                    for i in 0..10 {
+                        keys.append_talk_message(&id, TalkMessage { mine: true, text: format!("{}-{}", t, i), time: i })
+                            .expect("同時に保存しても失敗しない");
+                    }
+                });
+            }
+        });
+        let talks = KeyFiles::new(dir.path(), None).load_talks().unwrap();
+        assert_eq!(talks[&hex::encode(id.as_bytes())].len(), 80, "同時の保存で発言が消えた");
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains("tmp-"))
+            .count();
+        assert_eq!(leftovers, 0, "一時ファイルが残っている");
     }
 }
