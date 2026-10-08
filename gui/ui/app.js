@@ -27,13 +27,20 @@ function el(tag, props = {}, children = []) {
 const state = {
   connected: false,
   receiving: false,
+  // 保存データが暗号化されていて、接続前にパスフレーズを尋ねる必要がある
+  needsPassphrase: false,
+  // 鍵を作った直後だけ、そのとき入れたパスフレーズで接続する（もう一度尋ねない）
+  pendingPassphrase: null,
   // 掲示板
   boards: [], // BoardInfo（公式＋お気に入り）
   board: null, // 開いている板（BoardInfo）
   thread: null, // ThreadView
   // トーク
   friends: [], // [{node_id, nickname, added_at}]
-  talks: new Map(), // node_id -> [{mine, text, time, ticket, status}]
+  // 保存済みの履歴（クライアントが発言の DAG の順に並べたもの）
+  talks: new Map(), // node_id -> [{mine, text, time, id, parents, missing_before}]
+  // まだ送り終えていない自分の発言（送信中・送信待ち・失敗）。送り終えたら履歴に入る
+  pending: new Map(), // node_id -> [{mine, text, time, ticket, status}]
   active: null, // 開いているトークの node_id
   unread: new Map(), // node_id -> 件数
   nextTicket: 1,
@@ -106,20 +113,67 @@ listen("aether-event", ({ payload }) => {
       updateSendStatus(payload.ticket, payload.status);
       break;
     case "received":
-      if (payload.source.type === "contact") receiveTalk(payload.source.node_id, payload.text);
+      if (payload.source.type === "contact") receiveTalk(payload.source.node_id);
       break;
   }
 });
 
-// ================================================================ 接続
+// ================================================================ 設定・接続
 
-document.querySelectorAll('input[name="mode"]').forEach((r) =>
-  r.addEventListener("change", () => {
-    const relay = document.querySelector('input[name="mode"]:checked').value === "relay";
-    $("advertise-row").hidden = !relay;
-    $("presence-row").hidden = !relay;
-  }),
-);
+function updateModeRows() {
+  const relay = document.querySelector('input[name="mode"]:checked').value === "relay";
+  $("advertise-row").hidden = !relay;
+  $("presence-row").hidden = !relay;
+}
+document.querySelectorAll('input[name="mode"]').forEach((r) => r.addEventListener("change", updateModeRows));
+
+/** 画面の入力から設定を組み立てる（パスフレーズは含めない。保存しないため） */
+function readSettings() {
+  return {
+    seed: $("seed").value.trim(),
+    relay: document.querySelector('input[name="mode"]:checked').value === "relay",
+    advertise: $("advertise").value.trim(),
+    auto_connect: $("auto-connect").checked,
+    privacy: {
+      delay_fetch: $("delay-fetch").checked,
+      delay_release: $("delay-release").checked,
+      hide_presence: $("hide-presence").checked,
+      save_talk_history: $("save-talk-history").checked,
+    },
+  };
+}
+
+/** 保存した設定を画面に入れる */
+function fillSettings(s) {
+  $("seed").value = s.seed ?? "";
+  document.querySelector(`input[name="mode"][value="${s.relay === false ? "ephemeral" : "relay"}"]`).checked = true;
+  $("advertise").value = s.advertise ?? "";
+  $("auto-connect").checked = s.auto_connect ?? true;
+  const p = s.privacy ?? {};
+  $("delay-fetch").checked = p.delay_fetch ?? true;
+  $("delay-release").checked = p.delay_release ?? true;
+  $("hide-presence").checked = p.hide_presence ?? false;
+  $("save-talk-history").checked = p.save_talk_history ?? true;
+  updateModeRows();
+}
+
+async function saveSettings() {
+  try {
+    await invoke("save_settings", { settings: readSettings() });
+    return true;
+  } catch (e) {
+    toast(`設定を保存できません: ${e}`, "error");
+    return false;
+  }
+}
+
+// 匿名性の切り替えは押したらすぐ保存する（接続中なら次の送受信から効く）
+for (const id of ["delay-fetch", "delay-release", "hide-presence", "save-talk-history"]) {
+  $(id).addEventListener("change", async () => {
+    if (await saveSettings()) toast(state.connected ? "変更しました（次の送受信から効きます）" : "保存しました");
+  });
+}
+$("auto-connect").addEventListener("change", saveSettings);
 
 $("btn-create-id").addEventListener("click", async () => {
   const pass = $("id-pass").value;
@@ -131,39 +185,67 @@ $("btn-create-id").addEventListener("click", async () => {
   const id = await busy("鍵を生成しています…", () => invoke("create_identity", { passphrase: pass || null }));
   if (!id) return;
   $("identity-card").hidden = true;
-  $("passphrase").value = pass;
+  state.needsPassphrase = !!pass;
+  // 作った直後は、いま入れたパスフレーズで接続する（もう一度尋ねない）
+  state.pendingPassphrase = pass || null;
+  $("id-pass").value = "";
   toast("鍵を作りました");
 });
 
 $("connect-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
-  const relay = document.querySelector('input[name="mode"]:checked').value === "relay";
-  const passphrase = $("passphrase").value;
-  if (!passphrase && !$("passphrase-plaintext-ok").checked) {
-    toast("パスフレーズを設定しないなら、チェックを入れて理解したことを示してください", "warn");
+  if (!(await saveSettings())) return;
+  if (state.connected) {
+    toast("保存しました（種ノード・参加のしかたは次の起動から効きます）");
     return;
   }
-  const params = {
-    seed: $("seed").value,
-    passphrase: passphrase || null,
-    relay,
-    advertise: relay ? $("advertise").value || null : null,
-    hide_presence: relay && $("hide-presence").checked,
-    delay_fetch: $("delay-fetch").checked,
-    delay_release: $("delay-release").checked,
-  };
-  const res = await busy("網に参加しています…", () => invoke("connect", { params }));
-  if (!res) return;
+  startConnect();
+});
+
+/** 接続を始める。保存データが暗号化されていればパスフレーズを尋ねる */
+function startConnect() {
+  if (state.pendingPassphrase) {
+    const pass = state.pendingPassphrase;
+    state.pendingPassphrase = null;
+    connectWith(pass);
+  } else if (state.needsPassphrase) {
+    $("pass-input").value = "";
+    $("pass-dialog").hidden = false;
+    $("pass-input").focus();
+  } else {
+    connectWith(null);
+  }
+}
+
+$("pass-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const pass = $("pass-input").value;
+  if (!pass) return;
+  $("pass-dialog").hidden = true;
+  // 違っていたらもう一度尋ねる
+  if (!(await connectWith(pass))) startConnect();
+});
+$("pass-cancel").addEventListener("click", () => {
+  $("pass-dialog").hidden = true;
+  show("settings");
+});
+
+async function connectWith(passphrase) {
+  const res = await busy("網に参加しています…", () => invoke("connect", { passphrase }));
+  $("pass-input").value = "";
+  if (!res) return false;
   state.receiving = res.receiving;
   setConnected(true);
-  $("btn-connect").disabled = true;
+  $("btn-connect").textContent = "保存";
+  $("connect-note").hidden = false;
   $("receive-warn").hidden = res.receiving;
   toast("参加しました");
   refreshStatus();
   await Promise.all([loadFriends(), loadBoards()]);
   await loadTalks();
   show("bbs");
-});
+  return true;
+}
 
 async function refreshStatus() {
   try {
@@ -472,7 +554,7 @@ function renderFriendList() {
   ul.replaceChildren();
   $("friend-empty").hidden = state.friends.length > 0;
   // 最後にやりとりした順（LINE と同じ）
-  const last = (id) => state.talks.get(id)?.at(-1);
+  const last = (id) => messagesOf(id).at(-1);
   const sorted = [...state.friends].sort((a, b) => (last(b.node_id)?.time ?? 0) - (last(a.node_id)?.time ?? 0));
   for (const f of sorted) {
     const m = last(f.node_id);
@@ -530,6 +612,7 @@ $("btn-delete-friend").addEventListener("click", async () => {
   if (ok === undefined) return;
   const name = friendName(nodeId);
   state.talks.delete(nodeId);
+  state.pending.delete(nodeId);
   state.unread.delete(nodeId);
   state.friends = state.friends.filter((f) => f.node_id !== nodeId);
   state.active = null;
@@ -550,14 +633,23 @@ function statusText(m) {
   return STATUS_TEXT[m.status] ?? "";
 }
 
+/** 表示する発言：保存済みの履歴（DAG の順）の後ろに、送り終えていない自分の発言 */
+function messagesOf(nodeId) {
+  return [...(state.talks.get(nodeId) ?? []), ...(state.pending.get(nodeId) ?? [])];
+}
+
 function renderBubbles() {
   const box = $("bubbles");
   box.replaceChildren();
-  for (const m of state.talks.get(state.active) ?? []) {
+  for (const m of messagesOf(state.active)) {
+    // 親の一部がまだ届いていない＝この前に届いていない発言がある
+    if (m.missing_before) box.append(el("div", { class: "gap", text: "この前に、まだ届いていない発言があります" }));
     const meta = el("div", { class: "meta" });
     if (m.mine) {
-      const pending = m.status !== "sent" && m.status !== "failed";
-      meta.append(el("span", { class: `status ${pending ? "pending" : m.status}`, text: statusText(m) }));
+      // 履歴にあるのは送り終えた発言だけ
+      const status = m.ticket ? m.status : "sent";
+      const pending = status !== "sent" && status !== "failed";
+      meta.append(el("span", { class: `status ${pending ? "pending" : status}`, text: statusText({ ...m, status }) }));
     }
     meta.append(el("span", { text: hhmm(new Date(m.time)) }));
     box.append(el("div", { class: `msg ${m.mine ? "mine" : "theirs"}` }, [el("div", { class: "bubble", text: m.text }), meta]));
@@ -565,15 +657,18 @@ function renderBubbles() {
   box.scrollTop = box.scrollHeight;
 }
 
-function pushTalk(nodeId, msg) {
-  if (!state.talks.has(nodeId)) state.talks.set(nodeId, []);
-  state.talks.get(nodeId).push(msg);
+/** 1 人とのトーク履歴を読み直す（受信・送信の完了のたびに。遅れて届いた発言も書かれた位置に入る） */
+async function reloadTalk(nodeId) {
+  try {
+    state.talks.set(nodeId, await invoke("talk", { peer: nodeId }));
+  } catch (e) {
+    log(`トーク履歴の読み込みに失敗しました: ${e}`, "warn");
+  }
 }
 
-function receiveTalk(nodeId, text) {
-  const time = Date.now();
-  pushTalk(nodeId, { mine: false, text, time });
-  persistTalk(nodeId, false, text, time);
+async function receiveTalk(nodeId) {
+  // 受け取った発言はクライアントが履歴に入れてある
+  await reloadTalk(nodeId);
   const viewing = state.active === nodeId && $("view-talk").classList.contains("active");
   if (viewing) renderBubbles();
   else {
@@ -581,15 +676,6 @@ function receiveTalk(nodeId, text) {
     toast(`${friendName(nodeId)} からトークが届きました`);
   }
   renderFriendList();
-}
-
-/** トークの保存先（talks.bin）へ 1 件追記する。失敗しても画面表示は止めない */
-async function persistTalk(peer, mine, text, time) {
-  try {
-    await invoke("record_talk_message", { peer, mine, text, time });
-  } catch (e) {
-    log(`トーク履歴の保存に失敗しました: ${e}`, "warn");
-  }
 }
 
 /** 保存済みのトーク履歴を読み込む（接続後、起動時に1回） */
@@ -601,19 +687,13 @@ async function loadTalks() {
     log(`トーク履歴の読み込みに失敗しました: ${e}`, "warn");
     return;
   }
-  for (const [nodeId, list] of Object.entries(talks)) {
-    // 送信状態は保存していない。自分の発言は「送信済み」として出す
-    state.talks.set(
-      nodeId,
-      list.map((m) => ({ mine: m.mine, text: m.text, time: m.time, status: m.mine ? "sent" : undefined })),
-    );
-  }
+  for (const [nodeId, list] of Object.entries(talks)) state.talks.set(nodeId, list);
   renderFriendList();
   if (state.active) renderBubbles();
 }
 
 function findByTicket(ticket) {
-  for (const list of state.talks.values()) {
+  for (const list of state.pending.values()) {
     const m = list.find((x) => x.ticket === ticket);
     if (m) return m;
   }
@@ -636,16 +716,19 @@ $("chat-form").addEventListener("submit", (ev) => {
   const ticket = state.nextTicket++;
   const time = Date.now();
   const msg = { mine: true, text, time, ticket, status: "sending" };
-  pushTalk(to, msg);
+  if (!state.pending.has(to)) state.pending.set(to, []);
+  state.pending.get(to).push(msg);
   $("chat-text").value = "";
   renderBubbles();
   renderFriendList();
-  persistTalk(to, true, text, time);
-  // 送信は待たない（遅延放流で数分かかることがある）。状態は SendStatus で更新される
+  // 送信は待たない（遅延放流で数分かかることがある）。状態は SendStatus で更新される。
+  // 送り終えた発言はクライアントが履歴に入れるので、送信中の吹き出しを外して読み直す
   invoke("send_talk", { to, text, ticket })
-    .then(() => {
-      msg.status = "sent";
-      renderBubbles();
+    .then(async () => {
+      state.pending.set(to, (state.pending.get(to) ?? []).filter((m) => m !== msg));
+      await reloadTalk(to);
+      if (state.active === to) renderBubbles();
+      renderFriendList();
     })
     .catch((e) => {
       msg.status = "failed";
@@ -701,7 +784,12 @@ $("add-friend-form").addEventListener("submit", async (ev) => {
   setConnected(false);
   showBbs("empty");
   showTalkPane("empty");
+  show("settings");
   const info = await invoke("app_info");
-  $("identity-card").hidden = info.has_identity;
   log(`データの保存先: ${info.data_dir}`);
+  $("identity-card").hidden = info.has_identity;
+  state.needsPassphrase = info.needs_passphrase;
+  fillSettings(info.settings ?? {});
+  // 保存した設定があり、自動接続が有効なら、そのまま接続を試みる
+  if (info.settings?.auto_connect && info.settings.seed) startConnect();
 })();

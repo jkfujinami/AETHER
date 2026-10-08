@@ -8,7 +8,8 @@ use aether_client::{
     RelayOptions, SendReport, Status, TalkMessage, builtin_boards, event_channel, friend_uri,
     parse_friend_id,
 };
-use serde::{Deserialize, Serialize};
+use crate::settings::{self, Settings};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -53,16 +54,43 @@ fn err(e: impl std::fmt::Display) -> String {
 pub struct AppInfo {
     data_dir: String,
     has_identity: bool,
+    /// 保存データが暗号化されている（接続前にパスフレーズを尋ねる）
+    needs_passphrase: bool,
     connected: bool,
+    /// 保存した設定（初回起動なら None）
+    settings: Option<Settings>,
 }
 
 #[tauri::command]
 pub async fn app_info(state: State<'_, AppState>) -> CmdResult<AppInfo> {
+    let keys = KeyFiles::new(&state.data_dir, None);
     Ok(AppInfo {
         data_dir: state.data_dir.display().to_string(),
-        has_identity: KeyFiles::new(&state.data_dir, None).has_identity(),
+        has_identity: keys.has_identity(),
+        needs_passphrase: keys.needs_passphrase(),
         connected: state.client.read().await.is_some(),
+        settings: settings::load(&state.data_dir),
     })
+}
+
+/// 設定を保存する。接続中なら匿名性の切り替えをすぐ反映する
+///
+/// 種ノード・参加のしかた・広告アドレスは次の接続（起動）から効く。
+#[tauri::command]
+pub async fn save_settings(state: State<'_, AppState>, settings: Settings) -> CmdResult<()> {
+    settings::save(&state.data_dir, &settings)?;
+    if let Some(client) = state.client.read().await.as_ref() {
+        client.set_privacy(privacy_of(&settings));
+    }
+    Ok(())
+}
+
+/// 実際に使う匿名性の設定（在席を隠すのは常駐のときだけ意味がある）
+fn privacy_of(settings: &Settings) -> aether_client::PrivacyOptions {
+    aether_client::PrivacyOptions {
+        hide_presence: settings.relay && settings.privacy.hide_presence,
+        ..settings.privacy.clone()
+    }
 }
 
 /// 私信の身元（identity.key）を作る。返り値は NodeId（hex）
@@ -76,29 +104,6 @@ pub async fn create_identity(
     Ok(hex::encode(id.public_id().as_bytes()))
 }
 
-#[derive(Deserialize)]
-pub struct ConnectParams {
-    seed: String,
-    passphrase: Option<String>,
-    /// 常駐（リレー）として参加するか。トークの受信には必須
-    relay: bool,
-    /// リレーとして到達可能と宣言するアドレス（空なら STUN で判定）
-    advertise: Option<String>,
-    /// 在席を隠す（起動後のプレキー束の公開を遅らせる。既定は無効）
-    #[serde(default)]
-    hide_presence: bool,
-    /// 受信した本体を取りに行くのを 0〜60 秒ずらす（既定は有効）
-    #[serde(default = "yes")]
-    delay_fetch: bool,
-    /// Hint の放流を流量に応じて遅らせる（既定は有効）
-    #[serde(default = "yes")]
-    delay_release: bool,
-}
-
-fn yes() -> bool {
-    true
-}
-
 #[derive(Serialize)]
 pub struct Connected {
     /// 私信の宛先としての自分（鍵が無ければ None）
@@ -108,26 +113,35 @@ pub struct Connected {
 }
 
 #[tauri::command]
+/// 保存した設定で網に参加する（先に [`save_settings`] で保存しておく）
+///
+/// `passphrase` は保存データが暗号化されていれば必須（設定には保存しない）。
 pub async fn connect(
     app: AppHandle,
     state: State<'_, AppState>,
-    params: ConnectParams,
+    passphrase: Option<String>,
 ) -> CmdResult<Connected> {
     if state.client.read().await.is_some() {
         return Err("既に接続しています".into());
     }
+    let settings = settings::load(&state.data_dir)
+        .ok_or("設定がまだありません。設定タブで種ノードを入れてください")?;
+    let passphrase = passphrase.filter(|p| !p.is_empty());
+    if passphrase.is_none() && KeyFiles::new(&state.data_dir, None).needs_passphrase() {
+        return Err("保存データが暗号化されています。パスフレーズを入れてください".into());
+    }
 
-    let seed: SocketAddr = params
+    let seed: SocketAddr = settings
         .seed
         .trim()
         .parse()
-        .map_err(|_| format!("種ノードのアドレスが不正です: {}", params.seed))?;
-    let advertise = match params.advertise.as_deref().map(str::trim) {
-        Some(a) if !a.is_empty() => Some(
+        .map_err(|_| format!("種ノードのアドレスが不正です: {}", settings.seed))?;
+    let advertise = match settings.advertise.trim() {
+        "" => None,
+        a => Some(
             a.parse::<SocketAddr>()
                 .map_err(|_| format!("広告アドレスが不正です: {}", a))?,
         ),
-        _ => None,
     };
 
     // イベントを画面へ中継する（接続前から流す：到達性判定などの進捗が見える）
@@ -146,7 +160,7 @@ pub async fn connect(
         }
     });
 
-    let mode = if params.relay {
+    let mode = if settings.relay {
         NodeMode::Relay(RelayOptions {
             advertise,
             ..Default::default()
@@ -157,18 +171,14 @@ pub async fn connect(
     let client = AetherClient::start(
         ClientConfig {
             data_dir: state.data_dir.clone(),
-            passphrase: params.passphrase.filter(|p| !p.is_empty()),
+            passphrase,
             // 到達アドレスを宣言したら、そのポートで待ち受ける（0 だと宣言と食い違う）
             port: advertise.map(|a| a.port()).unwrap_or(0),
             seed: Some(seed),
             min_relays: 3,
             mode,
             network: Default::default(),
-            privacy: aether_client::PrivacyOptions {
-                delay_fetch: params.delay_fetch,
-                delay_release: params.delay_release,
-                hide_presence: params.relay && params.hide_presence,
-            },
+            privacy: privacy_of(&settings),
         },
         events,
     )
@@ -176,7 +186,7 @@ pub async fn connect(
     .map_err(err)?;
 
     // 常駐で鍵があれば、友だち全員からのトークを受信する
-    let receiving = params.relay && client.keys().has_identity();
+    let receiving = settings.relay && client.keys().has_identity();
     if receiving {
         let contacts = client
             .keys()
@@ -423,19 +433,12 @@ pub async fn talks(state: State<'_, AppState>) -> CmdResult<HashMap<String, Vec<
     state.client().await?.keys().load_talks().map_err(err)
 }
 
-/// トークを1件保存する。送信状態は含めない（再起動をまたぐと意味を失うため）
+/// 1 人とのトーク履歴を読む（発言の DAG の順・欠けの印つき）
+///
+/// 履歴は送信・受信のたびにクライアントが保存している。画面は受信や送信の完了の
+/// たびにこれで読み直す（遅れて届いた発言は、届いた順ではなく書かれた位置に入る）。
 #[tauri::command]
-pub async fn record_talk_message(
-    state: State<'_, AppState>,
-    peer: String,
-    mine: bool,
-    text: String,
-    time: u64,
-) -> CmdResult<()> {
-    let client = state.client().await?;
+pub async fn talk(state: State<'_, AppState>, peer: String) -> CmdResult<Vec<TalkMessage>> {
     let node_id = parse_friend_id(&peer).map_err(err)?;
-    client
-        .keys()
-        .append_talk_message(&node_id, TalkMessage { mine, text, time })
-        .map_err(err)
+    state.client().await?.keys().load_talk(&node_id).map_err(err)
 }

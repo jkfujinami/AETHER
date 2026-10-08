@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod settings;
 
 use tauri::Manager;
 
@@ -21,6 +22,7 @@ fn main() {
             commands::app_info,
             commands::create_identity,
             commands::connect,
+            commands::save_settings,
             commands::status,
             commands::boards,
             commands::join_board,
@@ -37,7 +39,7 @@ fn main() {
             commands::my_qr,
             commands::send_talk,
             commands::talks,
-            commands::record_talk_message,
+            commands::talk,
         ])
         .run(tauri::generate_context!())
         .expect("AETHER の起動に失敗しました");

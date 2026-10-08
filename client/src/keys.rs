@@ -122,6 +122,22 @@ impl KeyFiles {
         self.identity_path().exists()
     }
 
+    /// 保存データの解錠にパスフレーズが要るか（鍵や設定ファイルのどれかが暗号化されている）
+    ///
+    /// 起動時に尋ねるかを決めるのに使う。パスフレーズ自体はどこにも保存しない。
+    pub fn needs_passphrase(&self) -> bool {
+        let Ok(entries) = std::fs::read_dir(&self.data_dir) else {
+            return false;
+        };
+        entries.flatten().any(|e| {
+            let path = e.path();
+            path.is_file()
+                && std::fs::read(&path).is_ok_and(|b| {
+                    b.starts_with(SECURE_MAGIC) || Identity::is_encrypted_bytes(&b)
+                })
+        })
+    }
+
     /// 私信の身元を新しく作って保存する
     ///
     /// `force` なしで既存の鍵を上書きしない（NodeId が変わると連絡先から届かなくなる）。
@@ -330,6 +346,18 @@ mod tests {
         // 2 回目は同じ鍵を読む（ガードの実績・PoW をやり直さない）
         let again = keys.load_or_create_relay_identity().unwrap();
         assert_eq!(relay.public_id(), again.public_id());
+    }
+
+    #[test]
+    fn needs_passphrase_detects_encrypted_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!KeyFiles::new(dir.path(), None).needs_passphrase(), "空なら要らない");
+        KeyFiles::new(dir.path(), None).create_identity(false).unwrap();
+        assert!(!KeyFiles::new(dir.path(), None).needs_passphrase(), "平文の鍵だけなら要らない");
+
+        let dir = tempfile::tempdir().unwrap();
+        KeyFiles::new(dir.path(), Some("pass".into())).create_identity(false).unwrap();
+        assert!(KeyFiles::new(dir.path(), None).needs_passphrase(), "暗号化した鍵がある");
     }
 
     #[test]

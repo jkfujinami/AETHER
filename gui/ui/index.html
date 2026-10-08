@@ -14,9 +14,9 @@
         <img src="icon.png" alt="" width="28" height="28">
         <span>AETHER</span>
       </div>
-      <button class="nav-item active" data-view="connect">接続</button>
       <button class="nav-item" data-view="bbs" data-needs-connection>掲示板</button>
       <button class="nav-item" data-view="talk" data-needs-connection>トーク<span class="badge" id="talk-badge" hidden></span></button>
+      <button class="nav-item active" data-view="settings">設定</button>
       <button class="nav-item" data-view="log">ログ</button>
       <div class="sidebar-foot">
         <div class="conn-state" id="conn-state">未接続</div>
@@ -25,15 +25,15 @@
     </nav>
 
     <main class="content">
-      <!-- 接続 -->
-      <section class="view active" id="view-connect">
+      <!-- 設定 -->
+      <section class="view active" id="view-settings">
         <div class="page">
-          <h1>網に参加する</h1>
+          <h1>設定</h1>
 
           <div class="card" id="identity-card" hidden>
             <h2>自分の鍵を作る</h2>
             <p class="muted">トークの宛先になる鍵です。掲示板だけなら無くても使えます。</p>
-            <label>パスフレーズ（鍵と保存データを暗号化します）
+            <label>パスフレーズ（鍵と保存データを暗号化します。起動のたびに尋ねます）
               <input type="password" id="id-pass" autocomplete="new-password">
             </label>
             <label class="choice"><input type="checkbox" id="id-plaintext-ok">
@@ -42,15 +42,10 @@
           </div>
 
           <form class="card" id="connect-form">
+            <h2>接続</h2>
             <label>種ノード
               <input id="seed" placeholder="例: 127.0.0.1:19001" required spellcheck="false">
             </label>
-            <label>パスフレーズ
-              <input type="password" id="passphrase" autocomplete="current-password">
-              <span class="hint">未設定だと鍵・友だち・保持データが平文でディスクに残ります</span>
-            </label>
-            <label class="choice"><input type="checkbox" id="passphrase-plaintext-ok">
-              <span>パスフレーズを設定しません。押収されたとき鍵・友だち・保持データが平文で読まれることを理解しました</span></label>
 
             <fieldset>
               <legend>参加のしかた</legend>
@@ -64,18 +59,25 @@
               <input id="advertise" placeholder="例: 127.0.0.1:19010" spellcheck="false">
             </label>
 
-            <fieldset>
-              <legend>匿名性のための遅延（切ると速くなる代わりに守りが弱まります）</legend>
-              <label class="choice"><input type="checkbox" id="delay-fetch" checked>
-                <span>受け取りをずらす ── 届いたトークを取りに行くのを 0〜60 秒ずらします（送り主に受け取った人を特定されにくくなります）</span></label>
-              <label class="choice"><input type="checkbox" id="delay-release" checked>
-                <span>送信の告知を遅らせる ── 大きなファイルほど、告知（Hint）を流すまで待ちます（送信と告知を結びつけられにくくなります）</span></label>
-              <label class="choice" id="presence-row"><input type="checkbox" id="hide-presence">
-                <span>在席を隠す ── 起動直後の数分はトークの初回接触を受けられないことがあります（参加したことを悟られにくくなります）</span></label>
-            </fieldset>
+            <label class="choice"><input type="checkbox" id="auto-connect" checked>
+              <span>起動したら、この設定で自動的に接続する</span></label>
 
-            <button class="primary" type="submit" id="btn-connect">参加する</button>
+            <p class="hint" id="connect-note" hidden>接続中です。種ノード・参加のしかたの変更は次の起動から効きます。</p>
+            <button class="primary" type="submit" id="btn-connect">保存して接続</button>
           </form>
+
+          <div class="card" id="privacy-card">
+            <h2>匿名性</h2>
+            <p class="muted">切ると速く・便利になる代わりに守りが弱まります。変えるとすぐ保存され、接続中でも次の送受信から効きます。</p>
+            <label class="choice"><input type="checkbox" id="delay-fetch" checked>
+              <span><strong>受け取りをずらす</strong> ── 届いたトークを取りに行くのを 0〜60 秒ずらします（送り主に受け取った人を特定されにくくなります）</span></label>
+            <label class="choice"><input type="checkbox" id="delay-release" checked>
+              <span><strong>送信の告知を遅らせる</strong> ── 大きなファイルほど、告知（Hint）を流すまで待ちます（送信と告知を結びつけられにくくなります）</span></label>
+            <label class="choice" id="presence-row"><input type="checkbox" id="hide-presence">
+              <span><strong>在席を隠す</strong> ── 起動直後の数分はトークの初回接触を受けられないことがあります（参加したことを悟られにくくなります）。次の起動から効きます</span></label>
+            <label class="choice"><input type="checkbox" id="save-talk-history" checked>
+              <span><strong>トーク履歴を端末に保存する</strong> ── 切ると会話が端末に残りません（パスフレーズがあれば暗号化して保存します）。切った間は発言の前後関係（遅れて届いた発言の並べ直し）も使えません</span></label>
+          </div>
         </div>
       </section>
 
@@ -244,6 +246,18 @@
   </div>
 
   <div class="popup" id="popup" hidden></div>
+  <div class="busy" id="pass-dialog" hidden>
+    <form class="busy-box pass-box" id="pass-form">
+      <div>保存データが暗号化されています</div>
+      <label>パスフレーズ
+        <input type="password" id="pass-input" autocomplete="current-password">
+      </label>
+      <div class="pass-actions">
+        <button class="primary" type="submit">接続する</button>
+        <button type="button" id="pass-cancel">今は接続しない</button>
+      </div>
+    </form>
+  </div>
   <div class="busy" id="busy" hidden>
     <div class="busy-box">
       <div class="spinner"></div>

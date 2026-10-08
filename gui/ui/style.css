@@ -230,6 +230,8 @@ button:disabled { opacity: .5; cursor: default; }
 .msg.theirs .meta { align-items: flex-start; }
 .msg .status.pending { color: var(--talk-meta); }
 .msg .status.failed { color: #ffdddd; font-weight: 700; }
+/* 親の一部がまだ届いていない発言の前に出す（遅れて届けば消える） */
+.bubbles .gap { align-self: center; font-size: 11px; color: var(--talk-meta); padding: 2px 10px; border: 1px dashed var(--talk-meta); border-radius: 10px; }
 .chat-input { display: flex; gap: 8px; padding: 10px 12px; background: var(--talk-list); border-top: 1px solid var(--border); }
 .chat-input textarea { flex: 1; resize: none; max-height: 140px; border-radius: 18px; padding: 8px 14px; }
 .chat-input .send { background: var(--talk-mine); color: #fff; border: none; border-radius: 18px; font-weight: 700; }
@@ -251,6 +253,8 @@ button:disabled { opacity: .5; cursor: default; }
 .busy[hidden] { display: none; }
 .busy-box { background: var(--panel); border-radius: 10px; padding: 22px 28px; min-width: 300px; max-width: 460px; text-align: center; }
 .busy-box #busy-detail { margin-top: 6px; min-height: 1.2em; overflow-wrap: anywhere; }
+.pass-box { text-align: left; display: flex; flex-direction: column; gap: 12px; }
+.pass-actions { display: flex; gap: 8px; }
 .spinner { width: 26px; height: 26px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; margin: 0 auto 12px; animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
