@@ -10,7 +10,6 @@ use crate::error::{ClientError, Result};
 use crate::events::{self, ClientEvent, MessageSource};
 use crate::pull::PullSession;
 use aether_core::crypto::identity::{Identity, NodeId};
-use aether_core::crypto::x3dh::PreKeySecrets;
 use aether_core::mailbox::schrodinger::SchrodingerMailbox;
 use aether_core::storage::keystore::KeyStore;
 use aether_core::net::tunnel::TunnelEndpoint;
@@ -43,19 +42,6 @@ const MAX_FETCH_ATTEMPTS: u32 = 3;
 /// Hint の再放流（18.3-A）はしない。発見は索引（pull）が担い、再放流すると取得した人の数
 /// だけ同じ投稿の Hint が網全体に流れ続ける。
 const RESEED_INTERVAL: Duration = Duration::from_secs(6 * 3600);
-/// 在席を隠す設定のとき、起動後に最初にプレキー束を置くまでの最大の遅れ
-///
-/// 束の置き場所は NodeId から誰でも計算できるので、その保持者は「いつ置き直されたか」を
-/// 見られる。以前は 10 分ごとに置き直していて、保持者に在席を 10 分刻みで知らせていた
-/// （公開リレー一覧の出入りと突き合わせると IP を絞り込める）。いまは起動時に一度、
-/// 以後は置き場所が変わる期間ごとに一度、期間内のランダムな時刻に置く。
-/// 起動時の遅れは [`crate::PrivacyOptions::hide_presence`] で有効にする（既定は無効）。
-const PREKEY_FIRST_DELAY_MAX: Duration = Duration::from_secs(300);
-/// 起動後の 1 回目のあと、リレー一覧が揃ってから置き直すまでの最短の待ち（最長はこの 3 倍）
-const PREKEY_SETTLE_MIN: Duration = Duration::from_secs(60);
-/// プレキー束を置けなかったときの再試行間隔
-const PREKEY_RETRY: Duration = Duration::from_secs(300);
-
 /// Hint を見つけてから本体を取りに行くまでの最大の遅れ
 const FETCH_JITTER_MAX: Duration = Duration::from_secs(60);
 /// ダミーの取得の平均間隔
@@ -64,19 +50,6 @@ const COVER_FETCH_MEAN: Duration = Duration::from_secs(90);
 /// 取りに行くまでの遅れ（0〜FETCH_JITTER_MAX の一様乱数）
 fn fetch_jitter() -> Duration {
     Duration::from_millis(rand::random::<u64>() % FETCH_JITTER_MAX.as_millis() as u64)
-}
-
-/// 0〜`max` の一様乱数
-fn random_below(max: Duration) -> Duration {
-    Duration::from_millis(rand::random::<u64>() % (max.as_millis() as u64).max(1))
-}
-
-/// 次の期間の中のランダムな時刻までの待ち時間（プレキー束の置き直し）
-fn until_random_point_in_next_period(now: u64) -> Duration {
-    use aether_core::mailbox::schrodinger::PREKEY_PERIOD_SECS;
-    let next_start = (SchrodingerMailbox::prekey_period(now) + 1) * PREKEY_PERIOD_SECS;
-    let at = next_start + rand::random::<u64>() % PREKEY_PERIOD_SECS;
-    Duration::from_secs(at - now)
 }
 
 /// 次のダミー取得までの間隔（指数分布：いつ来るか予測できない）
@@ -152,7 +125,6 @@ impl AetherClient {
             ));
         }
         let identity = self.keys.load_identity()?;
-        self.ensure_prekeys()?;
 
         let mut subs = Subscriptions::default();
         for c in contacts {
@@ -210,85 +182,6 @@ impl AetherClient {
         Ok(())
     }
 
-    /// 自分のプレキー束を網へ公開し続ける（誰からでも初回接触を受けられるように）
-    pub fn start_prekey_publisher(self: &Arc<Self>) -> Result<()> {
-        self.ensure_prekeys()?;
-        let this = self.clone();
-        tokio::spawn(async move {
-            // 在席を隠す設定なら、起動直後に置かず少しずらす（「この人が今起動した」が
-            // 保持者に見えるため）。ただし今の期間にも前の期間にも束を置いていなければ
-            // （初めての起動・長く離れていた）、置くまで誰からも初回接触を受けられない
-            // ので、設定に関わらずすぐに置く
-            let period = SchrodingerMailbox::prekey_period(aether_core::protocol::hint::current_timestamp());
-            let reachable = this
-                .keystore()
-                .and_then(|ks| Ok(ks.load_prekey_period()?))
-                .ok()
-                .flatten()
-                .is_some_and(|last| last + 1 >= period);
-            if this.privacy().hide_presence && reachable {
-                tokio::time::sleep(random_below(PREKEY_FIRST_DELAY_MAX)).await;
-            }
-            // 起動直後の 1 回目は、リレー一覧が出揃う前に置くことがある（保持者の計算が
-            // 取りに来る側とずれる）。1 回目の後、一覧が揃ってからもう一度だけ早めに置き直す
-            let mut settled = false;
-            loop {
-                let wait = match this.publish_prekeys_once().await {
-                    Ok(()) => {
-                        events::progress(&this.events, "プレキー束を公開しました");
-                        if settled {
-                            until_random_point_in_next_period(aether_core::protocol::hint::current_timestamp())
-                        } else {
-                            settled = true;
-                            PREKEY_SETTLE_MIN + random_below(PREKEY_SETTLE_MIN * 2)
-                        }
-                    }
-                    Err(e) => {
-                        events::warning(&this.events, format!("プレキー公開に失敗: {}", e));
-                        PREKEY_RETRY
-                    }
-                };
-                tokio::time::sleep(wait).await;
-            }
-        });
-        Ok(())
-    }
-
-    /// 自分のプレキー束をいますぐ 1 回置く（試験・初回設定用）
-    ///
-    /// 通常は [`start_prekey_publisher`](Self::start_prekey_publisher) が、在席を悟られない
-    /// よう遅らせて置く。すぐに初回接触を受けたい場合に使う。
-    pub async fn publish_prekeys_now(&self) -> Result<()> {
-        self.ensure_prekeys()?;
-        self.publish_prekeys_once().await
-    }
-
-    async fn publish_prekeys_once(&self) -> Result<()> {
-        use aether_core::net::gossip::GossipClient;
-        use aether_core::net::relay::RelayClient;
-
-        let bundle = self
-            .keystore()?
-            .load_prekeys()?
-            .map(|(b, _)| b)
-            .ok_or_else(|| ClientError::invalid("プレキーが未生成です"))?;
-
-        // 束が途中で消えると、置き直すまで誰からも初回接触を受けられない
-        let circuit = self.open_probed_circuit(&[]).await?.circuit;
-        let mailbox = SchrodingerMailbox::with_directory(
-            Arc::new(circuit.client),
-            Arc::new(GossipClient::new(RelayClient::new()?)),
-            Arc::new(std::sync::Mutex::new(HashMap::new())),
-            self.node.directory(),
-        );
-        let period = SchrodingerMailbox::prekey_period(aether_core::protocol::hint::current_timestamp());
-        mailbox.publish_prekey_bundle(&bundle, period).await?;
-        self.keystore()?.save_prekey_period(period)?;
-        // 書いた直後に接続を閉じるとシャードが失われる
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        Ok(())
-    }
-
     async fn open_receive_session(&self, secrets: &HashMap<NodeId, [u8; 32]>) -> Result<LiveSession> {
         let PullSession {
             mailbox,
@@ -310,10 +203,12 @@ impl AetherClient {
 
         let me = identity.public_id();
         let keystore = self.keystore()?;
-        let prekeys = keystore.load_prekeys()?.map(|(_, s)| s);
-        // 本体の TTL を過ぎた処理済みの目印を掃除する（起動のたびに 1 回）
+        // 本体の TTL を過ぎた処理済みの目印と、期限の切れた招待を掃除する（起動のたびに 1 回）
         if let Err(e) = keystore.prune_seen() {
             events::warning(&self.events, format!("処理済みの目印を掃除できません: {}", e));
+        }
+        if let Err(e) = keystore.prune_invites(aether_core::protocol::hint::current_timestamp()) {
+            events::warning(&self.events, format!("期限の切れた友だちコードを掃除できません: {}", e));
         }
         // 認識に使う秘密：購読（静的な DH・板の鍵）＋会話ごとの Hint 鍵チェーン（昨日・今日・明日）
         let secrets_now = || {
@@ -486,7 +381,7 @@ impl AetherClient {
                             continue;
                         }
                         let had_session = keystore.contains(contact);
-                        match open_private_body(&keystore, &identity, prekeys.as_ref(), &me, contact, &body) {
+                        match open_private_body(&keystore, &identity, &me, contact, &body) {
                             Ok(Some(msg)) => {
                                 if !had_session {
                                     // 会話が立った。相手はこれから Hint 鍵チェーンで送ってくる
@@ -654,26 +549,31 @@ fn add_private(subs: &mut Subscriptions, identity: &Identity, c: &Contact) -> Re
     Ok(())
 }
 
-/// 受信した私信フレームを開く（X3DH 初回接触 or 継続ラチェット）
-///
-/// 初回接触なら自分のプレキー秘密で respond して `SK` を復元しセッションを立てる。
-/// 継続なら保存済みセッションで開く。開けたらラチェットを進めて保存する。
 /// 受け取った初回メッセージから応答側のセッションを立てる
+///
+/// 相手が使った招待（[`InitialMessage::invite_key`]）の秘密で `SK` を復元する。
+/// 使い終えて消した・作っていない招待なら `None`。
+///
+/// [`InitialMessage::invite_key`]: aether_core::crypto::x3dh::InitialMessage::invite_key
 fn responder_session(
+    keystore: &KeyStore,
     identity: &Identity,
-    prekeys: Option<&PreKeySecrets>,
     init: &aether_core::crypto::x3dh::InitialMessage,
 ) -> Option<aether_core::crypto::session::Session> {
     use aether_core::crypto::session::Session;
-    let secrets = prekeys?;
-    let sk = aether_core::crypto::x3dh::respond(identity, secrets, init).ok()?;
+    let secrets = keystore.load_invite_secrets(&init.invite_key).ok()??;
+    let sk = aether_core::crypto::x3dh::respond(identity, &secrets, init).ok()?;
     Some(Session::responder(&sk, &secrets.signed_prekey_secret, init.ephemeral_key))
 }
 
+/// 受信した私信フレームを開く（X3DH 初回接触 or 継続ラチェット）
+///
+/// 初回接触なら、相手が使った招待の秘密で respond して `SK` を復元しセッションを立てる。
+/// 立てたセッションを保存したら、その招待の秘密は消す（使い捨て ＝ 初回メッセージの前方秘匿）。
+/// 継続なら保存済みセッションで開く。開けたらラチェットを進めて保存する。
 fn open_private_body(
     keystore: &KeyStore,
     identity: &Identity,
-    prekeys: Option<&PreKeySecrets>,
     me: &NodeId,
     contact: &NodeId,
     body: &[u8],
@@ -685,6 +585,8 @@ fn open_private_body(
     };
 
     let existing = keystore.load(contact)?;
+    // 新しく立てたセッションの元になった招待（保存できたら消す）
+    let mut consumed_invite = None;
     let mut session = match (initial, existing) {
         (None, Some(s)) => s,
         (None, None) => return Ok(None), // 初回メッセージを添えた 1 通がまだ届いていない
@@ -699,16 +601,21 @@ fn open_private_body(
                 Some(s) if s.peer_initial_ek == Some(init.ephemeral_key) => s,
                 // 互いに同時に初回接触した。NodeId の小さい側の接触を採る。
                 // こちらが勝つなら、相手の 1 通は使い捨てのセッションで開くだけにして保存しない
-                // （相手はこちらの初回メッセージを受け取って、こちらのセッションに乗り換える）
+                // （相手はこちらの初回メッセージを受け取って、こちらのセッションに乗り換える。
+                // 乗り換えるまでの相手の数通もこの招待で開くので、招待はここでは消さない）
                 Some(s) if s.pending_initial.is_some() && me.as_bytes() < contact.as_bytes() => {
-                    let Some(mut temp) = responder_session(identity, prekeys, &init) else {
+                    let Some(mut temp) = responder_session(keystore, identity, &init) else {
                         return Ok(None);
                     };
                     return Ok(temp.open(sealed, &[]).ok());
                 }
-                // それ以外（初めての接触・相手が状態を失って接触し直した・同時接触でこちらが負け）
-                _ => match responder_session(identity, prekeys, &init) {
-                    Some(s) => s,
+                // それ以外（初めての接触・相手が状態を失って新しいコードで接触し直した・
+                // 同時接触でこちらが負け）
+                _ => match responder_session(keystore, identity, &init) {
+                    Some(s) => {
+                        consumed_invite = Some(init.invite_key);
+                        s
+                    }
                     None => return Ok(None),
                 },
             }
@@ -718,6 +625,9 @@ fn open_private_body(
     match session.open(sealed, &[]) {
         Ok(pt) => {
             keystore.save(contact, &session)?;
+            if let Some(key) = consumed_invite {
+                keystore.remove_invite_secrets(&key)?;
+            }
             Ok(Some(pt))
         }
         Err(_) => Ok(None),

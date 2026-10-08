@@ -288,17 +288,21 @@ board_key = H("aether_board_key_v1" ‖ BoardId)   ← BoardId（ID）を知る�
 初回接触の初期秘密は **X3DH**（非同期鍵合意）で確立します：
 
 ```
-受信側 Bob: プレキー束（署名付きプレキー + 耐量子KEM公開鍵）を
-            H("aether_prekey_v1" ‖ BobのNodeId) に公開しておく
-送信側 Alice: 束を取得 → 一時鍵 + Bobのプレキー + ML-KEM で初期秘密 SK を計算
+受信側 Bob: 招待（署名付きプレキー + 耐量子KEM公開鍵・使い捨て）を作り、
+            友だちコード aether:… に入れて Alice へ手渡す（網には置かない）
+送信側 Alice: 招待 → 一時鍵 + Bobのプレキー + ML-KEM で初期秘密 SK を計算
             → 初回本文に InitialMessage を前置して送る
-Bob: InitialMessage から同じ SK を復元 → 以降はラチェットで会話
+Bob: InitialMessage が示す招待の秘密で同じ SK を復元し、その秘密を消す
+     → 以降はラチェットで会話
 ```
 
+- **招待を網に置かない理由**：網に置くと、置き場所は NodeId から誰でも計算でき、作れるのは本人だけなので、置かれた時刻＝本人が起動していた時刻になる。公開のリレー一覧の出入りと突き合わせると、NodeId と IP が 1〜2 回の起動でつながる。時刻をずらしても情報は対数でしか減らないので、**置く出来事そのものを無くした**（Signal 方式の網上のプレキー束から、SimpleX 方式の帯域外の招待へ）。
+- **初回メッセージの前方秘匿**：招待の鍵は招待ごとに作り、受け取ったら消す。渡す相手ごとに新しいコードを作る（30 日で期限切れ）。
+
 - **耐量子ハイブリッド**：X25519 に加え **ML-KEM(Kyber768)** の共有秘密を混ぜる（harvest-now-decrypt-later 対策）。
-- **署名は SK でなくプレキーにだけ**掛かる（否認可能性）。署名は署名付きプレキー・KEM公開鍵・ID鍵の3点を1つで覆い、MITM の差し替えを弾く。
+- **署名は SK でなく招待にだけ**掛かる（否認可能性）。署名は NodeId・署名付きプレキー・期限・KEM公開鍵をまとめて覆い、MITM の差し替えや期限の延長を弾く。
 - **認識と本文の分離**：Hint 認識（blind_tag）と Mailbox 位置は、相手の NodeId から自動合意する静的鍵（`identity.agree`）のまま。前方秘匿は**本文だけ**に掛ける。だから X3DH 配線は既存フローへの**追加**であって作り直しではない。
-- `--to <NodeId>` だけで送れます（`--secret` の手渡しは不要。省略時は自動鍵合意）。
+- 初めての相手には `aether invite` で作った友だちコードを渡し合い、`--to aether:<相手のコード>` で送ります（`--secret` の手渡しは不要）。会話が立った後は `--to <NodeId>` だけで送れます。
 
 ### 10. エポックビーコン
 
@@ -324,7 +328,7 @@ Bob: InitialMessage から同じ SK を復元 → 以降はラチェットで会
 | ファイル | 中身 | 暗号化 |
 |---|---|---|
 | `identity.key` | Ed25519 秘密鍵（＝ID そのもの） | `[AEIK][salt][nonce][ct]` 80B・誤パスは拒否 |
-| `keystore.db` | 連絡先ごとのラチェット状態・自分のプレキー秘密 | 値ごとに暗号化・カナリアで誤パス検出 |
+| `keystore.db` | 連絡先ごとのラチェット状態・渡した招待の秘密・受け取った招待 | 値ごとに暗号化・カナリアで誤パス検出 |
 | `mailbox.db` | 保持中のシャード・索引・トンネル本文 | 値ごとに暗号化 |
 
 パスフレーズ無しには**成りすましも過去の連絡先状態の読み出しもできません**。ラチェットの前方秘匿と合わせ、押収時点で「これから使う鍵」しか残らない設計です。
@@ -390,12 +394,12 @@ aether get --board <雑談 | aether-board:…> --ref <hex> [--out <path>] --conn
 **Phase 3 完了**：
 - ① 前方秘匿（Double Ratchet を私信に配線）
 - ② Dandelion++（stem/fluff + echo 再送で黒穴でも配送保証）
-- ③ 自動鍵合意（`--secret` 手渡しの排除）+ **full prekey X3DH 配線**（プレキー公開/取得・InitialMessage・実網実証）
+- ③ 自動鍵合意（`--secret` 手渡しの排除）+ **X3DH 配線**（友だちコードで手渡す使い捨ての招待・InitialMessage）
 - ④ 耐量子ハイブリッド（X25519 + ML-KEM を X3DH に）
 - 保存時暗号化（identity / keystore / mailbox）
 - エポックビーコン（drand・opt-in）
 
-**残り（roadmap）**：使い捨てプレキー（OPK）プール / 未承諾初回接触の受信箱チャネル / エポックの BLS 検証 or 網内伝播（drand 足跡の除去）/ FU ボタン / 実 NAT 検証 / セキュリティ監査。
+**残り（roadmap）**：受け手が選ぶ受け箱（送り手が本体の保持者を選べるため、取得の時刻から起動の時刻が漏れる。Part 24 の続き）/ 未承諾初回接触の受信箱チャネル / エポックの BLS 検証 or 網内伝播（drand 足跡の除去）/ FU ボタン / 実 NAT 検証 / セキュリティ監査。
 
 lib + integration テストと clippy 0 を CI 前提にしている（`cargo test` / `cargo clippy --all-targets`）。
 
@@ -423,7 +427,7 @@ core/                Rust ライブラリ本体（部品：回路・Mailbox・�
                      relay_list(directory) · epoch(drand) · pex · punch · reachability · guard …
   src/node/          server(パケット処理) · router · peer
   src/mailbox/       schrodinger(配置/取得) · sharding(RS) · index · chunk · board(DAG) · server(sled)
-  src/storage/       keystore(ラチェット/プレキー永続化) · at_rest(Argon2id+ChaCha20)
+  src/storage/       keystore(ラチェット/招待の永続化) · at_rest(Argon2id+ChaCha20)
   src/protocol/      wire(パケット型) · hint
   tests/             e2e_*（gossip 伝播 / トンネル / 回路分離 / bootstrap …）
 client/              aether-client（送る・探す・取る・受けるの手順。CLI と GUI が共有）

@@ -4,6 +4,7 @@
 //! aether init                        鍵を生成して保存する
 //! aether start --connect <種ノード>   ネットワークに参加して常駐する
 //! aether id                          保存済みの Node ID を表示する
+//! aether invite                      友だちコードを作る（相手 1 人に 1 つ渡す）
 //! ```
 
 use aether_client::{
@@ -28,8 +29,10 @@ aether init                                       鍵を生成\n  \
 aether start --connect <種>:<port>                常駐（リレー / 受信）\n  \
 aether start --subscribe 雑談                     板を購読して受信\n  \
 \n  \
-# 私信（相手と秘密を事前共有）\n  \
-aether send --to <NodeId> --secret <hex> --message \"やあ\" --connect <種>\n  \
+# 私信（友だちコードを交換してから）\n  \
+aether invite                                     自分の友だちコードを作る\n  \
+aether start --contact aether:<相手のコード>        相手を受信対象にして常駐\n  \
+aether send --to aether:<相手のコード> --message \"やあ\" --connect <種>\n  \
 \n  \
 # 公開：投稿・ファイル共有・掲示板\n  \
 aether send --board 雑談 --message \"本文\" --connect <種>\n  \
@@ -100,9 +103,11 @@ enum Commands {
         #[arg(long, default_value_t = 16)]
         pow_difficulty: u32,
 
-        /// 受信したい相手 `<NodeId hex>:<共有秘密 hex>`（複数指定可）
+        /// 受信したい相手（複数指定可）
         ///
-        /// **共有秘密は事前共有が前提。** X3DH は未実装。
+        /// 相手の友だちコード `aether:…`（相手が `aether invite` で作ったもの）か、
+        /// NodeId（hex）。コードなら、こちらからも会話を始められるよう招待を保存する。
+        /// `<NodeId hex>:<共有秘密 hex>` で事前共有の秘密も指定できる。
         /// 1つでも指定すると受信用の Inbound Tunnel を張り、
         /// 自分宛ての Hint を手元で拾って本文を表示する。
         #[arg(long = "contact")]
@@ -122,20 +127,15 @@ enum Commands {
         #[arg(long)]
         epoch_beacon: bool,
 
-        /// 在席を隠す：起動後に最初にプレキー束を置くのを 0〜5 分ランダムに遅らせる
-        ///
-        /// 束の保持者に「今起動した」を悟られにくくなる代わりに、起動直後の数分は
-        /// 初回接触を受けられないことがある（既定は無効）。
-        #[arg(long)]
-        hide_presence: bool,
     },
     /// メッセージを送る（私信 or 公開）
     ///
     /// 私信は `--to`＋`--secret`（事前共有）、板への書き込みは `--board`。
     Send {
-        /// 宛先の Node ID (hex 64文字)。私信のとき指定
+        /// 宛先。私信のとき指定
         ///
-        /// `--secret` を省くと、相手の NodeId から**自動で鍵合意**する（3-1 ③）。
+        /// 相手の友だちコード `aether:…` か NodeId（hex 64 文字）。初めて送る相手には
+        /// 友だちコードが要る（中の招待で初回の鍵を合意する）。会話が立った後は NodeId でよい。
         #[arg(long)]
         to: Option<String>,
 
@@ -226,11 +226,25 @@ enum Commands {
     },
     /// 保存済みの Node ID を表示する
     Id,
+    /// 友だちコードを作る（相手 1 人に 1 つ渡す）
+    ///
+    /// コードには、相手がこちらへ初回の 1 通を送るための招待（使い捨ての鍵）が入る。
+    /// 網には何も出さない。30 日で期限が切れる。常駐中の `start` と同じデータディレクトリでは
+    /// 実行できない（鍵の保存先を 1 つのプロセスしか開けない）。
+    Invite,
 }
 
-/// `<NodeId hex>[:<共有秘密 hex>]` を分解する（秘密を省くと NodeId から自動鍵合意）
+/// 受信したい相手を分解する
+///
+/// 友だちコード（`aether:…`）か `<NodeId hex>[:<共有秘密 hex>]`（秘密を省くと NodeId から自動鍵合意）。
 fn parse_contact(spec: &str) -> Result<Contact, Box<dyn Error>> {
     use aether_core::crypto::identity::NodeId;
+    if spec.starts_with(aether_client::friends::FRIEND_URI_PREFIX) {
+        return Ok(Contact {
+            node_id: aether_client::parse_friend_code(spec)?.node_id,
+            secret: None,
+        });
+    }
     Ok(match spec.split_once(':') {
         Some((id, secret)) => Contact {
             node_id: NodeId(parse_hex32(id, "--contact の NodeId")?),
@@ -250,14 +264,13 @@ fn env_passphrase() -> Option<String> {
     std::env::var("AETHER_PASSPHRASE").ok().filter(|p| !p.is_empty())
 }
 
-/// 全体のフラグから匿名性の遅延の切り替えを作る（在席を隠すかは `start` だけ）
+/// 全体のフラグから匿名性の遅延の切り替えを作る
 fn privacy_of(cli: &Cli) -> PrivacyOptions {
     PrivacyOptions {
         delay_fetch: !cli.no_fetch_delay,
         delay_release: !cli.no_release_delay,
         // CLI は会話の平文を端末に残さない（受信は表示するだけ）
         save_talk_history: false,
-        ..Default::default()
     }
 }
 
@@ -365,6 +378,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("{}", keys.load_identity()?.public_id());
         }
 
+        Commands::Invite => {
+            let identity = keys.load_identity()?;
+            let keystore = keys.open_keystore()?;
+            let code = aether_client::friends::create_friend_code(&identity, &keystore)?;
+            println!("{}", code);
+            eprintln!();
+            eprintln!("このコードを 1 人に渡してください（使い捨て・30 日で期限切れ）。");
+            eprintln!("相手はこのコードで、あなたへ最初の 1 通を送れます。");
+        }
+
         Commands::Send {
             to,
             secret,
@@ -397,12 +420,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             let report = match (to, board) {
                 (Some(to), None) => {
-                    let target = NodeId(parse_hex32(to, "--to")?);
+                    let code = aether_client::parse_friend_code(to)?;
+                    let target: NodeId = code.node_id;
                     let secret = secret.as_deref().map(|s| parse_hex32(s, "--secret")).transpose()?;
-                    if secret.is_none() {
-                        println!("相手の NodeId から鍵を自動合意します（--secret 不要）");
-                    }
                     let client = join_ephemeral(privacy_of(&cli), cli.data_dir.clone(), *port, connect, *min_relays).await?;
+                    if code.invite.is_some() {
+                        // 招待を保存する（会話がまだ無ければ、これで初回の鍵を合意する）
+                        client.accept_friend_code(to)?;
+                    }
                     let r = client.send_private(target, secret, &content).await?;
                     // 書き出し終える前に終了すると、置いたはずのシャードが失われる
                     client.flush().await;
@@ -487,10 +512,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             contacts,
             subscribe,
             epoch_beacon,
-            hide_presence,
         } => {
             println!("Node ID: {}", keys.load_identity()?.public_id());
-            let contacts = contacts
+            let contacts_parsed = contacts
                 .iter()
                 .map(|c| parse_contact(c))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -511,10 +535,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         epoch_beacon: *epoch_beacon,
                     }),
                     network: Default::default(),
-                    privacy: PrivacyOptions {
-                        hide_presence: *hide_presence,
-                        ..privacy_of(&cli)
-                    },
+                    privacy: privacy_of(&cli),
                 },
                 events,
             )
@@ -524,15 +545,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             println!("待ち受け開始。Ctrl+C で停止します");
 
-            if !contacts.is_empty() || !subscribe.is_empty() {
+            // 友だちコードで渡された相手は、招待を保存しておく（こちらからも会話を始められる）
+            for spec in contacts.iter().filter(|c| c.starts_with(aether_client::friends::FRIEND_URI_PREFIX)) {
+                client.accept_friend_code(spec)?;
+            }
+            if !contacts_parsed.is_empty() || !subscribe.is_empty() {
                 let boards = subscribe
                     .iter()
                     .map(|b| Ok((aether_client::resolve_board(b)?, b.clone())))
                     .collect::<aether_client::Result<Vec<_>>>()?;
-                client.start_receiving(contacts, boards).await?;
+                client.start_receiving(contacts_parsed, boards).await?;
             }
-            // 誰からでも初回接触を受けられるよう、プレキー束を網へ公開しておく
-            client.start_prekey_publisher()?;
 
             let status = client.clone();
             tokio::spawn(async move {

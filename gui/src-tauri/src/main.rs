@@ -36,7 +36,7 @@ fn main() {
             commands::friends,
             commands::add_friend,
             commands::remove_friend,
-            commands::my_qr,
+            commands::create_friend_code,
             commands::send_talk,
             commands::talks,
             commands::talk,

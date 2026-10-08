@@ -126,7 +126,7 @@ async fn private_message_first_contact_over_three_hops() {
     .await
     .unwrap();
 
-    // Bob のリレーが網に広まり、プレキー束が置かれるまで待つ
+    // Bob のリレーが網に広まるまで待つ
     wait_until("bob's relay spreads", Duration::from_secs(20), || {
         let relays = relays.clone();
         let bob_relay = bob.node().descriptor.node_id;
@@ -147,9 +147,8 @@ async fn private_message_first_contact_over_three_hops() {
         async move { bob.status().await.known_relays >= 7 }
     })
     .await;
-    // プレキー束を置く（定期の公開は在席を悟られないよう遅らせるので、ここでは即座に置く。
-    // 置く前に取りに行くと初回接触が失敗する）
-    bob.publish_prekeys_now().await.expect("Bob のプレキー束を置けない");
+    // Bob の友だちコード（招待入り）。網には何も置かず、Alice へ手渡す
+    let bob_code = bob.create_friend_code().expect("Bob の友だちコード");
 
     // --- 送信者：一回限り ---
     let alice = AetherClient::start(ephemeral(alice_dir.path(), seed), event_channel())
@@ -161,6 +160,7 @@ async fn private_message_first_contact_over_three_hops() {
         async move { alice.status().await.known_relays >= 8 }
     })
     .await;
+    alice.accept_friend_code(&bob_code).expect("Bob のコードを受け取る");
     alice
         .send_private(bob_id, None, b"hi bob, over three hops")
         .await
@@ -222,8 +222,12 @@ async fn private_conversation_round_trip_over_three_hops() {
     bob.start_receiving(vec![Contact { node_id: alice_id, secret: None }], Vec::new())
         .await
         .unwrap();
-    alice.publish_prekeys_now().await.expect("Alice のプレキー束");
-    bob.publish_prekeys_now().await.expect("Bob のプレキー束");
+    // 友だちコードを交換する（網の外で手渡す想定）
+    alice
+        .accept_friend_code(&bob.create_friend_code().unwrap())
+        .expect("Bob のコードを受け取る");
+    bob.accept_friend_code(&alice.create_friend_code().unwrap())
+        .expect("Alice のコードを受け取る");
 
     // 1. 初回接触（静的な DH の Hint ＋ X3DH の初回メッセージ）
     alice.send_private(bob_id, None, b"hello bob").await.expect("send 1");

@@ -121,7 +121,7 @@ pub struct Session {
 impl Session {
     /// 開始側（X3DH の initiator）のセッション
     ///
-    /// `peer_signed_prekey` は相手のプレキー束の SPK 公開鍵。`initial` は相手へ添える
+    /// `peer_signed_prekey` は相手の招待の SPK 公開鍵。`initial` は相手へ添える
     /// 初回メッセージで、相手から 1 通受け取るまで送るたびに添える。
     pub fn initiator(sk: &[u8; 32], peer_signed_prekey: &[u8; 32], initial: InitialMessage) -> Self {
         Self {
@@ -134,7 +134,7 @@ impl Session {
 
     /// 応答側（X3DH の responder）のセッション
     ///
-    /// `my_signed_prekey_secret` は自分の SPK 秘密鍵、`initial_ek` は受け取った初回メッセージの一時鍵。
+    /// `my_signed_prekey_secret` は自分の招待の SPK 秘密鍵、`initial_ek` は受け取った初回メッセージの一時鍵。
     pub fn responder(sk: &[u8; 32], my_signed_prekey_secret: &[u8; 32], initial_ek: [u8; 32]) -> Self {
         Self {
             ratchet: Ratchet::init_bob(sk, my_signed_prekey_secret),
@@ -198,12 +198,13 @@ pub(crate) fn test_pair() -> (Session, Session) {
     use crate::crypto::x3dh;
     let alice = Identity::generate();
     let bob = Identity::generate();
-    let (bundle, secrets) = x3dh::generate_prekeys(&bob, false);
-    let (sk_a, init) = x3dh::initiate(&alice, &bob.public_id(), &bundle).unwrap();
+    let now = crate::protocol::hint::current_timestamp();
+    let (invite, secrets) = x3dh::create_invite(&bob, now + 3600);
+    let (sk_a, init) = x3dh::initiate(&alice, &bob.public_id(), &invite, now).unwrap();
     let sk_b = x3dh::respond(&bob, &secrets, &init).unwrap();
     let ek = init.ephemeral_key;
     (
-        Session::initiator(&sk_a, &bundle.signed_prekey, init),
+        Session::initiator(&sk_a, &invite.signed_prekey, init),
         Session::responder(&sk_b, &secrets.signed_prekey_secret, ek),
     )
 }

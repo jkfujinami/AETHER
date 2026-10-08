@@ -18,6 +18,8 @@ rand.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 hex.workspace = true
+# 友だちコード（招待）を文字にする。Kyber の公開鍵で 1.3KB あるので hex では長すぎる
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3.24.0"

@@ -1,4 +1,4 @@
-//! 取得 ── 索引の検索・本体の取得・プレキー束の取得
+//! 取得 ── 索引の検索・本体の取得
 //!
 //! どれも [`PullSession`](crate::pull::PullSession) の上で行う。要求は 3 ホップ回路で出し、
 //! 返信は Inbound Tunnel で戻る。保持者に自分の IP は見えない。
@@ -11,10 +11,9 @@
 
 use crate::board::{Board, build_board};
 use crate::client::AetherClient;
-use crate::error::{ClientError, Result};
+use crate::error::Result;
 use crate::events;
 use crate::pull::PullSession;
-use aether_core::crypto::identity::NodeId;
 use crate::boards::BoardId;
 use aether_core::mailbox::chunk::Manifest;
 use aether_core::mailbox::index::IndexDescriptor;
@@ -32,8 +31,6 @@ const SEARCH_WAIT: Duration = Duration::from_secs(8);
 const SEARCH_QUIET: Duration = Duration::from_millis(1500);
 /// 本体・チャンクを待つ上限
 const OBJECT_WAIT: Duration = Duration::from_secs(15);
-/// プレキー束を待つ上限
-const PREKEY_WAIT: Duration = Duration::from_secs(10);
 /// 返信の到着を見に行く間隔
 const POLL: Duration = Duration::from_millis(100);
 
@@ -160,33 +157,6 @@ impl AetherClient {
             got.iter().all(Option::is_some)
         })
         .await
-    }
-
-    /// 相手のプレキー束を網から取得する（X3DH 初回接触）
-    pub(crate) async fn fetch_prekey_bundle(
-        &self,
-        target: &NodeId,
-    ) -> Result<aether_core::crypto::x3dh::PreKeyBundle> {
-        let session = self.open_pull_session(HashMap::new()).await?;
-        let period = SchrodingerMailbox::prekey_period(aether_core::protocol::hint::current_timestamp());
-        session.mailbox.request_prekey_bundle(target, period).await?;
-
-        let mut collected = Vec::new();
-        let until = tokio::time::Instant::now() + PREKEY_WAIT;
-        while tokio::time::Instant::now() < until {
-            let raw = self.take_replies(&session.receive_tunnel_id).await?;
-            if !raw.is_empty() {
-                collected.extend(session.mailbox.decrypt_replies(&raw));
-                if let Some(bundle) = session.mailbox.reassemble_prekey_bundle(&collected, target, period)? {
-                    return Ok(bundle);
-                }
-            }
-            tokio::time::sleep(POLL).await;
-        }
-        Err(ClientError::network(format!(
-            "プレキー束を取得できません（相手 {} が公開していない／オフライン）",
-            target
-        )))
     }
 
     /// 複数のオブジェクトをまとめて要求し、並行に集める

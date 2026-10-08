@@ -2,28 +2,33 @@
 //!
 //! # 何のためか
 //!
-//! Double Ratchet を始めるには両者が共有する初期秘密 `SK` が要る。今は `--secret` を
-//! **手渡し**しているが、これは運用が苦しく、鍵配送そのものが攻撃面になる。
-//! X3DH は「相手がオフラインでも」初期秘密を安全に確立する（Signal の初回鍵合意）。
+//! Double Ratchet を始めるには両者が共有する初期秘密 `SK` が要る。X3DH は「相手が
+//! オフラインでも」初期秘密を安全に確立する（Signal の初回鍵合意）。
 //!
-//! - Bob は事前に**プレキー束**（署名付きプレキー＋任意の使い捨てプレキー）を公開しておく。
-//! - Alice はそれを取ってきて `SK` を計算し、最初のメッセージに自分の公開鍵を添える。
-//! - Bob は後からそれを見て同じ `SK` を復元する。
+//! - Bob は**招待**（署名付きプレキー＋ML-KEM 公開鍵）を作り、友だちコードに入れて手渡す。
+//! - Alice はそれで `SK` を計算し、最初のメッセージに自分の公開鍵を添える。
+//! - Bob は後からそれを見て同じ `SK` を復元し、使った招待の秘密を消す。
+//!
+//! # 招待は網に置かない
+//!
+//! 以前は Bob がプレキー束を網に置き、場所を NodeId から誰でも計算できた。束を作れるのは
+//! 本人だけなので、束が現れた時刻は「本人が起動していた時刻」になる。公開のリレー一覧の
+//! 出入りと突き合わせると、NodeId と IP が 1〜2 回の起動でつながった（Part 24 の L1）。
+//! 置く時刻をずらしても情報は対数でしか減らない。
+//!
+//! 招待は友だちの NodeId を網の外で交換するときに一緒に渡す。網に置く出来事そのものが
+//! 無いので、観測できるものが無い。初回の後は Double Ratchet が鍵を回すので、招待は二度と
+//! 要らない。
 //!
 //! # 得られる性質
 //!
 //! - **相互認証**: 双方の**恒久 ID 鍵**（AETHER の NodeId 由来 X25519）が DH に入る。
-//! - **前方秘匿**: Alice の一時鍵 / Bob の使い捨てプレキーが入るので、恒久鍵が後で
-//!   漏れても、この初回秘密は復元されない。
-//! - **否認可能性**: 署名は SK でなく**プレキー**にだけ掛かる。会話内容の署名は残らない。
-//!
-//! # AETHER への組み込み（配線側）
-//!
-//! Bob のプレキー束は索引/連絡先発見で配る。得た `SK` を
-//! [`crate::crypto::ratchet::Ratchet::init_alice`] / `init_bob` に渡し、Bob の
-//! **署名付きプレキー**をそのままラチェットの初期鍵として使う（Signal と同じ）。
+//! - **初回メッセージの前方秘匿**: 招待の鍵は招待ごとに作り、受け取ったら消す（使い捨て）。
+//!   恒久鍵が後で漏れても、この初回秘密は復元されない。
+//! - **耐量子**: ML-KEM (Kyber768) の共有秘密も `SK` に混ぜる。KEM の鍵も招待ごとに使い捨て。
+//! - **否認可能性**: 署名は `SK` でなく**招待**にだけ掛かる。会話内容の署名は残らない。
 
-use crate::crypto::identity::{verify_signature, Identity, NodeId};
+use crate::crypto::identity::{verify_signature, x25519_public_from_node_id, Identity, NodeId};
 use crate::error::{AetherError, Result};
 use hkdf::Hkdf;
 use pqcrypto_kyber::kyber768;
@@ -33,38 +38,44 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-/// Bob が公開するプレキー束
+/// 招待の形式の版
+const INVITE_VERSION: u8 = 1;
+/// ML-KEM (Kyber768) 公開鍵の長さ
+const KEM_PUBLIC_LEN: usize = 1184;
+/// Ed25519 署名の長さ
+const SIGNATURE_LEN: usize = 64;
+/// 招待のバイト列の長さ: 版 ‖ NodeId ‖ 署名付きプレキー ‖ 期限 ‖ KEM 公開鍵 ‖ 署名
+pub const INVITE_LEN: usize = 1 + 32 + 32 + 8 + KEM_PUBLIC_LEN + SIGNATURE_LEN;
+
+/// Bob が友だちコードに入れて手渡す招待（X3DH のプレキー束に当たる）
 ///
-/// `signed_prekey` は Bob の NodeId（Ed25519）で署名されている。これがラチェットの
-/// 初期鍵も兼ねる。`one_time_prekey` は1回使い切りで前方秘匿を強める（任意）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PreKeyBundle {
-    /// Bob の恒久 ID 鍵（X25519 公開・NodeId から導出）
-    pub identity_key: [u8; 32],
-    /// Bob の NodeId（署名検証に使う）
+/// 鍵は招待ごとに作る。`signed_prekey` は招待を見分ける ID とラチェットの初期鍵を兼ねる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invite {
+    /// Bob の NodeId（署名者。ID 鍵もここから導く）
     pub node_id: NodeId,
-    /// 署名付きプレキー（X25519 公開）。ラチェット初期鍵も兼ねる
+    /// 署名付きプレキー（X25519 公開）
     pub signed_prekey: [u8; 32],
-    /// **署名付きプレキー・KEM 公開鍵・ID 鍵をまとめて覆う** Ed25519 署名（署名者 = `node_id`）
+    /// ML-KEM (Kyber768) 公開鍵 ── 耐量子ハイブリッドの片肺
+    pub kem_public: Vec<u8>,
+    /// 期限（UNIX 秒）。過ぎた招待では初回接触を始めない
+    pub expires_at: u64,
+    /// NodeId ・署名付きプレキー・期限・KEM 公開鍵をまとめて覆う Ed25519 署名
     ///
     /// KEM 公開鍵まで署名で縛らないと、MITM が KEM 公開鍵だけ差し替えて
-    /// 耐量子の片肺を無力化できる。3つ全部を1つの署名で認証する。
-    pub signed_prekey_sig: Vec<u8>,
-    /// 使い捨てプレキー（X25519 公開・任意）
-    pub one_time_prekey: Option<[u8; 32]>,
-    /// ML-KEM (Kyber768) 公開鍵 ── 耐量子ハイブリッドの片肺（3-1 ④）
-    pub kem_public: Vec<u8>,
+    /// 耐量子の片肺を無力化できる。
+    pub signature: Vec<u8>,
 }
 
-/// Bob が手元に保持するプレキーの秘密鍵（KeyStore に置く）
+/// Bob が手元に保持する招待の秘密（KeyStore に置き、受け取ったら消す）
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PreKeySecrets {
+pub struct InviteSecrets {
     /// 署名付きプレキーの秘密（＝ラチェット初期鍵の秘密）
     pub signed_prekey_secret: [u8; 32],
-    /// 使い捨てプレキーの秘密（使ったら消す）
-    pub one_time_prekey_secret: Option<[u8; 32]>,
-    /// ML-KEM (Kyber768) 秘密鍵（耐量子ハイブリッド用）
+    /// ML-KEM (Kyber768) 秘密鍵
     pub kem_secret: Vec<u8>,
+    /// 招待の期限（期限を過ぎても、届くのが遅れた初回メッセージのために少し残す）
+    pub expires_at: u64,
 }
 
 /// Alice が最初のメッセージに添える鍵情報
@@ -76,8 +87,8 @@ pub struct InitialMessage {
     pub identity_key: [u8; 32],
     /// Alice の一時鍵（X25519 公開）
     pub ephemeral_key: [u8; 32],
-    /// どの使い捨てプレキーを使ったか（Bob が特定して消すため）
-    pub used_one_time_prekey: Option<[u8; 32]>,
+    /// どの招待を使ったか（招待の署名付きプレキー。Bob が秘密を引いて消すため）
+    pub invite_key: [u8; 32],
     /// Bob の ML-KEM 公開鍵へ encapsulate した暗号文（耐量子ハイブリッド用）
     pub kem_ciphertext: Vec<u8>,
 }
@@ -104,99 +115,122 @@ fn kdf_sk(dhs: &[[u8; 32]]) -> [u8; 32] {
     }
     let hk = Hkdf::<Sha256>::new(Some(&[0u8; 32]), &ikm);
     let mut sk = [0u8; 32];
-    hk.expand(b"aether_x3dh_v1", &mut sk).expect("32 <= 255*32");
+    hk.expand(b"aether_x3dh_v2", &mut sk).expect("32 <= 255*32");
     sk
 }
 
-/// 署名で認証する対象：署名付きプレキー ‖ KEM 公開鍵 ‖ ID 鍵
-///
-/// この3つはすべて DH / KEM に入る。どれか1つでも MITM に差し替えられると
-/// 認証・耐量子が崩れるので、まとめて1つの署名で縛る。
-fn signed_transcript(signed_prekey: &[u8; 32], kem_public: &[u8], identity_key: &[u8; 32]) -> Vec<u8> {
-    let mut t = Vec::with_capacity(32 + kem_public.len() + 32);
-    t.extend_from_slice(b"aether_x3dh_prekeys_v1");
-    t.extend_from_slice(signed_prekey);
-    t.extend_from_slice(kem_public);
-    t.extend_from_slice(identity_key);
-    t
+impl Invite {
+    /// 署名で認証する対象：NodeId ‖ 署名付きプレキー ‖ 期限 ‖ KEM 公開鍵
+    fn transcript(&self) -> Vec<u8> {
+        let mut t = Vec::with_capacity(32 + 32 + 8 + self.kem_public.len() + 32);
+        t.extend_from_slice(b"aether_x3dh_invite_v1");
+        t.extend_from_slice(self.node_id.as_bytes());
+        t.extend_from_slice(&self.signed_prekey);
+        t.extend_from_slice(&self.expires_at.to_be_bytes());
+        t.extend_from_slice(&self.kem_public);
+        t
+    }
+
+    /// 署名と期限を確かめる
+    ///
+    /// `expected` は**こちらが繋ぎたい相手の NodeId**。招待が自称する `node_id` ではなく
+    /// これで検証する（自称を信じると MITM が自己署名した招待を通せる）。
+    pub fn verify(&self, expected: &NodeId, now: u64) -> Result<()> {
+        if self.node_id != *expected {
+            return Err(AetherError::Crypto("X3DH: invite is for a different NodeId".into()));
+        }
+        verify_signature(expected, &self.transcript(), &self.signature)
+            .map_err(|_| AetherError::Crypto("X3DH: invite signature invalid".into()))?;
+        if now >= self.expires_at {
+            return Err(AetherError::Crypto("X3DH: invite expired".into()));
+        }
+        Ok(())
+    }
+
+    /// 友だちコードに入れるバイト列（固定長 [`INVITE_LEN`]）
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(INVITE_LEN);
+        out.push(INVITE_VERSION);
+        out.extend_from_slice(self.node_id.as_bytes());
+        out.extend_from_slice(&self.signed_prekey);
+        out.extend_from_slice(&self.expires_at.to_be_bytes());
+        out.extend_from_slice(&self.kem_public);
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    /// [`to_bytes`](Self::to_bytes) の逆。形だけ確かめる（署名は [`verify`](Self::verify) で）
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != INVITE_LEN {
+            return Err(AetherError::Protocol(format!(
+                "invite must be {} bytes, got {}",
+                INVITE_LEN,
+                bytes.len()
+            )));
+        }
+        if bytes[0] != INVITE_VERSION {
+            return Err(AetherError::Protocol(format!("unknown invite version {}", bytes[0])));
+        }
+        let take32 = |at: usize| -> [u8; 32] { bytes[at..at + 32].try_into().expect("32 バイト") };
+        let kem_at = 1 + 32 + 32 + 8;
+        Ok(Self {
+            node_id: NodeId(take32(1)),
+            signed_prekey: take32(33),
+            expires_at: u64::from_be_bytes(bytes[65..73].try_into().expect("8 バイト")),
+            kem_public: bytes[kem_at..kem_at + KEM_PUBLIC_LEN].to_vec(),
+            signature: bytes[kem_at + KEM_PUBLIC_LEN..].to_vec(),
+        })
+    }
 }
 
-/// Bob 役：プレキー束と、その秘密を生成する
-///
-/// `with_one_time` が true なら使い捨てプレキーも1つ含める（前方秘匿が強まる）。
-pub fn generate_prekeys(identity: &Identity, with_one_time: bool) -> (PreKeyBundle, PreKeySecrets) {
+/// Bob 役：招待と、その秘密を作る（招待ごとに新しい鍵）
+pub fn create_invite(identity: &Identity, expires_at: u64) -> (Invite, InviteSecrets) {
     let (spk_secret, spk_public) = new_keypair();
-
-    let (opk_secret, opk_public) = if with_one_time {
-        let (s, p) = new_keypair();
-        (Some(s), Some(p))
-    } else {
-        (None, None)
-    };
-
-    // 耐量子ハイブリッドの片肺：ML-KEM (Kyber768) 鍵ペア
     let (kem_pk, kem_sk) = kyber768::keypair();
 
-    let identity_key = identity_x25519_public(identity);
-    // 署名付きプレキー・KEM 公開鍵・ID 鍵をまとめて署名する（KEM も認証する）
-    let signed_prekey_sig = identity.sign(&signed_transcript(
-        &spk_public,
-        kem_pk.as_bytes(),
-        &identity_key,
-    ));
-
-    let bundle = PreKeyBundle {
-        identity_key,
+    let mut invite = Invite {
         node_id: identity.public_id(),
         signed_prekey: spk_public,
-        signed_prekey_sig,
-        one_time_prekey: opk_public,
         kem_public: kem_pk.as_bytes().to_vec(),
+        expires_at,
+        signature: Vec::new(),
     };
-    let secrets = PreKeySecrets {
+    invite.signature = identity.sign(&invite.transcript());
+
+    let secrets = InviteSecrets {
         signed_prekey_secret: spk_secret,
-        one_time_prekey_secret: opk_secret,
         kem_secret: kem_sk.as_bytes().to_vec(),
+        expires_at,
     };
-    (bundle, secrets)
+    (invite, secrets)
 }
 
-/// Alice 役：Bob の束から `SK` と最初のメッセージ用鍵情報を作る
+/// Alice 役：Bob の招待から `SK` と最初のメッセージ用鍵情報を作る
 ///
-/// `expected` は**こちらが繋ぎたい相手の NodeId**。束が自称する `node_id` ではなく
-/// これで検証する（自称を信じると MITM が自己署名した束を通せる）。
-/// 署名は署名付きプレキー・KEM 公開鍵・ID 鍵の3点を覆う。1つでも合わなければ拒否。
+/// 招待は `expected`（こちらが繋ぎたい相手）で検証し、期限切れなら拒否する。
 pub fn initiate(
     alice: &Identity,
     expected: &NodeId,
-    bundle: &PreKeyBundle,
+    invite: &Invite,
+    now: u64,
 ) -> Result<([u8; 32], InitialMessage)> {
-    if bundle.node_id != *expected {
-        return Err(AetherError::Crypto(
-            "X3DH: prekey bundle is for a different NodeId".into(),
-        ));
-    }
-    let transcript =
-        signed_transcript(&bundle.signed_prekey, &bundle.kem_public, &bundle.identity_key);
-    verify_signature(expected, &transcript, &bundle.signed_prekey_sig)
-        .map_err(|_| AetherError::Crypto("X3DH: prekey bundle signature invalid".into()))?;
+    invite.verify(expected, now)?;
+    let ik_b = x25519_public_from_node_id(expected)?;
 
     let ik_a_secret = alice.x25519_secret().to_bytes();
     let (ek_secret, ek_public) = new_keypair();
 
-    // DH1 = DH(IK_A, SPK_B), DH2 = DH(EK_A, IK_B), DH3 = DH(EK_A, SPK_B), DH4 = DH(EK_A, OPK_B)
+    // DH1 = DH(IK_A, SPK_B), DH2 = DH(EK_A, IK_B), DH3 = DH(EK_A, SPK_B)
+    // SPK は招待ごとの使い捨てなので、DH3 が Signal の使い捨てプレキー (DH4) の役も果たす
     let mut secrets = vec![
-        dh(&ik_a_secret, &bundle.signed_prekey),
-        dh(&ek_secret, &bundle.identity_key),
-        dh(&ek_secret, &bundle.signed_prekey),
+        dh(&ik_a_secret, &invite.signed_prekey),
+        dh(&ek_secret, &ik_b),
+        dh(&ek_secret, &invite.signed_prekey),
     ];
-    if let Some(opk) = bundle.one_time_prekey {
-        secrets.push(dh(&ek_secret, &opk));
-    }
 
     // 耐量子ハイブリッド：Bob の ML-KEM 公開鍵へ encapsulate し、共有秘密を混ぜる。
     // X25519 が量子で破れても、この KEM 秘密が残るので SK は守られる（逆も然り）。
-    let kem_pk = kyber768::PublicKey::from_bytes(&bundle.kem_public)
+    let kem_pk = kyber768::PublicKey::from_bytes(&invite.kem_public)
         .map_err(|_| AetherError::Crypto("X3DH: invalid KEM public key".into()))?;
     let (kem_ss, kem_ct) = kyber768::encapsulate(&kem_pk);
     secrets.push(kem_ss.as_bytes().try_into().expect("kyber768 ss は 32 バイト"));
@@ -207,7 +241,7 @@ pub fn initiate(
         initiator_node_id: alice.public_id(),
         identity_key: identity_x25519_public(alice),
         ephemeral_key: ek_public,
-        used_one_time_prekey: bundle.one_time_prekey,
+        invite_key: invite.signed_prekey,
         kem_ciphertext: kem_ct.as_bytes().to_vec(),
     };
     Ok((sk, msg))
@@ -215,11 +249,11 @@ pub fn initiate(
 
 /// Bob 役：Alice の最初のメッセージから同じ `SK` を復元する
 ///
-/// Alice の恒久 ID 鍵（X25519）が自称 NodeId から導出したものと一致するか検証する
-/// （NodeId と ID 鍵の食い違いを弾く）。DH2/DH4 に入るのはこの `identity_key` なので、
-/// MITM が差し替えても最終的に SK が食い違い Bob の復号は失敗する ── ここで先に弾く。
-pub fn respond(bob: &Identity, secrets: &PreKeySecrets, msg: &InitialMessage) -> Result<[u8; 32]> {
-    let claimed_ik = crate::crypto::identity::x25519_public_from_node_id(&msg.initiator_node_id)?;
+/// `secrets` は `msg.invite_key` の招待の秘密。Alice の恒久 ID 鍵（X25519）が自称 NodeId
+/// から導出したものと一致するか検証する（NodeId と ID 鍵の食い違いを弾く）。
+/// 期限はここでは見ない（期限の前に送られて遅れて届いた初回メッセージを開けるように）。
+pub fn respond(bob: &Identity, secrets: &InviteSecrets, msg: &InitialMessage) -> Result<[u8; 32]> {
+    let claimed_ik = x25519_public_from_node_id(&msg.initiator_node_id)?;
     if claimed_ik != msg.identity_key {
         return Err(AetherError::Crypto(
             "X3DH: initiator identity key does not match its NodeId".into(),
@@ -234,12 +268,6 @@ pub fn respond(bob: &Identity, secrets: &PreKeySecrets, msg: &InitialMessage) ->
         dh(&ik_b_secret, &msg.ephemeral_key),                 // DH2
         dh(&secrets.signed_prekey_secret, &msg.ephemeral_key), // DH3
     ];
-    if msg.used_one_time_prekey.is_some() {
-        let opk_secret = secrets.one_time_prekey_secret.ok_or_else(|| {
-            AetherError::Crypto("X3DH: initiator used a one-time prekey Bob does not have".into())
-        })?;
-        shared.push(dh(&opk_secret, &msg.ephemeral_key)); // DH4
-    }
 
     // 耐量子ハイブリッド：Alice の暗号文を自分の ML-KEM 秘密鍵で decapsulate
     let kem_sk = kyber768::SecretKey::from_bytes(&secrets.kem_secret)
@@ -312,29 +340,45 @@ mod tests {
     use super::*;
     use crate::crypto::ratchet::Ratchet;
 
-    #[test]
-    fn alice_and_bob_derive_the_same_secret_with_one_time_prekey() {
-        let alice = Identity::generate();
-        let bob = Identity::generate();
+    const NOW: u64 = 1_800_000_000;
+    const LATER: u64 = NOW + 3600;
 
-        let (bundle, secrets) = generate_prekeys(&bob, true);
-        let (sk_a, msg) = initiate(&alice, &bob.public_id(), &bundle).unwrap();
-        let sk_b = respond(&bob, &secrets, &msg).unwrap();
-
-        assert_eq!(sk_a, sk_b, "X3DH の両者が同じ初期秘密に到達する");
+    fn invite_of(bob: &Identity) -> (Invite, InviteSecrets) {
+        create_invite(bob, LATER)
     }
 
     #[test]
-    fn works_without_one_time_prekey() {
+    fn alice_and_bob_derive_the_same_secret() {
         let alice = Identity::generate();
         let bob = Identity::generate();
 
-        let (bundle, secrets) = generate_prekeys(&bob, false);
-        assert!(bundle.one_time_prekey.is_none());
-
-        let (sk_a, msg) = initiate(&alice, &bob.public_id(), &bundle).unwrap();
+        let (invite, secrets) = invite_of(&bob);
+        let (sk_a, msg) = initiate(&alice, &bob.public_id(), &invite, NOW).unwrap();
         let sk_b = respond(&bob, &secrets, &msg).unwrap();
-        assert_eq!(sk_a, sk_b);
+
+        assert_eq!(sk_a, sk_b, "X3DH の両者が同じ初期秘密に到達する");
+        assert_eq!(msg.invite_key, invite.signed_prekey, "使った招待を Bob が引ける");
+    }
+
+    #[test]
+    fn each_invite_has_fresh_keys() {
+        // 招待ごとに鍵が違う ＝ 1 つの招待の秘密を消せば、その初回秘密は二度と復元できない
+        let bob = Identity::generate();
+        let (a, _) = invite_of(&bob);
+        let (b, _) = invite_of(&bob);
+        assert_ne!(a.signed_prekey, b.signed_prekey);
+        assert_ne!(a.kem_public, b.kem_public);
+    }
+
+    #[test]
+    fn another_invites_secrets_cannot_open_the_message() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let (invite, _) = invite_of(&bob);
+        let (_, other_secrets) = invite_of(&bob);
+
+        let (sk_a, msg) = initiate(&alice, &bob.public_id(), &invite, NOW).unwrap();
+        assert_ne!(sk_a, respond(&bob, &other_secrets, &msg).unwrap());
     }
 
     #[test]
@@ -343,11 +387,11 @@ mod tests {
         let bob = Identity::generate();
         let carol = Identity::generate();
 
-        let (bundle_b, _) = generate_prekeys(&bob, true);
-        let (bundle_c, _) = generate_prekeys(&carol, true);
+        let (invite_b, _) = invite_of(&bob);
+        let (invite_c, _) = invite_of(&carol);
 
-        let (sk_ab, _) = initiate(&alice, &bob.public_id(), &bundle_b).unwrap();
-        let (sk_ac, _) = initiate(&alice, &carol.public_id(), &bundle_c).unwrap();
+        let (sk_ab, _) = initiate(&alice, &bob.public_id(), &invite_b, NOW).unwrap();
+        let (sk_ac, _) = initiate(&alice, &carol.public_id(), &invite_c, NOW).unwrap();
         assert_ne!(sk_ab, sk_ac, "相手が違えば初期秘密も違う");
     }
 
@@ -356,12 +400,12 @@ mod tests {
         let alice = Identity::generate();
         let bob = Identity::generate();
 
-        let (mut bundle, _) = generate_prekeys(&bob, true);
+        let (mut invite, _) = invite_of(&bob);
         // 署名付きプレキーを差し替える（中間者が別の鍵を挿す想定）
-        bundle.signed_prekey = [0x13; 32];
+        invite.signed_prekey = [0x13; 32];
 
         assert!(
-            initiate(&alice, &bob.public_id(), &bundle).is_err(),
+            initiate(&alice, &bob.public_id(), &invite, NOW).is_err(),
             "署名の合わないプレキーは拒否する（中間者対策）"
         );
     }
@@ -371,31 +415,52 @@ mod tests {
         // KEM 公開鍵を差し替えると署名が合わなくなる（耐量子の片肺を守る）
         let alice = Identity::generate();
         let bob = Identity::generate();
-        let (mut bundle, _) = generate_prekeys(&bob, true);
+        let (mut invite, _) = invite_of(&bob);
 
-        // 別の Kyber 公開鍵に差し替える
         let (other_pk, _) = kyber768::keypair();
-        bundle.kem_public = other_pk.as_bytes().to_vec();
+        invite.kem_public = other_pk.as_bytes().to_vec();
 
         assert!(
-            initiate(&alice, &bob.public_id(), &bundle).is_err(),
+            initiate(&alice, &bob.public_id(), &invite, NOW).is_err(),
             "署名で覆われた KEM 公開鍵の差し替えは拒否する"
         );
     }
 
     #[test]
-    fn bundle_claiming_a_different_node_is_rejected() {
+    fn extended_expiry_is_rejected() {
+        // 期限も署名で覆う（延ばした招待は通らない）
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let (mut invite, _) = invite_of(&bob);
+        invite.expires_at += 365 * 24 * 3600;
+        assert!(initiate(&alice, &bob.public_id(), &invite, NOW).is_err());
+    }
+
+    #[test]
+    fn expired_invite_is_rejected() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let (invite, _) = invite_of(&bob);
+        assert!(invite.verify(&bob.public_id(), LATER - 1).is_ok());
+        assert!(
+            initiate(&alice, &bob.public_id(), &invite, LATER).is_err(),
+            "期限を過ぎた招待では初回接触を始めない"
+        );
+    }
+
+    #[test]
+    fn invite_claiming_a_different_node_is_rejected() {
         // 自称 node_id ではなく、こちらが意図した相手で検証する
         let alice = Identity::generate();
         let bob = Identity::generate();
         let mallory = Identity::generate();
 
-        // Mallory が自分の束を「Bob 宛て」として渡してくる（自己署名は valid）
-        let (bundle, _) = generate_prekeys(&mallory, true);
+        // Mallory が自分の招待を「Bob の招待」として渡してくる（自己署名は valid）
+        let (invite, _) = invite_of(&mallory);
 
         assert!(
-            initiate(&alice, &bob.public_id(), &bundle).is_err(),
-            "意図した相手(Bob)でない束は拒否する（自己署名 MITM 対策）"
+            initiate(&alice, &bob.public_id(), &invite, NOW).is_err(),
+            "意図した相手(Bob)でない招待は拒否する（自己署名 MITM 対策）"
         );
     }
 
@@ -406,8 +471,8 @@ mod tests {
         let bob = Identity::generate();
         let mallory = Identity::generate();
 
-        let (bundle, secrets) = generate_prekeys(&bob, true);
-        let (_sk, mut msg) = initiate(&alice, &bob.public_id(), &bundle).unwrap();
+        let (invite, secrets) = invite_of(&bob);
+        let (_sk, mut msg) = initiate(&alice, &bob.public_id(), &invite, NOW).unwrap();
 
         // NodeId だけ別人にすり替える（ID 鍵はそのまま）
         msg.initiator_node_id = mallory.public_id();
@@ -419,13 +484,29 @@ mod tests {
     }
 
     #[test]
-    fn bundle_survives_wire_roundtrip() {
+    fn invite_bytes_roundtrip_with_a_fixed_length() {
         let bob = Identity::generate();
-        let (bundle, _) = generate_prekeys(&bob, true);
-        let bytes = bincode::serialize(&bundle).unwrap();
-        let decoded: PreKeyBundle = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(decoded.signed_prekey, bundle.signed_prekey);
-        assert_eq!(decoded.node_id, bundle.node_id);
+        let (invite, _) = invite_of(&bob);
+        let bytes = invite.to_bytes();
+        assert_eq!(bytes.len(), INVITE_LEN);
+        assert_eq!(INVITE_LEN, 1321, "友だちコードの大きさ（base64 で約 1,760 文字）");
+
+        let decoded = Invite::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, invite);
+        assert!(decoded.verify(&bob.public_id(), NOW).is_ok());
+    }
+
+    #[test]
+    fn malformed_invite_bytes_are_rejected() {
+        let bob = Identity::generate();
+        let bytes = invite_of(&bob).0.to_bytes();
+        assert!(Invite::from_bytes(&bytes[..bytes.len() - 1]).is_err(), "短い");
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(Invite::from_bytes(&longer).is_err(), "長い");
+        let mut other_version = bytes;
+        other_version[0] = 0xEE;
+        assert!(Invite::from_bytes(&other_version).is_err(), "知らない版");
     }
 
     #[test]
@@ -435,15 +516,15 @@ mod tests {
         let alice = Identity::generate();
         let bob = Identity::generate();
 
-        let (bundle, secrets) = generate_prekeys(&bob, true);
-        let (sk_a, mut msg) = initiate(&alice, &bob.public_id(), &bundle).unwrap();
+        let (invite, secrets) = invite_of(&bob);
+        let (sk_a, mut msg) = initiate(&alice, &bob.public_id(), &invite, NOW).unwrap();
 
         // まず正規は一致
         assert_eq!(sk_a, respond(&bob, &secrets, &msg).unwrap());
 
         // KEM 暗号文を別の encapsulate 結果に差し替える → decapsulate 結果が変わり不一致
-        let (bundle2, _) = generate_prekeys(&bob, true);
-        let kem_pk2 = kyber768::PublicKey::from_bytes(&bundle2.kem_public).unwrap();
+        let (invite2, _) = invite_of(&bob);
+        let kem_pk2 = kyber768::PublicKey::from_bytes(&invite2.kem_public).unwrap();
         let (_ss2, ct2) = kyber768::encapsulate(&kem_pk2);
         msg.kem_ciphertext = ct2.as_bytes().to_vec();
 
@@ -455,19 +536,11 @@ mod tests {
     }
 
     #[test]
-    fn bundle_carries_kyber_public_key() {
-        let bob = Identity::generate();
-        let (bundle, _) = generate_prekeys(&bob, true);
-        // Kyber768 公開鍵は 1184 バイト
-        assert_eq!(bundle.kem_public.len(), 1184, "Kyber768 公開鍵のサイズ");
-    }
-
-    #[test]
     fn private_body_frames_roundtrip() {
         let alice = Identity::generate();
         let bob = Identity::generate();
-        let (bundle, _) = generate_prekeys(&bob, false);
-        let (_sk, init) = initiate(&alice, &bob.public_id(), &bundle).unwrap();
+        let (invite, _) = invite_of(&bob);
+        let (_sk, init) = initiate(&alice, &bob.public_id(), &invite, NOW).unwrap();
 
         // 初回接触フレーム: InitialMessage と sealed 本体が分離して戻る
         let sealed = b"sealed ratchet body";
@@ -491,11 +564,11 @@ mod tests {
 
         let alice = Identity::generate();
         let bob = Identity::generate();
-        let (bundle, secrets) = generate_prekeys(&bob, false);
+        let (invite, secrets) = invite_of(&bob);
 
         // Alice: initiate → SK → Session、初回本文をフレーム化
-        let (sk_a, init) = initiate(&alice, &bob.public_id(), &bundle).unwrap();
-        let mut alice_session = Session::initiator(&sk_a, &bundle.signed_prekey, init.clone());
+        let (sk_a, init) = initiate(&alice, &bob.public_id(), &invite, NOW).unwrap();
+        let mut alice_session = Session::initiator(&sk_a, &invite.signed_prekey, init.clone());
         let sealed1 = alice_session.seal(b"hello via x3dh", b"").unwrap();
         let framed1 = frame_initial(&init, &sealed1).unwrap();
 
@@ -518,22 +591,18 @@ mod tests {
 
     #[test]
     fn x3dh_bootstraps_a_ratchet_conversation() {
-        // X3DH で SK を確立 → Bob の署名付きプレキーをラチェット初期鍵にして会話開始
-        // これで「事前共有 --secret」を排除できる（3-1 の全体像）
+        // X3DH で SK を確立 → 招待の署名付きプレキーをラチェット初期鍵にして会話開始
         let alice = Identity::generate();
         let bob = Identity::generate();
 
-        let (bundle, secrets) = generate_prekeys(&bob, true);
-        let bob_spk_pub = bundle.signed_prekey;
-        let bob_spk_secret = secrets.signed_prekey_secret;
-
-        let (sk_a, _msg) = initiate(&alice, &bob.public_id(), &bundle).unwrap();
-        let sk_b = respond(&bob, &secrets, &_msg).unwrap();
+        let (invite, secrets) = invite_of(&bob);
+        let (sk_a, msg) = initiate(&alice, &bob.public_id(), &invite, NOW).unwrap();
+        let sk_b = respond(&bob, &secrets, &msg).unwrap();
         assert_eq!(sk_a, sk_b);
 
         // 署名付きプレキーがラチェットの初期鍵を兼ねる（Signal と同じ）
-        let mut alice_ratchet = Ratchet::init_alice(&sk_a, &bob_spk_pub);
-        let mut bob_ratchet = Ratchet::init_bob(&sk_b, &bob_spk_secret);
+        let mut alice_ratchet = Ratchet::init_alice(&sk_a, &invite.signed_prekey);
+        let mut bob_ratchet = Ratchet::init_bob(&sk_b, &secrets.signed_prekey_secret);
 
         let (h1, c1) = alice_ratchet.encrypt(b"first from x3dh", b"").unwrap();
         assert_eq!(bob_ratchet.decrypt(&h1, &c1, b"").unwrap(), b"first from x3dh");

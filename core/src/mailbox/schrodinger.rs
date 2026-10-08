@@ -38,12 +38,6 @@ pub const K_REPLICAS: usize = 5;
 /// 256KB に対しては +0.08% で償却される。
 pub const CHUNK_SIZE: usize = 256 * 1024;
 
-/// プレキー束の置き場所が変わる周期（2 日）
-///
-/// 本体の TTL（既定 1 週間）より短くする。束を置き直さないまま周期をまたいでも、
-/// 前の期間の置き場所に残っている束を引ける（[`SchrodingerMailbox::request_prekey_bundle`]）。
-pub const PREKEY_PERIOD_SECS: u64 = 2 * 24 * 3600;
-
 /// 索引の記述子に解く PoW の下限（ビット）。2^16 回の SHA-256 で、1 件あたり数十ミリ秒
 const INDEX_RECORD_MIN_POW: u32 = 16;
 
@@ -446,86 +440,6 @@ impl SchrodingerMailbox {
         object: &[u8],
     ) -> Result<UploadProfile> {
         self.place_object(mailbox_key, secret, object).await
-    }
-
-    /// プレキー束の配置座標と公開鍵を NodeId と期間から導出する（X3DH / 3-1）
-    ///
-    /// どちらも **NodeId と期間番号だけから計算できる**（公開値）ので、相手の NodeId を
-    /// 知る者は誰でも束の位置を特定して取得できる。束自体は署名済みなので、保持者や
-    /// 取得経路が改竄しても [`x3dh::initiate`](crate::crypto::x3dh::initiate) が弾く。
-    ///
-    /// **位置は [`PREKEY_PERIOD_SECS`] ごとに変わる。** 固定だと保持者も固定になり、
-    /// (1) 狙った NodeId の束の位置へ Sybil を置けば初回接触をずっと妨害でき、
-    /// (2) 保持者が「この人がいつ束を置き直したか」＝在席を観測し続けられる。
-    fn prekey_location(node_id: &NodeId, period: u64) -> ([u8; 32], SharedSecret) {
-        use sha2::Digest;
-        let mut mk = Sha256::new();
-        mk.update(b"aether_prekey_v2");
-        mk.update(node_id.as_bytes());
-        mk.update(period.to_be_bytes());
-        let mailbox_key: [u8; 32] = mk.finalize().into();
-
-        let mut pk = Sha256::new();
-        pk.update(b"aether_prekey_pub_v2");
-        pk.update(node_id.as_bytes());
-        pk.update(period.to_be_bytes());
-        let pub_key: [u8; 32] = pk.finalize().into();
-
-        (mailbox_key, pub_key)
-    }
-
-    /// いまの期間番号（プレキー束の置き場所を決める）
-    pub fn prekey_period(now: u64) -> u64 {
-        now / PREKEY_PERIOD_SECS
-    }
-
-    /// 自分のプレキー束を網へ公開する（X3DH の Bob 役 / 3-1）
-    ///
-    /// `period` の置き場所の担当保持者へ、RS シャードに割って置く。
-    /// 束は公開情報（署名付き公開鍵の集まり）なので暗号化はしない ── 完全性は
-    /// シャードの HMAC 封と、束に載る Ed25519 署名が担う。
-    pub async fn publish_prekey_bundle(
-        &self,
-        bundle: &crate::crypto::x3dh::PreKeyBundle,
-        period: u64,
-    ) -> Result<()> {
-        let (mailbox_key, pub_key) = Self::prekey_location(&bundle.node_id, period);
-        let object =
-            bincode::serialize(bundle).map_err(|e| AetherError::Serialization(e.to_string()))?;
-        self.place_object(&mailbox_key, &pub_key, &object).await?;
-        Ok(())
-    }
-
-    /// 相手のプレキー束の取得要求を出す（返信は Inbound Tunnel 経由 / 3-1）
-    ///
-    /// 相手が今の期間にまだ置き直していないこともあるので、前の期間の置き場所も引く。
-    pub async fn request_prekey_bundle(&self, node_id: &NodeId, period: u64) -> Result<()> {
-        for p in [period, period.saturating_sub(1)] {
-            let (mailbox_key, pub_key) = Self::prekey_location(node_id, p);
-            self.request_body(&mailbox_key, &pub_key).await?;
-        }
-        Ok(())
-    }
-
-    /// トンネルで回収したシャードから相手のプレキー束を復元する（3-1）
-    ///
-    /// 署名検証は呼び出し側の [`x3dh::initiate`](crate::crypto::x3dh::initiate) が行う
-    /// （意図した相手の NodeId で束を検証する）。
-    pub fn reassemble_prekey_bundle(
-        &self,
-        replies: &[Vec<u8>],
-        node_id: &NodeId,
-        period: u64,
-    ) -> Result<Option<crate::crypto::x3dh::PreKeyBundle>> {
-        for p in [period, period.saturating_sub(1)] {
-            let (mailbox_key, pub_key) = Self::prekey_location(node_id, p);
-            if let Some(object) = self.reassemble_raw(replies, &mailbox_key, &pub_key)? {
-                let bundle = bincode::deserialize(&object)
-                    .map_err(|e| AetherError::Protocol(format!("Invalid prekey bundle: {}", e)))?;
-                return Ok(Some(bundle));
-            }
-        }
-        Ok(None)
     }
 
     /// 索引に記述子を1件公開する (19.7 / Phase 2-3)

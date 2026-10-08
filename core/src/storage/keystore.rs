@@ -20,7 +20,7 @@
 
 use crate::crypto::identity::NodeId;
 use crate::crypto::session::Session;
-use crate::crypto::x3dh::{PreKeyBundle, PreKeySecrets};
+use crate::crypto::x3dh::{Invite, InviteSecrets};
 use crate::error::{AetherError, Result};
 use crate::storage::at_rest;
 use sled::Db;
@@ -30,11 +30,16 @@ use std::path::Path;
 const META_TREE: &str = "aether_keystore_meta";
 const CANARY_PLAINTEXT: &[u8] = b"aether-keystore-canary-v1";
 
-/// 自分のプレキー秘密（X3DH の Bob 役）を置く別ツリー
-const PREKEY_TREE: &str = "aether_keystore_prekeys";
-const PREKEY_SELF_KEY: &[u8] = b"self";
-/// プレキー束を最後に置いた期間番号
-const PREKEY_PERIOD_KEY: &[u8] = b"published_period";
+/// 自分が渡した招待の秘密（X3DH の Bob 役）を置く別ツリー
+const INVITE_TREE: &str = "aether_keystore_invites";
+/// 受け取った相手の招待（初回接触に使う）を置く別ツリー
+const PEER_INVITE_TREE: &str = "aether_keystore_peer_invites";
+/// 以前の、網に置いていたプレキー束の秘密。開くときに消す
+const LEGACY_PREKEY_TREE: &str = "aether_keystore_prekeys";
+
+/// 招待の期限を過ぎても秘密を残す期間（期限の前に送られ、遅れて届いた初回メッセージのため）。
+/// 本体の TTL（既定 1 週間）より長くする
+pub const INVITE_GRACE_SECS: u64 = 8 * 24 * 3600;
 
 /// 処理済みメッセージの目印を置く別ツリー（再配送・リプレイで同じ私信を二度開かないため）
 const SEEN_TREE: &str = "aether_keystore_seen";
@@ -60,6 +65,7 @@ impl KeyStore {
     /// 指定パスに KeyStore を開く（**平文**・テストや暗号化しない場合）
     pub fn open(path: &Path) -> Result<Self> {
         let db = sled::open(path).map_err(|e| AetherError::Storage(e.to_string()))?;
+        drop_legacy_trees(&db)?;
         let blind_key = Self::plaintext_blind_key(&db)?;
         Ok(Self { db, cipher_key: None, blind_key })
     }
@@ -73,6 +79,7 @@ impl KeyStore {
     pub fn open_encrypted(path: &Path, passphrase: &str) -> Result<Self> {
         let db = sled::open(path).map_err(|e| AetherError::Storage(e.to_string()))?;
         let key = at_rest::unlock_db(&db, passphrase, META_TREE, CANARY_PLAINTEXT)?;
+        drop_legacy_trees(&db)?;
         let blind_key = derive_blind_key(&key);
         Ok(Self {
             db,
@@ -179,70 +186,118 @@ impl KeyStore {
         Ok(Some(session))
     }
 
-    /// 自分のプレキー束と秘密（X3DH の Bob 役）を保存する（暗号化有効なら暗号化して保存）
+    fn tree(&self, name: &str) -> Result<sled::Tree> {
+        self.db
+            .open_tree(name)
+            .map_err(|e| AetherError::Storage(e.to_string()))
+    }
+
+    fn invite_slot(&self, invite_key: &[u8; 32]) -> [u8; 32] {
+        self.slot(b"aether_keystore_invite_v1", invite_key)
+    }
+
+    fn peer_invite_slot(&self, peer: &NodeId) -> [u8; 32] {
+        self.slot(b"aether_keystore_peer_invite_v1", peer.as_bytes())
+    }
+
+    /// 自分が作った招待の秘密を保存する（X3DH の Bob 役）
     ///
-    /// Bob は `start` 時に1回だけ生成し、これを**永続化して再起動を跨いで再利用**する。
-    /// 束（公開部）も一緒に持つ ── Kyber 公開鍵は秘密鍵から再導出できないため、再公開に要る。
-    /// 鍵を毎回作り直すと、束を取得済みの initiator の初回メッセージが復元できなくなる。
-    /// initiator が初回メッセージに添える [`InitialMessage`] をこの秘密で開いて同じ `SK` を得る。
+    /// `invite_key` は招待の署名付きプレキー（公開）。相手の初回メッセージが
+    /// [`InitialMessage::invite_key`] でどの招待を使ったかを示すので、それで引く。
     ///
-    /// [`InitialMessage`]: crate::crypto::x3dh::InitialMessage
-    pub fn save_prekeys(&self, bundle: &PreKeyBundle, secrets: &PreKeySecrets) -> Result<()> {
-        let tree = self
-            .db
-            .open_tree(PREKEY_TREE)
-            .map_err(|e| AetherError::Storage(e.to_string()))?;
-        let bytes = bincode::serialize(&(bundle, secrets))
+    /// [`InitialMessage::invite_key`]: crate::crypto::x3dh::InitialMessage::invite_key
+    pub fn save_invite_secrets(&self, invite_key: &[u8; 32], secrets: &InviteSecrets) -> Result<()> {
+        let bytes = bincode::serialize(secrets)
             .map_err(|e| AetherError::Serialization(e.to_string()))?;
-        let stored = self.encode(&bytes)?;
-        tree.insert(PREKEY_SELF_KEY, stored)
+        self.tree(INVITE_TREE)?
+            .insert(self.invite_slot(invite_key), self.encode(&bytes)?)
             .map_err(|e| AetherError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    /// 自分のプレキー束と秘密を読む。無ければ `None`（初回生成が必要）
-    pub fn load_prekeys(&self) -> Result<Option<(PreKeyBundle, PreKeySecrets)>> {
-        let tree = self
-            .db
-            .open_tree(PREKEY_TREE)
-            .map_err(|e| AetherError::Storage(e.to_string()))?;
-        let Some(raw) = tree
-            .get(PREKEY_SELF_KEY)
+    /// 招待の秘密を読む。使い終えて消した・作っていない招待なら `None`
+    pub fn load_invite_secrets(&self, invite_key: &[u8; 32]) -> Result<Option<InviteSecrets>> {
+        let Some(raw) = self
+            .tree(INVITE_TREE)?
+            .get(self.invite_slot(invite_key))
             .map_err(|e| AetherError::Storage(e.to_string()))?
         else {
             return Ok(None);
         };
-        let bytes = self.decode(&raw)?;
-        let pair = bincode::deserialize(&bytes)
-            .map_err(|e| AetherError::Storage(format!("Corrupt prekey state: {}", e)))?;
-        Ok(Some(pair))
+        let secrets = bincode::deserialize(&self.decode(&raw)?)
+            .map_err(|e| AetherError::Storage(format!("Corrupt invite secrets: {}", e)))?;
+        Ok(Some(secrets))
     }
 
-    /// プレキー束を最後に置いた期間番号を記録する
-    pub fn save_prekey_period(&self, period: u64) -> Result<()> {
-        let tree = self
-            .db
-            .open_tree(PREKEY_TREE)
-            .map_err(|e| AetherError::Storage(e.to_string()))?;
-        tree.insert(PREKEY_PERIOD_KEY, self.encode(&period.to_be_bytes())?)
+    /// 招待の秘密を消す（初回接触を受けてセッションを立てたら呼ぶ。以後その初回秘密は
+    /// 誰にも復元できない ＝ 初回メッセージの前方秘匿）
+    pub fn remove_invite_secrets(&self, invite_key: &[u8; 32]) -> Result<()> {
+        self.tree(INVITE_TREE)?
+            .remove(self.invite_slot(invite_key))
             .map_err(|e| AetherError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    /// プレキー束を最後に置いた期間番号（一度も置いていなければ `None`）
-    pub fn load_prekey_period(&self) -> Result<Option<u64>> {
-        let tree = self
-            .db
-            .open_tree(PREKEY_TREE)
+    /// 受け取った相手の招待を保存する（同じ相手なら新しいもので上書き）
+    pub fn save_peer_invite(&self, peer: &NodeId, invite: &Invite) -> Result<()> {
+        self.tree(PEER_INVITE_TREE)?
+            .insert(self.peer_invite_slot(peer), self.encode(&invite.to_bytes())?)
             .map_err(|e| AetherError::Storage(e.to_string()))?;
-        let Some(raw) = tree
-            .get(PREKEY_PERIOD_KEY)
+        Ok(())
+    }
+
+    /// 相手の招待を読む。受け取っていない・使い終えたなら `None`
+    pub fn load_peer_invite(&self, peer: &NodeId) -> Result<Option<Invite>> {
+        let Some(raw) = self
+            .tree(PEER_INVITE_TREE)?
+            .get(self.peer_invite_slot(peer))
             .map_err(|e| AetherError::Storage(e.to_string()))?
         else {
             return Ok(None);
         };
-        let bytes = self.decode(&raw)?;
-        Ok(<[u8; 8]>::try_from(bytes.as_slice()).ok().map(u64::from_be_bytes))
+        Ok(Some(Invite::from_bytes(&self.decode(&raw)?)?))
+    }
+
+    /// 相手の招待を消す（その招待でセッションを立てたら要らない）
+    pub fn remove_peer_invite(&self, peer: &NodeId) -> Result<()> {
+        self.tree(PEER_INVITE_TREE)?
+            .remove(self.peer_invite_slot(peer))
+            .map_err(|e| AetherError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 期限の切れた招待を消す。消した件数を返す
+    ///
+    /// 自分の招待の秘密は期限から [`INVITE_GRACE_SECS`] 後、相手の招待は期限で消す。
+    pub fn prune_invites(&self, now: u64) -> Result<usize> {
+        let mut removed = 0;
+        let mine = self.tree(INVITE_TREE)?;
+        for item in mine.iter() {
+            let (k, v) = item.map_err(|e| AetherError::Storage(e.to_string()))?;
+            let expires_at = self
+                .decode(&v)
+                .ok()
+                .and_then(|b| bincode::deserialize::<InviteSecrets>(&b).ok())
+                .map(|s| s.expires_at);
+            if expires_at.is_none_or(|t| now > t.saturating_add(INVITE_GRACE_SECS)) {
+                mine.remove(k).map_err(|e| AetherError::Storage(e.to_string()))?;
+                removed += 1;
+            }
+        }
+        let peers = self.tree(PEER_INVITE_TREE)?;
+        for item in peers.iter() {
+            let (k, v) = item.map_err(|e| AetherError::Storage(e.to_string()))?;
+            let expires_at = self
+                .decode(&v)
+                .ok()
+                .and_then(|b| Invite::from_bytes(&b).ok())
+                .map(|i| i.expires_at);
+            if expires_at.is_none_or(|t| now >= t) {
+                peers.remove(k).map_err(|e| AetherError::Storage(e.to_string()))?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// 連絡先が登録済みか
@@ -330,6 +385,16 @@ impl KeyStore {
     }
 }
 
+/// 以前の形式の残りを消す
+///
+/// 網に置いていたプレキー束の秘密は、もう使わない。残しておくと、押収されたときに
+/// その鍵で受け取った初回メッセージを復元される（前方秘匿が効かない）。
+fn drop_legacy_trees(db: &Db) -> Result<()> {
+    db.drop_tree(LEGACY_PREKEY_TREE)
+        .map_err(|e| AetherError::Storage(e.to_string()))?;
+    Ok(())
+}
+
 /// 暗号鍵から sled キー用の HMAC 鍵を導く（暗号鍵そのものは使い回さない）
 fn derive_blind_key(cipher_key: &[u8; 32]) -> [u8; 32] {
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, cipher_key);
@@ -379,27 +444,92 @@ mod tests {
     }
 
     #[test]
-    fn prekeys_persist_and_survive_restart() {
+    fn invite_secrets_persist_until_removed() {
         use crate::crypto::identity::Identity;
         use crate::crypto::x3dh;
 
         let bob = Identity::generate();
-        let (bundle, secrets) = x3dh::generate_prekeys(&bob, false);
+        let (invite, secrets) = x3dh::create_invite(&bob, 2_000_000_000);
+        let key = invite.signed_prekey;
 
         let dir = tempfile::tempdir().unwrap();
         {
-            let ks = KeyStore::open(dir.path()).unwrap();
-            assert!(ks.load_prekeys().unwrap().is_none(), "初回は未設定");
-            ks.save_prekeys(&bundle, &secrets).unwrap();
+            let ks = KeyStore::open_encrypted(dir.path(), "pass").unwrap();
+            assert!(ks.load_invite_secrets(&key).unwrap().is_none());
+            ks.save_invite_secrets(&key, &secrets).unwrap();
         }
 
-        // 再起動して読み直す（束＋秘密の両方）
+        // 再起動して読み直す
+        let ks = KeyStore::open_encrypted(dir.path(), "pass").unwrap();
+        let got = ks.load_invite_secrets(&key).unwrap().expect("保存した招待の秘密が読める");
+        assert_eq!(got.signed_prekey_secret, secrets.signed_prekey_secret);
+        assert_eq!(got.kem_secret, secrets.kem_secret);
+
+        // 使ったら消す（以後その初回秘密は復元できない）
+        ks.remove_invite_secrets(&key).unwrap();
+        assert!(ks.load_invite_secrets(&key).unwrap().is_none());
+        assert!(ks.is_empty(), "招待は会話の数に数えない");
+    }
+
+    #[test]
+    fn peer_invites_roundtrip_and_hide_the_peer_on_disk() {
+        use crate::crypto::identity::Identity;
+        use crate::crypto::x3dh;
+
+        let bob = Identity::generate();
+        let (invite, _) = x3dh::create_invite(&bob, 2_000_000_000);
+        let (ks, dir) = store();
+        ks.save_peer_invite(&bob.public_id(), &invite).unwrap();
+        assert_eq!(ks.load_peer_invite(&bob.public_id()).unwrap(), Some(invite));
+        drop(ks);
+
+        // sled のキーに相手の NodeId がそのまま残らない
+        {
+            let raw = sled::open(dir.path()).unwrap();
+            let tree = raw.open_tree(PEER_INVITE_TREE).unwrap();
+            assert!(tree.iter().keys().all(|k| k.unwrap().as_ref() != bob.public_id().as_bytes()));
+        }
+
         let ks = KeyStore::open(dir.path()).unwrap();
-        let (rb, rs) = ks.load_prekeys().unwrap().expect("保存したプレキーが読める");
-        assert_eq!(rs.signed_prekey_secret, secrets.signed_prekey_secret);
-        assert_eq!(rs.kem_secret, secrets.kem_secret);
-        assert_eq!(rb.signed_prekey, bundle.signed_prekey);
-        assert_eq!(rb.kem_public, bundle.kem_public);
+        ks.remove_peer_invite(&bob.public_id()).unwrap();
+        assert!(ks.load_peer_invite(&bob.public_id()).unwrap().is_none());
+    }
+
+    #[test]
+    fn prune_invites_drops_expired_ones() {
+        use crate::crypto::identity::Identity;
+        use crate::crypto::x3dh;
+
+        let me = Identity::generate();
+        let friend = Identity::generate();
+        let now = 1_900_000_000;
+        let (ks, _dir) = store();
+
+        let (old, old_secrets) = x3dh::create_invite(&me, now - INVITE_GRACE_SECS - 1);
+        let (late, late_secrets) = x3dh::create_invite(&me, now - 10);
+        let (fresh, fresh_secrets) = x3dh::create_invite(&me, now + 3600);
+        for (i, s) in [(&old, &old_secrets), (&late, &late_secrets), (&fresh, &fresh_secrets)] {
+            ks.save_invite_secrets(&i.signed_prekey, s).unwrap();
+        }
+        let (expired_peer, _) = x3dh::create_invite(&friend, now - 1);
+        ks.save_peer_invite(&friend.public_id(), &expired_peer).unwrap();
+
+        assert_eq!(ks.prune_invites(now).unwrap(), 2);
+        assert!(ks.load_invite_secrets(&old.signed_prekey).unwrap().is_none(), "猶予も過ぎた");
+        assert!(ks.load_invite_secrets(&late.signed_prekey).unwrap().is_some(), "遅れて届く初回のため残す");
+        assert!(ks.load_invite_secrets(&fresh.signed_prekey).unwrap().is_some());
+        assert!(ks.load_peer_invite(&friend.public_id()).unwrap().is_none(), "期限切れの招待では送れない");
+    }
+
+    #[test]
+    fn opening_drops_the_legacy_prekey_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let raw = sled::open(dir.path()).unwrap();
+            raw.open_tree(LEGACY_PREKEY_TREE).unwrap().insert(b"self", &b"old secret"[..]).unwrap();
+        }
+        let ks = KeyStore::open(dir.path()).unwrap();
+        assert!(!ks.db.tree_names().iter().any(|n| n.as_ref() == LEGACY_PREKEY_TREE.as_bytes()));
     }
 
     #[test]

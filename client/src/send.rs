@@ -8,7 +8,7 @@
 use crate::circuit::Circuit;
 use crate::boards::BoardId;
 use crate::client::{AetherClient, board_target};
-use crate::error::Result;
+use crate::error::{ClientError, Result};
 use crate::events::{self, ClientEvent, SendState};
 use aether_core::crypto::identity::NodeId;
 use aether_core::mailbox::hint_release::{self, ReleaseStatus, UploadProfile};
@@ -59,8 +59,8 @@ pub struct SendReport {
 impl AetherClient {
     /// 私信を送る
     ///
-    /// `secret` を省くと相手の NodeId から鍵を合意する。初回は相手のプレキー束を取って
-    /// X3DH で前方秘匿のセッションを立て、以後はラチェットで封じる。
+    /// `secret` を省くと相手の NodeId から鍵を合意する。初回は相手の友だちコードの招待で
+    /// X3DH の前方秘匿のセッションを立て（[`AetherClient::accept_friend_code`]）、以後はラチェットで封じる。
     pub async fn send_private(
         &self,
         to: NodeId,
@@ -104,14 +104,21 @@ impl AetherClient {
         let mut session = match ks.load(&to)? {
             Some(s) => s,
             None => {
-                events::progress(
-                    &self.events,
-                    format!("初回接触: {} のプレキー束を取得して X3DH 鍵合意します", to),
-                );
-                let bundle = self.fetch_prekey_bundle(&to).await?;
-                let (sk, init) = x3dh::initiate(&identity, &to, &bundle)?;
-                events::progress(&self.events, "X3DH 成立（前方秘匿＋耐量子ハイブリッド）");
-                Session::initiator(&sk, &bundle.signed_prekey, init)
+                // 初回接触は、相手から受け取った友だちコードの招待で始める（網からは何も取らない）
+                let invite = ks.load_peer_invite(&to)?.ok_or_else(|| {
+                    ClientError::invalid(
+                        "この相手とはまだ会話を始められません。相手の友だちコードを追加するか、相手から先に送ってもらってください",
+                    )
+                })?;
+                let now = aether_core::protocol::hint::current_timestamp();
+                if now >= invite.expires_at {
+                    return Err(ClientError::invalid(
+                        "相手の友だちコードの期限が切れています（新しいコードをもらって追加し直してください）",
+                    ));
+                }
+                let (sk, init) = x3dh::initiate(&identity, &to, &invite, now)?;
+                events::progress(&self.events, "初回接触: 友だちコードの招待で鍵を合意しました（前方秘匿＋耐量子ハイブリッド）");
+                Session::initiator(&sk, &invite.signed_prekey, init)
             }
         };
         let new_conversation = !ks.contains(&to);
@@ -137,6 +144,10 @@ impl AetherClient {
         // 飛んだ番号を取りこぼしとして扱えるので、進めすぎても会話は壊れない
         ks.save(&to, &session)?;
         if new_conversation {
+            // 招待は使い捨て。会話が立ったので要らない（押収されたときに残すものを減らす）
+            if let Err(e) = ks.remove_peer_invite(&to) {
+                events::warning(&self.events, format!("使い終えた友だちコードを消せません: {}", e));
+            }
             // 相手の返事は Hint 鍵チェーンで届く。受信中なら認識できるよう知らせる
             self.subscriptions_changed();
         }

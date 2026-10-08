@@ -73,8 +73,6 @@
               <span><strong>受け取りをずらす</strong> ── 届いたトークを取りに行くのを 0〜60 秒ずらします（送り主に受け取った人を特定されにくくなります）</span></label>
             <label class="choice"><input type="checkbox" id="delay-release" checked>
               <span><strong>送信の告知を遅らせる</strong> ── 大きなファイルほど、告知（Hint）を流すまで待ちます（送信と告知を結びつけられにくくなります）</span></label>
-            <label class="choice" id="presence-row"><input type="checkbox" id="hide-presence">
-              <span><strong>在席を隠す</strong> ── 起動直後の数分はトークの初回接触を受けられないことがあります（参加したことを悟られにくくなります）。次の起動から効きます</span></label>
             <label class="choice"><input type="checkbox" id="save-talk-history" checked>
               <span><strong>トーク履歴を端末に保存する</strong> ── 切ると会話が端末に残りません（パスフレーズがあれば暗号化して保存します）。切った間は発言の前後関係（遅れて届いた発言の並べ直し）も使えません</span></label>
           </div>
@@ -211,17 +209,21 @@
 
           <section class="add-friend" id="add-friend" hidden>
             <h2>友だち追加</h2>
-            <div class="qr-block">
-              <img id="my-qr" alt="自分の QR コード" width="200" height="200">
+            <p class="muted small">お互いの友だちコードを交換します。コードには、相手があなたへ最初の 1 通を送るための鍵が入っています（網には何も置きません）。</p>
+            <h3>自分のコードを渡す</h3>
+            <p class="muted small">コードは使い捨てです。渡す相手ごとに作ってください（30 日で期限が切れます）。</p>
+            <button id="btn-new-code">友だちコードを作る</button>
+            <div class="qr-block" id="my-code" hidden>
+              <img id="my-qr" alt="自分の友だちコードの QR" width="280" height="280">
               <div>
-                <p class="muted small">相手にこの QR か ID を渡してください。</p>
-                <code id="my-uri"></code>
-                <button id="btn-copy-uri">ID をコピー</button>
+                <code id="my-uri" class="friend-code"></code>
+                <button id="btn-copy-uri">コードをコピー</button>
               </div>
             </div>
+            <h3>相手のコードを追加する</h3>
             <form id="add-friend-form">
-              <label>相手の ID（aether:… または 64 文字）
-                <input id="friend-id" required spellcheck="false">
+              <label>相手の友だちコード（aether:…）。ID（64 文字）だけでも追加できますが、その場合は相手から先に送ってもらう必要があります
+                <textarea id="friend-id" rows="3" required spellcheck="false"></textarea>
               </label>
               <label>表示名（自分の端末にだけ保存）
                 <input id="friend-name" required maxlength="40">

@@ -123,7 +123,6 @@ listen("aether-event", ({ payload }) => {
 function updateModeRows() {
   const relay = document.querySelector('input[name="mode"]:checked').value === "relay";
   $("advertise-row").hidden = !relay;
-  $("presence-row").hidden = !relay;
 }
 document.querySelectorAll('input[name="mode"]').forEach((r) => r.addEventListener("change", updateModeRows));
 
@@ -137,7 +136,6 @@ function readSettings() {
     privacy: {
       delay_fetch: $("delay-fetch").checked,
       delay_release: $("delay-release").checked,
-      hide_presence: $("hide-presence").checked,
       save_talk_history: $("save-talk-history").checked,
     },
   };
@@ -152,7 +150,6 @@ function fillSettings(s) {
   const p = s.privacy ?? {};
   $("delay-fetch").checked = p.delay_fetch ?? true;
   $("delay-release").checked = p.delay_release ?? true;
-  $("hide-presence").checked = p.hide_presence ?? false;
   $("save-talk-history").checked = p.save_talk_history ?? true;
   updateModeRows();
 }
@@ -168,7 +165,7 @@ async function saveSettings() {
 }
 
 // 匿名性の切り替えは押したらすぐ保存する（接続中なら次の送受信から効く）
-for (const id of ["delay-fetch", "delay-release", "hide-presence", "save-talk-history"]) {
+for (const id of ["delay-fetch", "delay-release", "save-talk-history"]) {
   $(id).addEventListener("change", async () => {
     if (await saveSettings()) toast(state.connected ? "変更しました（次の送受信から効きます）" : "保存しました");
   });
@@ -746,18 +743,24 @@ $("chat-text").addEventListener("keydown", (e) => {
   }
 });
 
-$("btn-add-friend").addEventListener("click", async () => {
+$("btn-add-friend").addEventListener("click", () => {
   state.active = null;
   renderFriendList();
   showTalkPane("add");
-  try {
-    const qr = await invoke("my_qr");
-    // SVG はこちらで生成したもの（網由来ではない）。data URL の img として表示する
-    $("my-qr").src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(qr.svg)}`;
-    $("my-uri").textContent = qr.uri;
-  } catch (e) {
-    $("my-uri").textContent = String(e);
-  }
+  // 友だちコードは開くたびには作らない（使い捨てなので、渡すときに作る）
+  $("my-code").hidden = true;
+  $("my-qr").removeAttribute("src");
+  $("my-uri").textContent = "";
+});
+
+// 渡す相手ごとに新しいコードを作る（中の招待は使い捨て）
+$("btn-new-code").addEventListener("click", async () => {
+  const qr = await busy("友だちコードを作っています…", () => invoke("create_friend_code"));
+  if (!qr) return;
+  // SVG はこちらで生成したもの（網由来ではない）。data URL の img として表示する
+  $("my-qr").src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(qr.svg)}`;
+  $("my-uri").textContent = qr.uri;
+  $("my-code").hidden = false;
 });
 
 $("btn-copy-uri").addEventListener("click", async () => {
@@ -774,7 +777,12 @@ $("add-friend-form").addEventListener("submit", async (ev) => {
   $("friend-id").value = "";
   $("friend-name").value = "";
   await loadFriends();
-  toast(`${f.nickname} を追加しました`);
+  // ID だけ（招待なし）なら、こちらからは会話を始められない
+  toast(
+    f.has_invite
+      ? `${f.nickname} を追加しました`
+      : `${f.nickname} を追加しました（ID だけなので、相手から先に送ってもらってください）`,
+  );
   openTalk(f.node_id);
 });
 

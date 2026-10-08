@@ -5,7 +5,7 @@
 use aether_client::bbs::{ReplyContext, Res, ThreadSummary, ThreadView};
 use aether_client::{
     AetherClient, BoardId, BoardInfo, ClientConfig, Contact, Friend, KeyFiles, NodeMode,
-    RelayOptions, SendReport, Status, TalkMessage, builtin_boards, event_channel, friend_uri,
+    RelayOptions, SendReport, Status, TalkMessage, builtin_boards, event_channel,
     parse_friend_id,
 };
 use crate::settings::{self, Settings};
@@ -80,17 +80,9 @@ pub async fn app_info(state: State<'_, AppState>) -> CmdResult<AppInfo> {
 pub async fn save_settings(state: State<'_, AppState>, settings: Settings) -> CmdResult<()> {
     settings::save(&state.data_dir, &settings)?;
     if let Some(client) = state.client.read().await.as_ref() {
-        client.set_privacy(privacy_of(&settings));
+        client.set_privacy(settings.privacy.clone());
     }
     Ok(())
-}
-
-/// 実際に使う匿名性の設定（在席を隠すのは常駐のときだけ意味がある）
-fn privacy_of(settings: &Settings) -> aether_client::PrivacyOptions {
-    aether_client::PrivacyOptions {
-        hide_presence: settings.relay && settings.privacy.hide_presence,
-        ..settings.privacy.clone()
-    }
 }
 
 /// 私信の身元（identity.key）を作る。返り値は NodeId（hex）
@@ -178,7 +170,7 @@ pub async fn connect(
             min_relays: 3,
             mode,
             network: Default::default(),
-            privacy: privacy_of(&settings),
+            privacy: settings.privacy.clone(),
         },
         events,
     )
@@ -202,8 +194,6 @@ pub async fn connect(
             .collect::<aether_client::Result<Vec<_>>>()
             .map_err(err)?;
         client.start_receiving(contacts, Vec::new()).await.map_err(err)?;
-        // 誰からでも初回接触を受けられるよう、プレキー束を公開しておく
-        client.start_prekey_publisher().map_err(err)?;
     }
 
     let my_node_id = client
@@ -356,26 +346,39 @@ pub async fn friends(state: State<'_, AppState>) -> CmdResult<Vec<Friend>> {
     state.client().await?.keys().load_friends().map_err(err)
 }
 
-/// 友だちを追加する（`aether:<hex>` か hex）。受信中なら即座に受信対象に加える
+#[derive(Serialize)]
+pub struct AddedFriend {
+    #[serde(flatten)]
+    friend: Friend,
+    /// 友だちコードに招待が入っていた（こちらから会話を始められる）
+    has_invite: bool,
+}
+
+/// 友だちを追加する（友だちコード `aether:…`、または ID だけ）。受信中なら即座に受信対象に加える
+///
+/// コードの招待は確かめてから保存する（期限切れ・書き換えは拒否）。
 #[tauri::command]
 pub async fn add_friend(
     state: State<'_, AppState>,
     id: String,
     nickname: String,
-) -> CmdResult<Friend> {
+) -> CmdResult<AddedFriend> {
     let client = state.client().await?;
-    let node_id = parse_friend_id(&id).map_err(err)?;
-    if client.my_node_id().ok() == Some(node_id) {
-        return Err("自分自身は追加できません".into());
+    if nickname.trim().is_empty() {
+        return Err("表示名を入れてください".into());
     }
-    let friend = client.keys().add_friend(&node_id, &nickname).map_err(err)?;
+    let code = client.accept_friend_code(&id).map_err(err)?;
+    let friend = client.keys().add_friend(&code.node_id, &nickname).map_err(err)?;
     client
         .add_contact(Contact {
-            node_id,
+            node_id: code.node_id,
             secret: None,
         })
         .map_err(err)?;
-    Ok(friend)
+    Ok(AddedFriend {
+        friend,
+        has_invite: code.invite.is_some(),
+    })
 }
 
 /// 友だちを削除する（トーク履歴も一緒に消える）
@@ -397,11 +400,10 @@ pub struct MyQr {
     svg: String,
 }
 
-/// 自分の宛先の QR（友だち追加用）
+/// 新しい友だちコードとその QR を作る（渡す相手ごとに呼ぶ。中の招待は使い捨て）
 #[tauri::command]
-pub async fn my_qr(state: State<'_, AppState>) -> CmdResult<MyQr> {
-    let id = state.client().await?.my_node_id().map_err(err)?;
-    let uri = friend_uri(&id);
+pub async fn create_friend_code(state: State<'_, AppState>) -> CmdResult<MyQr> {
+    let uri = state.client().await?.create_friend_code().map_err(err)?;
     let svg = render_qr(&uri)?;
     Ok(MyQr { uri, svg })
 }

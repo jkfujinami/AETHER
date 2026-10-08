@@ -34,7 +34,6 @@ fn no_delays() -> PrivacyOptions {
     PrivacyOptions {
         delay_fetch: false,
         delay_release: false,
-        hide_presence: false,
         save_talk_history: false,
     }
 }
@@ -84,13 +83,16 @@ async fn private_messages_arrive_despite_a_dead_relay_in_the_directory() {
         .await;
     }
 
-    // GUI と同じく、両者とも受信とプレキー束の公開を済ませておく。
-    // これで両者のガードは、落ちたノードが現れる前に決まる（実際の状況と揃える）
+    // GUI と同じく、友だちコードを交換し、受信を始めておく。
+    // これで Bob のガードは、落ちたノードが現れる前に決まる（実際の状況と揃える）
+    alice
+        .accept_friend_code(&bob.create_friend_code().unwrap())
+        .expect("Bob のコードを受け取る");
+    bob.accept_friend_code(&alice.create_friend_code().unwrap())
+        .expect("Alice のコードを受け取る");
     bob.start_receiving(vec![Contact { node_id: alice_id, secret: None }], Vec::new())
         .await
         .unwrap();
-    bob.publish_prekeys_now().await.expect("Bob のプレキー束");
-    alice.publish_prekeys_now().await.expect("Alice のプレキー束");
 
     // --- ここでノードが 1 台落ちる（記述子だけが全員の一覧に残る）---
     let dead = dead_relay();

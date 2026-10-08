@@ -5,10 +5,12 @@
 
 use crate::error::{ClientError, Result};
 use crate::keys::KeyFiles;
-use aether_core::crypto::identity::NodeId;
+use aether_core::crypto::identity::{Identity, NodeId};
+use aether_core::crypto::x3dh::Invite;
+use aether_core::storage::keystore::KeyStore;
 use serde::{Deserialize, Serialize};
 
-/// 友だちの共有用 URI の接頭辞（QR にもこの形で入れる）
+/// 友だちコードの接頭辞（QR にもこの形で入れる）
 pub const FRIEND_URI_PREFIX: &str = "aether:";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,16 +28,96 @@ impl Friend {
     }
 }
 
-/// 自分の宛先を共有する文字列（QR の中身）
-pub fn friend_uri(node_id: &NodeId) -> String {
-    format!("{}{}", FRIEND_URI_PREFIX, hex::encode(node_id.as_bytes()))
+/// 貼り付けられた友だちコード（または ID だけ）を読んだもの
+#[derive(Debug, Clone)]
+pub struct FriendCode {
+    pub node_id: NodeId,
+    /// 招待。ID だけのときは `None`（こちらからは会話を始められず、相手から始めてもらう）
+    pub invite: Option<Invite>,
+}
+
+/// 招待を友だちコードにする: `aether:<base64url>`
+///
+/// コードには相手がこちらへ初回の 1 通を送るための鍵（招待）が入る。招待は網に置かず、
+/// このコードだけで手渡す（置いた時刻から在席を知られないため / [`aether_core::crypto::x3dh`]）。
+/// 招待は使い捨てなので、**1 人に 1 つ**渡す。
+pub fn friend_code(invite: &Invite) -> String {
+    use base64::Engine;
+    format!(
+        "{}{}",
+        FRIEND_URI_PREFIX,
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(invite.to_bytes())
+    )
+}
+
+/// 友だちコード（`aether:<base64url>`）か ID（`aether:<hex>` / hex）を読む
+///
+/// 招待の署名と期限はここでは確かめない（[`crate::AetherClient::accept_friend_code`] が確かめる）。
+/// 貼り付けで改行や空白が混ざっても読めるよう、空白は取り除く。
+pub fn parse_friend_code(input: &str) -> Result<FriendCode> {
+    use base64::Engine;
+    let compact: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    let body = compact.strip_prefix(FRIEND_URI_PREFIX).unwrap_or(&compact);
+    if body.len() == 64 {
+        return Ok(FriendCode {
+            node_id: NodeId(crate::parse_hex32(body, "友だちの ID")?),
+            invite: None,
+        });
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body)
+        .map_err(|_| ClientError::invalid("友だちコードを読めません（途中で切れていないか確かめてください）"))?;
+    let invite = Invite::from_bytes(&bytes)
+        .map_err(|_| ClientError::invalid("友だちコードを読めません（途中で切れていないか確かめてください）"))?;
+    Ok(FriendCode {
+        node_id: invite.node_id,
+        invite: Some(invite),
+    })
+}
+
+/// 友だちコードの有効期間（30 日）。過ぎたコードでは会話を始められない
+pub const FRIEND_CODE_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// 新しい友だちコードを作る（招待の秘密は KeyStore に置き、相手から初回の 1 通が届いたら消す）
+///
+/// 網には何も出さない。呼ぶたびに別の招待になる。
+pub fn create_friend_code(identity: &Identity, keystore: &KeyStore) -> Result<String> {
+    let now = aether_core::protocol::hint::current_timestamp();
+    // ついでに期限の切れた招待を片付ける
+    keystore.prune_invites(now)?;
+    let (invite, secrets) = aether_core::crypto::x3dh::create_invite(identity, now + FRIEND_CODE_TTL_SECS);
+    keystore.save_invite_secrets(&invite.signed_prekey, &secrets)?;
+    Ok(friend_code(&invite))
+}
+
+/// 相手の友だちコードを受け取る：招待を確かめて保存し、読んだコードを返す
+///
+/// ID だけのコードも受け付ける（その相手とは、相手から始めてもらう）。
+pub fn accept_friend_code(keystore: &KeyStore, me: &NodeId, input: &str) -> Result<FriendCode> {
+    let code = parse_friend_code(input)?;
+    if code.node_id == *me {
+        return Err(ClientError::invalid("自分自身は追加できません"));
+    }
+    if let Some(invite) = &code.invite {
+        let now = aether_core::protocol::hint::current_timestamp();
+        if now >= invite.expires_at {
+            return Err(ClientError::invalid(
+                "この友だちコードは期限が切れています（相手に新しいコードを作ってもらってください）",
+            ));
+        }
+        invite.verify(&code.node_id, now).map_err(|_| {
+            ClientError::invalid("友だちコードの署名が合いません（途中で書き換えられた可能性があります）")
+        })?;
+        keystore.save_peer_invite(&code.node_id, invite)?;
+    }
+    Ok(code)
 }
 
 /// 貼り付けられた宛先（`aether:<hex>` または hex）を NodeId にする
+///
+/// 友だちコード（招待入り）も受け付け、中の NodeId を返す。
 pub fn parse_friend_id(input: &str) -> Result<NodeId> {
-    let s = input.trim();
-    let hex_part = s.strip_prefix(FRIEND_URI_PREFIX).unwrap_or(s);
-    Ok(NodeId(crate::parse_hex32(hex_part, "友だちの ID")?))
+    Ok(parse_friend_code(input)?.node_id)
 }
 
 impl KeyFiles {
@@ -144,9 +226,84 @@ mod tests {
     }
 
     #[test]
-    fn friend_uri_roundtrip() {
-        let id = NodeId([9; 32]);
-        assert_eq!(parse_friend_id(&friend_uri(&id)).unwrap(), id);
-        assert_eq!(parse_friend_id(&hex::encode(id.as_bytes())).unwrap(), id);
+    fn accepting_a_code_stores_the_invite_and_creating_one_stores_the_secret() {
+        use aether_core::crypto::identity::Identity;
+        let dir = tempfile::tempdir().unwrap();
+        let ks = KeyStore::open(dir.path()).unwrap();
+        let me = Identity::generate();
+        let friend = Identity::generate();
+
+        // 相手のコードを受け取る → 招待が保存され、次の送信で会話を始められる
+        let friend_ks_dir = tempfile::tempdir().unwrap();
+        let friend_ks = KeyStore::open(friend_ks_dir.path()).unwrap();
+        let code = create_friend_code(&friend, &friend_ks).unwrap();
+        let parsed = parse_friend_code(&code).unwrap();
+        let invite = parsed.invite.clone().unwrap();
+        assert!(
+            friend_ks.load_invite_secrets(&invite.signed_prekey).unwrap().is_some(),
+            "作った側は招待の秘密を持つ"
+        );
+
+        let accepted = accept_friend_code(&ks, &me.public_id(), &code).unwrap();
+        assert_eq!(accepted.node_id, friend.public_id());
+        assert_eq!(ks.load_peer_invite(&friend.public_id()).unwrap(), Some(invite));
+
+        // 自分のコードは追加できない
+        let mine = create_friend_code(&me, &ks).unwrap();
+        assert!(accept_friend_code(&ks, &me.public_id(), &mine).is_err());
+    }
+
+    #[test]
+    fn tampered_or_expired_codes_are_refused() {
+        use aether_core::crypto::identity::Identity;
+        use aether_core::crypto::x3dh::create_invite;
+        let dir = tempfile::tempdir().unwrap();
+        let ks = KeyStore::open(dir.path()).unwrap();
+        let me = Identity::generate();
+        let friend = Identity::generate();
+
+        let (expired, _) = create_invite(&friend, 1_000);
+        assert!(accept_friend_code(&ks, &me.public_id(), &friend_code(&expired)).is_err());
+
+        let (mut forged, _) = create_invite(&friend, u64::MAX);
+        forged.signed_prekey = [7; 32];
+        assert!(accept_friend_code(&ks, &me.public_id(), &friend_code(&forged)).is_err());
+        assert!(ks.load_peer_invite(&friend.public_id()).unwrap().is_none());
+    }
+
+    #[test]
+    fn friend_code_roundtrips_and_tolerates_line_breaks() {
+        let me = aether_core::crypto::identity::Identity::generate();
+        let (invite, _) = aether_core::crypto::x3dh::create_invite(&me, 2_000_000_000);
+        let code = friend_code(&invite);
+        assert!(code.starts_with(FRIEND_URI_PREFIX));
+        assert!(code.len() < 1800, "{} 文字", code.len());
+
+        let parsed = parse_friend_code(&code).unwrap();
+        assert_eq!(parsed.node_id, me.public_id());
+        assert_eq!(parsed.invite, Some(invite.clone()));
+
+        // メールやチャットで折り返されても読める
+        let wrapped: String = code
+            .as_bytes()
+            .chunks(70)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        assert_eq!(parse_friend_code(&wrapped).unwrap().invite, Some(invite));
+
+        // 途中で切れたコードは読めない（黙って ID だけにしない）
+        assert!(parse_friend_code(&code[..code.len() - 10]).is_err());
+    }
+
+    #[test]
+    fn bare_ids_are_still_accepted_without_an_invite() {
+        let hex_id = "ab".repeat(32);
+        for input in [hex_id.clone(), format!("{}{}", FRIEND_URI_PREFIX, hex_id)] {
+            let parsed = parse_friend_code(&input).unwrap();
+            assert_eq!(parsed.node_id, NodeId([0xab; 32]));
+            assert!(parsed.invite.is_none());
+            assert_eq!(parse_friend_id(&input).unwrap(), NodeId([0xab; 32]));
+        }
     }
 }

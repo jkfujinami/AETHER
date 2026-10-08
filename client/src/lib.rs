@@ -56,7 +56,7 @@ pub use config::{ClientConfig, NetworkParams, NodeMode, PrivacyOptions, RelayOpt
 pub use error::{ClientError, Result};
 pub use events::{ClientEvent, EventSender, MessageSource, SendState, event_channel};
 pub use fetch::Fetched;
-pub use friends::{Friend, friend_uri, parse_friend_id};
+pub use friends::{Friend, FriendCode, friend_code, parse_friend_code, parse_friend_id};
 pub use keys::KeyFiles;
 pub use receive::Contact;
 pub use send::{PublicPost, SendReport};

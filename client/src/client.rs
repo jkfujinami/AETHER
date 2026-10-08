@@ -243,8 +243,6 @@ impl AetherClient {
     }
 
     /// 匿名性の設定を変える。次の送信・受信から効く
-    ///
-    /// 「在席を隠す」は起動直後のプレキー束の公開にだけ効くので、変えても次の起動から。
     pub fn set_privacy(&self, privacy: crate::config::PrivacyOptions) {
         *self.privacy.write().unwrap() = privacy;
     }
@@ -299,18 +297,19 @@ impl AetherClient {
         Ok(ks)
     }
 
-    /// X3DH のプレキーを用意する（無ければ生成して永続化）
+    /// 自分の友だちコードを新しく作る（[`crate::friends::create_friend_code`]）
     ///
-    /// 受信・公開タスクより**先に**呼ぶこと。未生成を掴むと初回接触に応答できない。
-    pub(crate) fn ensure_prekeys(&self) -> Result<()> {
-        let ks = self.keystore()?;
-        if ks.load_prekeys()?.is_none() {
-            let id = self.keys.load_identity()?;
-            let (bundle, secrets) = aether_core::crypto::x3dh::generate_prekeys(&id, false);
-            ks.save_prekeys(&bundle, &secrets)?;
-            events::progress(&self.events, "X3DH プレキーを生成しました（初回接触を受信できます）");
-        }
-        Ok(())
+    /// コードには、相手がこちらへ初回の 1 通を送るための招待が入る。招待は使い捨てなので、
+    /// 渡す相手ごとに作る。
+    pub fn create_friend_code(&self) -> Result<String> {
+        crate::friends::create_friend_code(&self.keys.load_identity()?, &*self.keystore()?)
+    }
+
+    /// 相手の友だちコードを受け取る（[`crate::friends::accept_friend_code`]）
+    ///
+    /// 招待が入っていれば保存し、次の送信で会話を始められるようにする。
+    pub fn accept_friend_code(&self, input: &str) -> Result<crate::friends::FriendCode> {
+        crate::friends::accept_friend_code(&*self.keystore()?, &self.my_node_id()?, input)
     }
 }
 

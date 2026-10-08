@@ -23,6 +23,7 @@ name = "aether-client"
 version = "0.1.0"
 dependencies = [
  "aether-core",
+ "base64 0.22.1",
  "bincode",
  "hex",
  "rand 0.8.8",
