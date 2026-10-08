@@ -255,6 +255,8 @@ fn privacy_of(cli: &Cli) -> PrivacyOptions {
     PrivacyOptions {
         delay_fetch: !cli.no_fetch_delay,
         delay_release: !cli.no_release_delay,
+        // CLI は会話の平文を端末に残さない（受信は表示するだけ）
+        save_talk_history: false,
         ..Default::default()
     }
 }
@@ -296,7 +298,7 @@ fn spawn_event_printer(mut rx: tokio::sync::broadcast::Receiver<ClientEvent>) {
                 Ok(ClientEvent::Progress { message }) => println!("{}", message),
                 Ok(ClientEvent::Warning { message }) => eprintln!("警告: {}", message),
                 Ok(ClientEvent::SendStatus { .. }) => {}
-                Ok(ClientEvent::Received { source, text }) => {
+                Ok(ClientEvent::Received { source, text, .. }) => {
                     let from = match source {
                         MessageSource::Contact { node_id } => format!("contact {}", node_id),
                         MessageSource::Board { label } => format!("板「{}」", label),

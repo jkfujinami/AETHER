@@ -236,4 +236,15 @@ async fn private_conversation_round_trip_over_three_hops() {
     // 3. 継続（Alice もチェーンの Hint で送る）
     alice.send_private(bob_id, None, b"how are you").await.expect("send 3");
     assert_eq!(next_received(&mut bob_rx, "bob").await, "how are you");
+
+    // 両者の履歴が発言の DAG の順に並び、欠けが無い（親は相手の手元にある発言だけ）
+    for (who, keys, peer) in [("alice", alice.keys(), bob_id), ("bob", bob.keys(), alice_id)] {
+        let talk = keys.load_talk(&peer).unwrap();
+        let texts: Vec<&str> = talk.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, vec!["hello bob", "hi alice", "how are you"], "{} の履歴の並び", who);
+        assert!(talk.iter().all(|m| !m.missing_before), "{} の履歴に欠けがある", who);
+        assert!(talk[0].parents.is_empty(), "最初の発言に親は無い");
+        assert_eq!(talk[1].parents, vec![talk[0].id.clone().unwrap()], "{}: 返事の親は最初の発言", who);
+        assert_eq!(talk[2].parents, vec![talk[1].id.clone().unwrap()], "{}: 3 通目の親は返事", who);
+    }
 }

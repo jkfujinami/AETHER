@@ -518,9 +518,15 @@ impl AetherClient {
                     },
                     Origin::Public(k) => MessageSource::Board { label: k.clone() },
                 };
+                let (text, message_id, sent_at) = match &origin {
+                    Origin::Private(contact) => self.record_received_talk(contact, &msg),
+                    Origin::Public(_) => (String::from_utf8_lossy(&msg).into_owned(), None, None),
+                };
                 let _ = self.events.send(ClientEvent::Received {
                     source,
-                    text: String::from_utf8_lossy(&msg).into_owned(),
+                    text,
+                    message_id,
+                    sent_at,
                 });
 
                 // 公開コンテンツなら、受け取った者が保持者になる (18.3-C)
@@ -533,6 +539,35 @@ impl AetherClient {
                 pending.remove(&key);
             }
         }
+    }
+
+    /// 受け取った私信の本文を読み、履歴を保存する設定なら履歴へ入れる
+    ///
+    /// 戻り値は（本文, 発言 ID, 書いた時刻）。DAG 以前の古い形式は本文だけ。
+    fn record_received_talk(&self, contact: &NodeId, plain: &[u8]) -> (String, Option<String>, Option<u64>) {
+        use crate::talks::{TalkEnvelope, TalkMessage};
+
+        let (message, id, sent_at) = match TalkEnvelope::decode(plain) {
+            Some(env) => (env.to_message(false), Some(hex::encode(env.id)), Some(env.sent_at)),
+            None => (
+                TalkMessage {
+                    mine: false,
+                    text: String::from_utf8_lossy(plain).into_owned(),
+                    time: crate::talks::now_ms(),
+                    id: None,
+                    parents: Vec::new(),
+                    missing_before: false,
+                },
+                None,
+                None,
+            ),
+        };
+        if self.privacy().save_talk_history
+            && let Err(e) = self.keys.append_talk_message(contact, message.clone())
+        {
+            events::warning(&self.events, format!("トーク履歴の保存に失敗しました: {}", e));
+        }
+        (message.text, id, sent_at)
     }
 
     fn spawn_reseed(

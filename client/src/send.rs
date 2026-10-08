@@ -52,6 +52,8 @@ pub struct SendReport {
     pub content_ref: Option<String>,
     /// チャンク数（チャンク化した場合）
     pub chunks: Option<usize>,
+    /// 私信の発言 ID（hex, [`crate::talks::TalkEnvelope`]）
+    pub message_id: Option<String>,
 }
 
 impl AetherClient {
@@ -118,7 +120,17 @@ impl AetherClient {
         let hint_secret = session
             .hint_secret_for_send(aether_core::protocol::hint::current_timestamp())
             .unwrap_or(shared_secret);
-        let sealed = session.seal(message, &[])?;
+        // 本文は発言の DAG の形で包む（親 = 書いた時点で見ていた会話の先端 / crate::talks）
+        let parents = if self.privacy().save_talk_history {
+            self.keys.talk_heads(&to).unwrap_or_else(|e| {
+                events::warning(&self.events, format!("トーク履歴を読めないので、親を付けずに送ります: {}", e));
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
+        let envelope = crate::talks::TalkEnvelope::new(parents, message.to_vec());
+        let sealed = session.seal(&envelope.encode(), &[])?;
         // **封じたらすぐ保存する。** 置く途中で失敗してから保存せずにやり直すと、同じ
         // メッセージ鍵（＝同じ鍵と nonce）で別の平文を封じることになる。途中まで置いた
         // シャードが残っていれば、二つの暗号文から平文の差が漏れる。受け取る側は
@@ -148,12 +160,21 @@ impl AetherClient {
         self.release_hint(&mailbox, &hint, &profile, ticket).await?;
         self.flush_in_background(mailbox);
 
+        // 送り終えた発言だけを履歴に残す（届いていない発言を親にすると、相手の側で
+        // 「欠けがある」と出続ける）
+        if self.privacy().save_talk_history
+            && let Err(e) = self.keys.append_talk_message(&to, envelope.to_message(true))
+        {
+            events::warning(&self.events, format!("トーク履歴の保存に失敗しました: {}", e));
+        }
+
         Ok(SendReport {
             body_exit: report_exits.0,
             hint_exit: Some(report_exits.1),
             bytes: profile.bytes,
             content_ref: None,
             chunks: None,
+            message_id: Some(hex::encode(envelope.id)),
         })
     }
 
@@ -195,6 +216,7 @@ impl AetherClient {
                 bytes: post.content.len() as u64,
                 content_ref: Some(hex::encode(content_ref)),
                 chunks: Some(chunks),
+                message_id: None,
             }
         } else {
             // 内容アドレスで置く（取得側が中身を ref と照合できる）
@@ -218,6 +240,7 @@ impl AetherClient {
                 bytes: profile.bytes,
                 content_ref: Some(hex::encode(content_ref)),
                 chunks: None,
+                message_id: None,
             }
         };
 

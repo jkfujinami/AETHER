@@ -7,121 +7,46 @@
 //!   分岐を収束させられるため（IOTA tangle / git と同型）。
 //! - **決定論的トポロジカル順序。** 全ノードが同じ DAG から同じ並びを再現できるよう、
 //!   Kahn のアルゴリズムで因果順を保ちつつ、同時処理可能なものを
-//!   `(timestamp 昇順 → content_ref 昇順)` で一意に並べる。
+//!   `(timestamp 昇順 → content_ref 昇順)` で一意に並べる（[`crate::dag`]、トークと共通）。
 //! - **掲示板 = スレッド一覧。** スレッド（parents が空の根）を [`hn_score`] で
 //!   ランク付けして並べる（Hacker News 流：熱量 ÷ 時間の重力）。
 //!
 //! 索引レコードは K_pub で封じられているので、保持者にはスレッド構造も見えない。
 
 use crate::mailbox::index::IndexDescriptor;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// 投稿の識別子（= その投稿の `content_ref`）
 pub type PostId = [u8; 32];
 
-/// content_ref → `descriptors` 内のインデックス
-fn index_of(descriptors: &[IndexDescriptor]) -> HashMap<PostId, usize> {
-    descriptors
-        .iter()
-        .enumerate()
-        .map(|(i, d)| (d.content_ref, i))
-        .collect()
-}
-
-/// 並び替えのタイブレーク鍵：(timestamp 昇順, content_ref 昇順)
-fn tiebreak(d: &IndexDescriptor) -> (u64, PostId) {
-    (d.timestamp, d.content_ref)
+impl crate::dag::DagNode for IndexDescriptor {
+    type Id = PostId;
+    fn id(&self) -> PostId {
+        self.content_ref
+    }
+    fn parents(&self) -> &[PostId] {
+        &self.parents
+    }
+    fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
 }
 
 /// DAG を決定論的トポロジカル順に並べる（戻り値は `descriptors` へのインデックス列）
 ///
-/// 親が先に来る。DAG に**存在しない**親参照は無視する（まだ取得できていない親は
-/// 数えず、その投稿を根として扱って迷子にしない）。万一循環があっても、
-/// 残りを末尾に足して全件返す（黙って落とさない）。
+/// 並べ方は [`crate::dag::topological_order`]（トークと共通）。
 pub fn topological_order(descriptors: &[IndexDescriptor]) -> Vec<usize> {
-    let idx = index_of(descriptors);
-    let n = descriptors.len();
-
-    let mut in_degree = vec![0usize; n];
-    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
-
-    for (i, d) in descriptors.iter().enumerate() {
-        for parent in &d.parents {
-            if let Some(&pi) = idx.get(parent) {
-                in_degree[i] += 1;
-                children.entry(pi).or_default().push(i);
-            }
-        }
-    }
-
-    // ready を (timestamp, id) 昇順に保つ
-    let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
-    ready.sort_by(|&a, &b| tiebreak(&descriptors[a]).cmp(&tiebreak(&descriptors[b])));
-
-    let mut order = Vec::with_capacity(n);
-    while !ready.is_empty() {
-        let next = ready.remove(0);
-        order.push(next);
-
-        if let Some(kids) = children.get(&next) {
-            for &c in kids {
-                in_degree[c] -= 1;
-                if in_degree[c] == 0 {
-                    let key = tiebreak(&descriptors[c]);
-                    let pos = ready
-                        .binary_search_by(|&x| tiebreak(&descriptors[x]).cmp(&key))
-                        .unwrap_or_else(|e| e);
-                    ready.insert(pos, c);
-                }
-            }
-        }
-    }
-
-    // 循環に巻き込まれて処理されなかったものを末尾に（決定論のため id 順）
-    if order.len() < n {
-        let placed: HashSet<usize> = order.iter().copied().collect();
-        let mut rest: Vec<usize> = (0..n).filter(|i| !placed.contains(i)).collect();
-        rest.sort_by(|&a, &b| tiebreak(&descriptors[a]).cmp(&tiebreak(&descriptors[b])));
-        order.extend(rest);
-    }
-
-    order
+    crate::dag::topological_order(descriptors)
 }
 
 /// トポロジカル順を前提に、各投稿の表示深さ（親からの最長距離）を求める
-///
-/// `order` の順で処理すれば親の深さが先に確定する。根は 0。
 pub fn depths(descriptors: &[IndexDescriptor], order: &[usize]) -> HashMap<usize, usize> {
-    let idx = index_of(descriptors);
-    let mut depth: HashMap<usize, usize> = HashMap::new();
-
-    for &i in order {
-        let d = descriptors[i]
-            .parents
-            .iter()
-            .filter_map(|p| idx.get(p))
-            .filter_map(|pi| depth.get(pi))
-            .map(|&x| x + 1)
-            .max()
-            .unwrap_or(0);
-        depth.insert(i, d);
-    }
-    depth
+    crate::dag::depths(descriptors, order)
 }
 
 /// DAG の先端（子を持たない投稿）。新しい投稿はここへ親参照を張る
 pub fn tips(descriptors: &[IndexDescriptor]) -> Vec<PostId> {
-    let mut has_child: HashSet<PostId> = HashSet::new();
-    for d in descriptors {
-        for p in &d.parents {
-            has_child.insert(*p);
-        }
-    }
-    descriptors
-        .iter()
-        .map(|d| d.content_ref)
-        .filter(|id| !has_child.contains(id))
-        .collect()
+    crate::dag::tips(descriptors)
 }
 
 /// スレッドの根（parents が空 = 新規スレッド）を `descriptors` のインデックスで返す
@@ -144,7 +69,11 @@ pub fn cumulative_pow(
     order: &[usize],
     pow_bits: &[u32],
 ) -> Vec<u32> {
-    let idx = index_of(descriptors);
+    let idx: HashMap<PostId, usize> = descriptors
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (d.content_ref, i))
+        .collect();
     let mut cum = vec![0u32; descriptors.len()];
 
     for &i in order {

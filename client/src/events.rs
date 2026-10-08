@@ -17,9 +17,16 @@ pub enum ClientEvent {
     /// 送信の進み具合（`ticket` は送信を頼んだ側が付けた番号）
     SendStatus { ticket: u64, status: SendState },
     /// メッセージを受信した
+    ///
+    /// 私信は、履歴を保存する設定なら流す前に履歴へ入れてある（画面は履歴を読み直せば
+    /// 並んだ位置に出せる）。
     Received {
         source: MessageSource,
         text: String,
+        /// 私信の発言 ID（hex）。公開の投稿・DAG 以前の古い私信は `None`
+        message_id: Option<String>,
+        /// 私信を書いた時刻（UNIX ミリ秒、書き手の時計）
+        sent_at: Option<u64>,
     },
 }
 

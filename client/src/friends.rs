@@ -127,7 +127,7 @@ mod tests {
         let keys = KeyFiles::new(dir.path(), None);
         let id = NodeId([8; 32]);
         keys.add_friend(&id, "たろう").unwrap();
-        keys.append_talk_message(&id, crate::talks::TalkMessage { mine: true, text: "hi".into(), time: 1 })
+        keys.append_talk_message(&id, crate::talks::TalkEnvelope::new(Vec::new(), b"hi".to_vec()).to_message(true))
             .unwrap();
 
         keys.remove_friend(&id).unwrap();

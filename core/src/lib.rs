@@ -3,6 +3,7 @@ pub mod config;
 pub mod net;
 pub mod crypto;
 pub mod mailbox;
+pub mod dag;
 pub mod dht;
 pub mod storage;
 pub mod protocol;

@@ -49,6 +49,12 @@ pub struct PrivacyOptions {
     /// 絞り込みに使える）。有効にすると起動直後の数分は初回接触を受けられないことがある。
     /// どちらでも、今の期間にも前の期間にも束を置いていなければすぐに置く。
     pub hide_presence: bool,
+    /// トーク（私信）の履歴を端末に保存する（既定: 有効）
+    ///
+    /// 保存すると、次に書く発言の親（会話の先端）を履歴から決められ、遅れて届いた発言も
+    /// 書かれた位置に並ぶ（[`crate::talks`]）。代わりに会話の平文が端末に残る
+    /// （パスフレーズがあれば暗号化される）。切ると親を付けずに送る。
+    pub save_talk_history: bool,
 }
 
 impl Default for PrivacyOptions {
@@ -57,6 +63,7 @@ impl Default for PrivacyOptions {
             delay_fetch: true,
             delay_release: true,
             hide_presence: false,
+            save_talk_history: true,
         }
     }
 }
