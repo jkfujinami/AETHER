@@ -273,7 +273,8 @@ impl AetherClient {
             .map(|(b, _)| b)
             .ok_or_else(|| ClientError::invalid("プレキーが未生成です"))?;
 
-        let circuit = self.build_circuit(&[]).await?;
+        // 束が途中で消えると、置き直すまで誰からも初回接触を受けられない
+        let circuit = self.open_probed_circuit(&[]).await?.circuit;
         let mailbox = SchrodingerMailbox::with_directory(
             Arc::new(circuit.client),
             Arc::new(GossipClient::new(RelayClient::new()?)),

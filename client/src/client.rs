@@ -35,6 +35,8 @@ pub struct AetherClient {
     pub(crate) pending_flush: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// 受信中なら、その購読（友だち追加で増やす）
     pub(crate) receiver: std::sync::Mutex<Option<Arc<crate::receive::Receiver>>>,
+    /// 疎通確認に失敗した回路の中継点。組み直すときに避ける
+    pub(crate) suspects: crate::circuit::Suspects,
 }
 
 impl AetherClient {
@@ -226,6 +228,7 @@ impl AetherClient {
             keystore: std::sync::Mutex::new(None),
             pending_flush: std::sync::Mutex::new(Vec::new()),
             receiver: std::sync::Mutex::new(None),
+            suspects: Default::default(),
         }))
     }
 

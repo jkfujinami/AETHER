@@ -11,13 +11,22 @@
 //!   構築者（＝受信者）の IP を gateway に晒して Inbound Tunnel の意味が消える。
 //! - **ガードは返信を「自分が張った接続」の上で返す**（アドレス宛てにしない）。
 //!   一回限りのクライアントは広告アドレスを持たず、NAT の内側にもいる。
+//!
+//! # 一周の疎通確認
+//!
+//! 中間・出口・gateway の生死は、直接確かめると IP を晒す。組んだ回路から自分の
+//! 返信トンネルへ目印を送り、戻ってくるかで確かめる。戻らなければ、その回路の
+//! 中継点をしばらく避けて組み直す。受信・検索・取得だけでなく送信の回路もこれを通す
+//! （入口へ書けた時点で送信は成功扱いになるので、途中で消えても送り手には見えない）。
 
+use crate::circuit::Circuit;
 use crate::client::AetherClient;
 use crate::error::{ClientError, Result};
 use aether_core::crypto::identity::NodeId;
 use aether_core::mailbox::schrodinger::SchrodingerMailbox;
 use aether_core::net::gossip::GossipClient;
 use aether_core::net::relay::RelayClient;
+use aether_core::net::relay_list::RelayDescriptor;
 use aether_core::net::tunnel::{InboundTunnel, TunnelEndpoint};
 use aether_core::protocol::wire::PacketType;
 use std::collections::HashMap;
@@ -41,6 +50,13 @@ pub(crate) struct PullSession {
     pub gateway: std::net::SocketAddr,
 }
 
+/// 一周の疎通確認に通った 3 ホップ回路と、その返信トンネル
+pub(crate) struct ProbedCircuit {
+    pub circuit: Circuit,
+    pub tunnel: InboundTunnel,
+    pub gateway: std::net::SocketAddr,
+}
+
 impl AetherClient {
     /// 返信トンネルと要求用の回路を張る
     ///
@@ -49,15 +65,39 @@ impl AetherClient {
         &self,
         contacts: HashMap<NodeId, [u8; 32]>,
     ) -> Result<PullSession> {
-        // 中間・出口・gateway の生死は、直接確かめると IP を晒す。
-        // 組んだあとで自分宛てに一周させて確かめ、戻らなければ別のリレーで組み直す
+        let ProbedCircuit {
+            circuit,
+            tunnel,
+            gateway,
+        } = self.open_probed_circuit(&[]).await?;
+
+        let receive_tunnel_id = tunnel.receive_tunnel_id;
+        let reply_to = tunnel.endpoint.clone();
+        let mailbox = SchrodingerMailbox::with_directory(
+            Arc::new(circuit.client),
+            Arc::new(GossipClient::new(RelayClient::new()?)),
+            Arc::new(Mutex::new(contacts)),
+            self.node.directory(),
+        );
+        mailbox.register_inbound_tunnel(tunnel);
+
+        Ok(PullSession {
+            mailbox,
+            receive_tunnel_id,
+            reply_to,
+            gateway,
+        })
+    }
+
+    /// 3 ホップ回路と返信トンネルを組み、自分宛てに一周させて確かめる
+    ///
+    /// 戻らなければ、その回路の中継点を避けて組み直す（[`PULL_ATTEMPTS`] 回まで）。
+    /// `avoid_exit` は出口にだけ使わない相手（回路分離）。
+    pub(crate) async fn open_probed_circuit(&self, avoid_exit: &[NodeId]) -> Result<ProbedCircuit> {
         let mut last_err = None;
         for attempt in 1..=PULL_ATTEMPTS {
-            match self.try_open_pull_session(contacts.clone()).await {
-                Ok(session) => match self.probe(&session).await {
-                    Ok(()) => return Ok(session),
-                    Err(e) => last_err = Some(e),
-                },
+            match self.try_probed_circuit(avoid_exit).await {
+                Ok(probed) => return Ok(probed),
                 Err(e) => last_err = Some(e),
             }
             if attempt < PULL_ATTEMPTS {
@@ -67,24 +107,46 @@ impl AetherClient {
         Err(last_err.unwrap_or_else(|| ClientError::network("回路を組めませんでした")))
     }
 
+    async fn try_probed_circuit(&self, avoid_exit: &[NodeId]) -> Result<ProbedCircuit> {
+        let circuit = self.build_circuit(avoid_exit).await?;
+        let (tunnel, middle2, gateway) = self.build_reply_tunnel(&circuit).await?;
+        let hops = [
+            circuit.middle.node_id,
+            circuit.exit.node_id,
+            middle2.node_id,
+            gateway.node_id,
+        ];
+        match self.probe(&circuit.client, &tunnel, gateway.addr).await {
+            Ok(()) => {
+                self.clear_suspects(&hops);
+                Ok(ProbedCircuit {
+                    circuit,
+                    tunnel,
+                    gateway: gateway.addr,
+                })
+            }
+            Err(e) => {
+                self.mark_suspects(&hops);
+                Err(e)
+            }
+        }
+    }
+
     /// 回路 → gateway → 中間 → ガード → 自分 と目印を一周させ、戻ってくるか確かめる
-    async fn probe(&self, session: &PullSession) -> Result<()> {
+    async fn probe(&self, client: &RelayClient, tunnel: &InboundTunnel, gateway: std::net::SocketAddr) -> Result<()> {
         let marker: [u8; 32] = rand::random();
-        let mut data = session.reply_to.tunnel_id.to_vec();
+        let mut data = tunnel.endpoint.tunnel_id.to_vec();
         data.extend_from_slice(&marker);
-        session
-            .mailbox
-            .relay_client()
-            .send_onion_message_typed(PacketType::TunnelData, &data, session.gateway)
+        client
+            .send_onion_message_typed(PacketType::TunnelData, &data, gateway)
             .await?;
 
         let until = tokio::time::Instant::now() + PROBE_WAIT;
         while tokio::time::Instant::now() < until {
-            let raw = self.take_replies(&session.receive_tunnel_id).await?;
-            if session
-                .mailbox
-                .decrypt_replies(&raw)
+            let raw = self.take_replies(&tunnel.receive_tunnel_id).await?;
+            if raw
                 .iter()
+                .filter_map(|d| tunnel.decrypt(d).ok())
                 .any(|m| m.as_slice() == marker)
             {
                 return Ok(());
@@ -94,11 +156,11 @@ impl AetherClient {
         Err(ClientError::network("回路か返信トンネルが応答しません"))
     }
 
-    async fn try_open_pull_session(
+    /// 回路の返信トンネル（gateway → 中間2 → ガード → 自分）を張る
+    async fn build_reply_tunnel(
         &self,
-        contacts: HashMap<NodeId, [u8; 32]>,
-    ) -> Result<PullSession> {
-        let circuit = self.build_circuit(&[]).await?;
+        circuit: &Circuit,
+    ) -> Result<(InboundTunnel, RelayDescriptor, RelayDescriptor)> {
         let me = self.node.descriptor.node_id;
         let guard = circuit.guard.clone();
 
@@ -106,14 +168,15 @@ impl AetherClient {
         let directory = self.node.directory();
         let (middle2, gateway) = {
             let dir = directory.read().await;
-            dir.circuit_hops(
+            self.pick_hops(
+                &dir,
                 &guard.node_id,
                 &[guard.addr],
                 &[me, circuit.middle.node_id, circuit.exit.node_id],
                 &[],
             )
             .or_else(|| {
-                dir.circuit_hops(&guard.node_id, &[guard.addr], &[me], &[circuit.exit.node_id])
+                self.pick_hops(&dir, &guard.node_id, &[guard.addr], &[me], &[circuit.exit.node_id])
             })
             .ok_or_else(|| {
                 ClientError::network("返信トンネルを組めません（到達可能なリレーが足りません）")
@@ -153,25 +216,8 @@ impl AetherClient {
             .send_onion_message_typed(PacketType::TunnelBuild, &gw_build.1, gateway.addr)
             .await?;
 
-        let receive_tunnel_id = tunnel.receive_tunnel_id;
-        let reply_to = tunnel.endpoint.clone();
-
-        let mailbox = SchrodingerMailbox::with_directory(
-            Arc::new(circuit.client),
-            Arc::new(GossipClient::new(RelayClient::new()?)),
-            Arc::new(Mutex::new(contacts)),
-            self.node.directory(),
-        );
-        mailbox.register_inbound_tunnel(tunnel);
-
         tokio::time::sleep(TUNNEL_SETTLE).await;
-
-        Ok(PullSession {
-            mailbox,
-            receive_tunnel_id,
-            reply_to,
-            gateway: gateway.addr,
-        })
+        Ok((tunnel, middle2, gateway))
     }
 
     /// 自分宛てに届いた返信を取り出す（取り出したものは消える）
