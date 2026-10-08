@@ -308,7 +308,7 @@ impl AetherClient {
         }
 
         // 切り替えで無効なら待たない（PrivacyOptions::delay_release）
-        let delay = if self.privacy.delay_release {
+        let delay = if self.privacy().delay_release {
             policy.delay_for(profile)
         } else {
             Duration::ZERO

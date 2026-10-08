@@ -28,7 +28,8 @@ pub struct ClientConfig {
 /// 匿名性のために入れる遅延の切り替え
 ///
 /// どれも「いつ」を観測者から隠すための遅延で、切ると速くなる代わりに守りが弱まる。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PrivacyOptions {
     /// 自分宛ての Hint を見つけてから本体を取りに行くまで 0〜60 秒ずらす（既定: 有効）
     ///

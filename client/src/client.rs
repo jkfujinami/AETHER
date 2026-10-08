@@ -27,8 +27,8 @@ pub struct AetherClient {
     pub(crate) events: EventSender,
     pub(crate) min_relays: usize,
     pub(crate) relay_mode: bool,
-    /// 匿名性のための遅延の切り替え
-    pub(crate) privacy: crate::config::PrivacyOptions,
+    /// 匿名性のための遅延の切り替え（接続中でも [`set_privacy`](Self::set_privacy) で変えられる）
+    privacy: std::sync::RwLock<crate::config::PrivacyOptions>,
     /// 1 プロセス 1 ハンドル（sled の排他ロック）。私信を使うときに開く
     keystore: std::sync::Mutex<Option<Arc<KeyStore>>>,
     /// 書き出し待ちの送信回路（[`AetherClient::flush`] で待つ）
@@ -224,7 +224,7 @@ impl AetherClient {
             events,
             min_relays: config.min_relays,
             relay_mode,
-            privacy: config.privacy.clone(),
+            privacy: std::sync::RwLock::new(config.privacy.clone()),
             keystore: std::sync::Mutex::new(None),
             pending_flush: std::sync::Mutex::new(Vec::new()),
             receiver: std::sync::Mutex::new(None),
@@ -235,6 +235,18 @@ impl AetherClient {
     /// イベントを購読する
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::ClientEvent> {
         self.events.subscribe()
+    }
+
+    /// 今の匿名性の設定
+    pub fn privacy(&self) -> crate::config::PrivacyOptions {
+        self.privacy.read().unwrap().clone()
+    }
+
+    /// 匿名性の設定を変える。次の送信・受信から効く
+    ///
+    /// 「在席を隠す」は起動直後のプレキー束の公開にだけ効くので、変えても次の起動から。
+    pub fn set_privacy(&self, privacy: crate::config::PrivacyOptions) {
+        *self.privacy.write().unwrap() = privacy;
     }
 
     /// 私信の宛先としての自分の NodeId（identity.key）

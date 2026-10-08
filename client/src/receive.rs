@@ -226,7 +226,7 @@ impl AetherClient {
                 .ok()
                 .flatten()
                 .is_some_and(|last| last + 1 >= period);
-            if this.privacy.hide_presence && reachable {
+            if this.privacy().hide_presence && reachable {
                 tokio::time::sleep(random_below(PREKEY_FIRST_DELAY_MAX)).await;
             }
             // 起動直後の 1 回目は、リレー一覧が出揃う前に置くことがある（保持者の計算が
@@ -356,7 +356,7 @@ impl AetherClient {
                         {
                             // **すぐには取りに行かない。** Hint の放流直後に取得が出ると、
                             // 放流時刻とガードの観測を突き合わせて受信者を特定できる
-                            let delay = if self.privacy.delay_fetch { fetch_jitter() } else { Duration::ZERO };
+                            let delay = if self.privacy().delay_fetch { fetch_jitter() } else { Duration::ZERO };
                             events::progress(
                                 &self.events,
                                 format!("自分宛ての Hint を検出。{} 秒後に本体を取り寄せます", delay.as_secs()),
