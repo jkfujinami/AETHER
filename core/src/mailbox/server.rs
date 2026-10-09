@@ -753,8 +753,11 @@ mod tests {
     #[tokio::test]
     async fn index_list_puts_stronger_pow_first() {
         let (s, _dir) = server_with(24);
-        let weak = record("weak", 10);
         let strong = record("strong", 14);
+        // 難易度は下限なので、弱い方が偶然 strong 以上のビットを満たすことがある。満たさないものを使う
+        let weak = std::iter::repeat_with(|| record("weak", 10))
+            .find(|w| w.pow_bits() < strong.pow_bits())
+            .unwrap();
         s.handle_index_put(&index_put([9; 32], &weak)).await.unwrap();
         s.handle_index_put(&index_put([9; 32], &strong)).await.unwrap();
         let listed = s.handle_index_list(&[9; 32]).await.unwrap();
