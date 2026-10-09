@@ -21,8 +21,8 @@ use aether_core::mailbox::schrodinger::{K_REPLICAS, SchrodingerMailbox};
 use aether_core::mailbox::sharding::{DATA_SHARDS, TOTAL_SHARDS};
 use aether_core::mailbox::sharding_v2;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 /// 索引の返信を待つ上限（何も無いときはここまで待つ）
 const SEARCH_WAIT: Duration = Duration::from_secs(8);
@@ -88,12 +88,27 @@ fn hedge_plan(elapsed: Duration) -> Vec<(u8, usize)> {
 /// 1 本が揃うたびに次の 1 本を要求する滑る窓にして、受け箱に溜まる量を
 /// 最悪でも `4 × (16 + m) × 256KiB`（m=27 で約 43MB）に抑える。
 const V2_STRIPES_IN_FLIGHT: usize = 4;
-/// 1 ストライプの最初の要求から、揃うまで待つ上限
+/// 追い越された要求を「失われた」とみなすまでの猶予
 ///
-/// 1 ストライプは k+m 枚を別々の保持者から集める。段階的に広げる `HEDGE_1`（2 秒）の後に
-/// パリティも全部要求した状態で、落ちた保持者を見切って待ち続けないための上限。
-/// `OBJECT_WAIT`（15 秒）より長いのは、1 回の要求で 4MiB 分（16 枚）を回路と返信トンネルに流すため。
-const V2_STRIPE_WAIT: Duration = Duration::from_secs(30);
+/// 返信は同じ返信トンネルをほぼ要求順に通るので、回線が遅いだけなら先の要求の返信は後の要求の
+/// 返信より先に届く。後の要求の返信が届いたのに先の要求の返信がまだなら、保持者が黙ったか
+/// 返信が落ちたと見てよい。3 秒は、保持者ごとの応答のばらつきと回路の揺れを見込んだ値
+/// （回線の速さには依存しない。1 ストライプに 7 秒かかる回線でも、順に届く限り足さない）。
+const V2_LATE: Duration = Duration::from_secs(3);
+/// 何も届かない状態が続いたとき、要求を「失われた」とみなすまでの静けさ
+///
+/// 追い越しでは見つからない場合（全員が落ちた・最後の数枚）のため。このファイルの取得で最後に
+/// 何かが届いてから、かつその要求を送ってから、どちらも `V2_IDLE` 経ったものだけを失われたとみなす。
+/// 取得の始めは何も届いていないので、最初の返信が届くまでの往復（3 ホップの回路 + 保持者 +
+/// 3 ホップの返信トンネル。実網で数秒）より十分長くする。短いと、遅い網では始めの要求が全部
+/// 失われたとみなされ、データと同じ枚数のパリティを一斉に取ってしまう。
+const V2_IDLE: Duration = Duration::from_secs(8);
+/// ストライプを諦めるまでの待ち
+///
+/// そのストライプの k+m 位置をすべて要求し終え、k 枚に届かず、届いていない要求がすべて
+/// 失われたとみなされてから、これだけ待って諦める。失われたとみなした要求の返信が遅れて届くことは
+/// あるので、すぐには切らない。遅いが進んでいる転送は、失われたと見なされないので諦めない。
+const V2_GIVE_UP: Duration = Duration::from_secs(30);
 /// 取得の進み具合を知らせる間隔
 const V2_PROGRESS_EVERY: Duration = Duration::from_secs(1);
 
@@ -148,8 +163,6 @@ impl StripeWindow {
 struct StripeState {
     /// データ k 個 → パリティ m 個の順。ハッシュが合って届いたものだけが入る
     got: Vec<Option<Vec<u8>>>,
-    started: Option<tokio::time::Instant>,
-    parity_requested: bool,
     done: bool,
 }
 
@@ -159,22 +172,179 @@ impl StripeState {
     }
 }
 
+/// 送った要求 1 本（届くまで持つ）
+struct InFlight {
+    stripe: usize,
+    pos: usize,
+    /// 要求を送った順の通し番号
+    seq: u64,
+    sent: Instant,
+    /// 失われたとみなした時刻。返信が後から届けば普通に使う（要求は届いた時点で消える）
+    lost_at: Option<Instant>,
+}
+
+/// [`HedgeTracker`] が持つストライプ 1 本ぶん
+struct StripeTrack {
+    /// データの位置の数
+    k: usize,
+    requested: Vec<bool>,
+    filled: Vec<bool>,
+}
+
+/// 失われた要求を見分けて、その分だけパリティを足す純粋な状態機械（時刻は引数で渡す）
+///
+/// 失われたかどうかは回線の速さではなく、次の 2 つだけで決める。
+/// - **追い越し**: 届いていない要求より後の通し番号の要求が届き、その時刻から [`V2_LATE`] 過ぎた。
+/// - **途切れ**: 最後に何かが届いてから [`V2_IDLE`]、かつその要求を送ってから [`V2_IDLE`] 過ぎた。
+///
+/// 失われた要求 1 本につき、同じストライプのまだ要求していないパリティの位置を 1 つだけ要求する
+/// （1 本の要求につき 1 回まで。パリティが尽きたら足さない）。足したパリティの要求も要求なので、
+/// 同じ規則で失われうる。ストライプを諦める条件は [`gave_up`](Self::gave_up)。
+struct HedgeTracker {
+    stripes: HashMap<usize, StripeTrack>,
+    /// 届いていない要求（通し番号の昇順）
+    pending: Vec<InFlight>,
+    next_seq: u64,
+    /// 届いた要求の（通し番号, 時刻）。まだ `V2_LATE` 経っていないもの
+    recent_arrivals: VecDeque<(u64, Instant)>,
+    /// `V2_LATE` 以上前に届いた要求の通し番号の最大。これより前の通し番号の未着は追い越された
+    overtaken_below: Option<u64>,
+    /// このファイルの取得で最後に何かが届いた時刻（始まりは取得の開始）
+    last_arrival: Instant,
+}
+
+impl HedgeTracker {
+    fn new(now: Instant) -> Self {
+        Self {
+            stripes: HashMap::new(),
+            pending: Vec::new(),
+            next_seq: 0,
+            recent_arrivals: VecDeque::new(),
+            overtaken_below: None,
+            last_arrival: now,
+        }
+    }
+
+    fn push(&mut self, stripe: usize, pos: usize, now: Instant) {
+        self.pending.push(InFlight { stripe, pos, seq: self.next_seq, sent: now, lost_at: None });
+        self.next_seq += 1;
+    }
+
+    /// ストライプを始める。データ k 位置すべてを要求したことにする
+    ///
+    /// `filled` は始める時点ですでに埋まっている位置（他のストライプの返信で埋まったもの）。
+    /// その位置の要求も送るが、返信は [`route_reply`] が捨てるので届いた扱いにして待たない。
+    fn start_stripe(&mut self, stripe: usize, k: usize, filled: &[bool], now: Instant) {
+        let mut requested = vec![false; filled.len()];
+        for pos in 0..k.min(filled.len()) {
+            requested[pos] = true;
+            if !filled[pos] {
+                self.push(stripe, pos, now);
+            }
+        }
+        self.stripes.insert(stripe, StripeTrack { k, requested, filled: filled.to_vec() });
+    }
+
+    /// 位置が埋まった。その位置への要求はすべて届いた扱いにする（同じハッシュの複数位置も、
+    /// [`route_reply`] が返した位置ごとに呼ぶ）
+    fn on_filled(&mut self, stripe: usize, pos: usize, now: Instant) {
+        self.last_arrival = now;
+        let Some(track) = self.stripes.get_mut(&stripe) else { return };
+        if let Some(f) = track.filled.get_mut(pos) {
+            *f = true;
+        }
+        let seqs: Vec<u64> =
+            self.pending.iter().filter(|r| r.stripe == stripe && r.pos == pos).map(|r| r.seq).collect();
+        self.pending.retain(|r| !(r.stripe == stripe && r.pos == pos));
+        for seq in seqs {
+            self.recent_arrivals.push_back((seq, now));
+        }
+    }
+
+    /// ストライプを終える（揃った・諦めた）。そのストライプの未着はもう見ない
+    fn finish_stripe(&mut self, stripe: usize) {
+        self.stripes.remove(&stripe);
+        self.pending.retain(|r| r.stripe != stripe);
+    }
+
+    /// 失われた要求を見つけ、足すパリティの（ストライプ, 位置）を返す。返した位置は要求したことになる
+    fn poll(&mut self, now: Instant) -> Vec<(usize, usize)> {
+        // V2_LATE 以上前に届いたものだけが「追い越した」証拠になる
+        while let Some(&(seq, at)) = self.recent_arrivals.front() {
+            if now.saturating_duration_since(at) < V2_LATE {
+                break;
+            }
+            self.overtaken_below = Some(self.overtaken_below.map_or(seq, |m| m.max(seq)));
+            self.recent_arrivals.pop_front();
+        }
+        let idle = now.saturating_duration_since(self.last_arrival) >= V2_IDLE;
+        let mut hedges = Vec::new();
+        let mut newly_lost = Vec::new();
+        for r in &mut self.pending {
+            if r.lost_at.is_some() {
+                continue;
+            }
+            let overtaken = self.overtaken_below.is_some_and(|m| r.seq < m);
+            let stalled = idle && now.saturating_duration_since(r.sent) >= V2_IDLE;
+            if overtaken || stalled {
+                r.lost_at = Some(now);
+                newly_lost.push(r.stripe);
+            }
+        }
+        for stripe in newly_lost {
+            let Some(track) = self.stripes.get_mut(&stripe) else { continue };
+            let next = (track.k..track.requested.len()).find(|&p| !track.requested[p] && !track.filled[p]);
+            if let Some(pos) = next {
+                track.requested[pos] = true;
+                hedges.push((stripe, pos));
+            }
+        }
+        for &(stripe, pos) in &hedges {
+            self.push(stripe, pos, now);
+        }
+        hedges
+    }
+
+    /// このストライプを諦めるか
+    ///
+    /// 全位置を要求し終え（足せるパリティが無い）、届いていない要求がすべて失われたとみなされ、
+    /// その最後の時刻から [`V2_GIVE_UP`] 経ったとき。k 枚に届いたかどうかは呼び出し側が先に見る。
+    fn gave_up(&self, stripe: usize, now: Instant) -> bool {
+        let Some(track) = self.stripes.get(&stripe) else { return false };
+        if (track.k..track.requested.len()).any(|p| !track.requested[p] && !track.filled[p]) {
+            return false;
+        }
+        let mut last_lost: Option<Instant> = None;
+        for r in self.pending.iter().filter(|r| r.stripe == stripe) {
+            let Some(at) = r.lost_at else { return false };
+            last_lost = Some(last_lost.map_or(at, |l| l.max(at)));
+        }
+        last_lost.is_some_and(|l| now.saturating_duration_since(l) >= V2_GIVE_UP)
+    }
+
+    /// そのストライプの届いていない要求の数（試験用）
+    #[cfg(test)]
+    fn outstanding(&self, stripe: usize) -> usize {
+        self.pending.iter().filter(|r| r.stripe == stripe).count()
+    }
+}
+
 /// 返信 1 枚を振り分ける。表に載る**すべての位置**を埋める（同じ中身のチャンクは同じハッシュ）
 ///
 /// 長さが `V2_SHARD_BYTES` でない返信と、表に無いハッシュの返信は捨てる。
-/// 終わったストライプの位置は埋めない。何か 1 か所でも埋まれば true。
+/// 終わったストライプの位置は埋めない。埋まった（ストライプ, 位置）をすべて返す。
 fn route_reply(
     routes: &HashMap<[u8; 32], Vec<(usize, usize)>>,
     states: &mut [StripeState],
     reply: &[u8],
-) -> bool {
+) -> Vec<(usize, usize)> {
+    let mut filled = Vec::new();
     if reply.len() != chunk::V2_SHARD_BYTES {
-        return false;
+        return filled;
     }
     let Some(positions) = routes.get(&chunk::shard_hash(reply)) else {
-        return false;
+        return filled;
     };
-    let mut filled = false;
     for &(si, pos) in positions {
         let Some(st) = states.get_mut(si) else { continue };
         if st.done {
@@ -184,37 +354,21 @@ fn route_reply(
             && slot.is_none()
         {
             *slot = Some(reply.to_vec());
-            filled = true;
+            filled.push((si, pos));
         }
     }
     filled
 }
 
-/// このストライプで今要求するシャードのハッシュ
+/// ストライプの開始時に要求するシャードのハッシュ
 ///
-/// `with_parity` でなければ（ストライプの開始）、**データ k 個の位置すべてを 1 位置 1 要求**で出す。
+/// **データ k 個の位置すべてを 1 位置 1 要求**で出す。
 /// 同じハッシュでもまとめず、他のストライプの返信で埋まった位置も要求する ── ファイルの中に
 /// 同じ中身のチャンク（ディスクイメージのゼロ領域など）があっても、取る量が置いた量
 /// （切り上げた大きさ）より減らないようにするため（ガードに取った量から大きさを絞らせない）。
-/// 遅れて届く重複した返信は [`route_reply`] が捨てる。
-///
-/// `with_parity` なら（`HEDGE_1` 後）パリティ m 個のうち、まだ埋まっていない位置だけ。
-/// すでに要求したハッシュ（返信がもうすぐ来る）は含めない。
-fn stripe_requests(
-    stripe: &StripeV2,
-    state: &StripeState,
-    requested: &HashSet<[u8; 32]>,
-    with_parity: bool,
-) -> Vec<[u8; 32]> {
-    let k = stripe.data as usize;
-    if !with_parity {
-        return stripe.shard_hashes[..k].to_vec();
-    }
-    (k..stripe.shard_hashes.len())
-        .filter(|&pos| state.got.get(pos).is_some_and(Option::is_none))
-        .map(|pos| stripe.shard_hashes[pos])
-        .filter(|h| !requested.contains(h))
-        .collect()
+/// 遅れて届く重複した返信は [`route_reply`] が捨てる。パリティは [`HedgeTracker`] が足す。
+fn stripe_requests(stripe: &StripeV2) -> Vec<[u8; 32]> {
+    stripe.shard_hashes[..stripe.data as usize].to_vec()
 }
 
 /// 取得した内容
@@ -300,8 +454,8 @@ impl AetherClient {
 
     /// v2 のファイルを取る。ストライプを `V2_STRIPES_IN_FLIGHT` 本ずつの窓で進める
     ///
-    /// ストライプごとに、まずデータ k 個を要求し、`HEDGE_1` 経っても k 枚に届かなければ
-    /// パリティも全部要求する。届いたシャードは Manifest のハッシュと照合し、合ったものだけ使う。
+    /// ストライプごとに、まずデータ k 個を要求し、失われた要求（[`HedgeTracker`]）1 本につき
+    /// パリティを 1 つ足す。回線が遅いだけならパリティは要求しない。届いたシャードは Manifest のハッシュと照合し、合ったものだけ使う。
     /// 全体をメモリに持つ（最大 約 800MB。逐次ファイルへ書く形は将来）。
     async fn fetch_file_v2(
         &self,
@@ -320,17 +474,18 @@ impl AetherClient {
             .iter()
             .map(|s| StripeState { got: vec![None; s.shard_hashes.len()], ..Default::default() })
             .collect();
+        let mut tracker = HedgeTracker::new(Instant::now());
         let mut plain: Vec<Vec<u8>> = vec![Vec::new(); total];
         let mut window = StripeWindow::new(total, V2_STRIPES_IN_FLIGHT);
-        let mut requested: HashSet<[u8; 32]> = HashSet::new();
         let (mut finished, mut failed) = (0usize, 0usize);
         let mut last_progress = tokio::time::Instant::now();
 
         loop {
             for i in window.start_more() {
-                states[i].started = Some(tokio::time::Instant::now());
-                let wants = stripe_requests(&manifest.stripes[i], &states[i], &requested, false);
-                self.request_v2(session, k_pub, &wants, &mut requested).await?;
+                let stripe = &manifest.stripes[i];
+                let filled: Vec<bool> = states[i].got.iter().map(Option::is_some).collect();
+                tracker.start_stripe(i, stripe.data as usize, &filled, Instant::now());
+                self.request_v2(session, k_pub, &stripe_requests(stripe)).await?;
             }
             if window.is_finished() {
                 break;
@@ -338,12 +493,15 @@ impl AetherClient {
 
             let raw = self.take_replies(&session.receive_tunnel_id).await?;
             for reply in session.mailbox.decrypt_replies(&raw) {
-                route_reply(&routes, &mut states, &reply);
+                let now = Instant::now();
+                for (si, pos) in route_reply(&routes, &mut states, &reply) {
+                    tracker.on_filled(si, pos, now);
+                }
             }
 
+            let mut gave_up = Vec::new();
             for i in window.active.clone() {
                 let stripe = &manifest.stripes[i];
-                let elapsed = states[i].started.map(|t| t.elapsed()).unwrap_or_default();
                 if states[i].have() >= stripe.data as usize {
                     let objects = sharding_v2::restore_stripe(stripe, &states[i].got)?;
                     let mut bytes = Vec::with_capacity(objects.len() * chunk::V2_CHUNK_PLAIN);
@@ -357,19 +515,32 @@ impl AetherClient {
                     plain[i] = bytes;
                     states[i].done = true;
                     states[i].got = Vec::new();
+                    tracker.finish_stripe(i);
                     window.finish(i);
                     finished += 1;
-                } else if elapsed >= V2_STRIPE_WAIT {
-                    states[i].done = true;
-                    states[i].got = Vec::new();
-                    window.finish(i);
-                    window.stop_launching();
-                    failed += 1;
-                } else if elapsed >= HEDGE_1 && !states[i].parity_requested {
-                    states[i].parity_requested = true;
-                    let wants = stripe_requests(stripe, &states[i], &requested, true);
-                    self.request_v2(session, k_pub, &wants, &mut requested).await?;
                 }
+            }
+
+            // 失われた要求の分だけパリティを足す。諦めの判断は、足した後の状態で行う
+            let now = Instant::now();
+            let hedges = tracker.poll(now);
+            for i in window.active.clone() {
+                if tracker.gave_up(i, now) {
+                    gave_up.push(i);
+                }
+            }
+            for i in gave_up {
+                states[i].done = true;
+                states[i].got = Vec::new();
+                tracker.finish_stripe(i);
+                window.finish(i);
+                window.stop_launching();
+                failed += 1;
+            }
+            if !hedges.is_empty() {
+                let wants: Vec<[u8; 32]> =
+                    hedges.iter().map(|&(si, pos)| manifest.stripes[si].shard_hashes[pos]).collect();
+                self.request_v2(session, k_pub, &wants).await?;
             }
 
             if last_progress.elapsed() >= V2_PROGRESS_EVERY {
@@ -397,13 +568,12 @@ impl AetherClient {
         Ok(Some(Fetched { name: Some(manifest.name), bytes }))
     }
 
-    /// シャードを要求して、要求済みの印を付ける。担当が 1 台も居なければエラー
+    /// シャードを要求する。担当が 1 台も居なければエラー
     async fn request_v2(
         &self,
         session: &PullSession,
         k_pub: &[u8; 32],
         wants: &[[u8; 32]],
-        requested: &mut HashSet<[u8; 32]>,
     ) -> Result<()> {
         if wants.is_empty() {
             return Ok(());
@@ -412,7 +582,6 @@ impl AetherClient {
         if sent == 0 {
             return Err(crate::error::ClientError::network("リレーの一覧が空です"));
         }
-        requested.extend(wants.iter().copied());
         Ok(())
     }
 
@@ -590,12 +759,12 @@ mod tests {
         ];
         let routes = sharding_v2::shard_routes(&stripes);
         let mut states: Vec<StripeState> = stripes.iter().map(state_for).collect();
-        assert!(route_reply(&routes, &mut states, &shard));
+        assert_eq!(route_reply(&routes, &mut states, &shard), vec![(0, 0), (1, 1)]);
         assert_eq!(states[0].got[0].as_deref(), Some(&shard[..]));
         assert_eq!(states[1].got[1].as_deref(), Some(&shard[..]), "別のストライプの同じ中身も埋まる");
         assert_eq!(states[0].have() + states[1].have(), 2);
         // 同じ返信がもう一度来ても何も変わらない
-        assert!(!route_reply(&routes, &mut states, &shard));
+        assert!(route_reply(&routes, &mut states, &shard).is_empty());
     }
 
     #[test]
@@ -604,35 +773,139 @@ mod tests {
         let stripes = vec![stripe_of(vec![chunk::shard_hash(&shard), [1u8; 32]], 1)];
         let routes = sharding_v2::shard_routes(&stripes);
         let mut states: Vec<StripeState> = stripes.iter().map(state_for).collect();
-        assert!(!route_reply(&routes, &mut states, &[0u8; 100]), "長さが違う");
+        assert!(route_reply(&routes, &mut states, &[0u8; 100]).is_empty(), "長さが違う");
         let mut forged = shard.clone();
         forged[0] ^= 1;
-        assert!(!route_reply(&routes, &mut states, &forged), "表に無いハッシュ");
+        assert!(route_reply(&routes, &mut states, &forged).is_empty(), "表に無いハッシュ");
         assert_eq!(states[0].have(), 0);
         // 終わったストライプには入れない
         states[0].done = true;
-        assert!(!route_reply(&routes, &mut states, &shard));
+        assert!(route_reply(&routes, &mut states, &shard).is_empty());
     }
 
     #[test]
-    fn requests_ask_every_data_position_then_only_unfilled_parity() {
+    fn start_requests_every_data_position_even_if_same_hash_or_filled() {
         let (a, b, p, q) = ([1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32]);
         // データ k=3（a が 2 か所で同じ中身）、パリティ 2
         let stripe = stripe_of(vec![a, b, a, p, q], 3);
-        let mut state = state_for(&stripe);
-        let mut requested = HashSet::new();
-        let data = stripe_requests(&stripe, &state, &requested, false);
-        assert_eq!(data, vec![a, b, a], "同じハッシュでも位置ごとに 1 要求（データ k 位置ぶん）");
-        // 他のストライプの返信で埋まった位置・要求済みでも、開始時はデータ k 位置すべてを要求する
-        state.got[1] = Some(vec![]);
-        requested.extend(data.iter().copied());
-        assert_eq!(stripe_requests(&stripe, &state, &requested, false), vec![a, b, a]);
-        // パリティは、まだ埋まっていない位置だけ（要求済みのハッシュは除く）
-        assert_eq!(stripe_requests(&stripe, &state, &requested, true), vec![p, q]);
-        state.got[3] = Some(vec![]);
-        assert_eq!(stripe_requests(&stripe, &state, &requested, true), vec![q], "届いた位置は要求しない");
-        requested.insert(q);
-        assert!(stripe_requests(&stripe, &state, &requested, true).is_empty());
+        assert_eq!(stripe_requests(&stripe), vec![a, b, a], "同じハッシュでも位置ごとに 1 要求（データ k 位置ぶん）");
+    }
+
+    fn at(base: Instant, secs: f64) -> Instant {
+        base + Duration::from_secs_f64(secs)
+    }
+
+    /// 4 データ + 3 パリティのストライプ 1 本（番号 0）を t=0 に始めた追跡
+    fn tracker_with_one_stripe() -> (HedgeTracker, Instant) {
+        let base = Instant::now();
+        let mut t = HedgeTracker::new(base);
+        t.start_stripe(0, 4, &[false; 7], base);
+        (t, base)
+    }
+
+    #[test]
+    fn slow_line_that_delivers_in_order_requests_no_parity() {
+        let (mut t, base) = tracker_with_one_stripe();
+        // 2 秒おきに要求順に届く（1 ストライプに 7 秒かかる回線）。毎秒見ても足さない
+        for tick in 0..=30 {
+            let now = at(base, tick as f64);
+            if tick % 2 == 1 && tick <= 7 {
+                t.on_filled(0, (tick / 2) as usize, now);
+            }
+            assert!(t.poll(now).is_empty(), "t = {}", tick);
+        }
+    }
+
+    #[test]
+    fn one_missing_request_overtaken_adds_exactly_one_parity_after_late() {
+        let (mut t, base) = tracker_with_one_stripe();
+        for (secs, pos) in [(1.0, 0usize), (2.0, 1), (3.0, 3)] {
+            t.on_filled(0, pos, at(base, secs));
+            assert!(t.poll(at(base, secs)).is_empty());
+        }
+        // 位置 3 が届いたのは 3 秒。V2_LATE 経つ前は足さない
+        assert!(t.poll(at(base, 5.9)).is_empty());
+        assert_eq!(t.poll(at(base, 6.0)), vec![(0, 4)], "位置 2 が失われた → パリティ 1 つだけ");
+        assert!(t.poll(at(base, 6.1)).is_empty(), "同じ要求では 2 回足さない");
+        assert_eq!(t.outstanding(0), 2, "失われたとみなしても要求は残る + 足したパリティ");
+        // 失われたとみなした位置の返信が後から届けば普通に使われる
+        t.on_filled(0, 2, at(base, 7.0));
+        assert_eq!(t.outstanding(0), 1);
+    }
+
+    #[test]
+    fn nothing_arriving_adds_parity_for_each_missing_request_capped_by_parity() {
+        let (mut t, base) = tracker_with_one_stripe();
+        let idle = V2_IDLE.as_secs_f64();
+        assert!(t.poll(at(base, idle - 0.1)).is_empty());
+        // 4 本が途切れで失われ、パリティは 3 つしかないので 3 つで頭打ち
+        assert_eq!(t.poll(at(base, idle)), vec![(0, 4), (0, 5), (0, 6)]);
+        // 足したパリティも V2_IDLE 届かなければ失われるが、もう足せない
+        assert!(t.poll(at(base, 2.0 * idle)).is_empty());
+        assert!(t.poll(at(base, 100.0)).is_empty());
+    }
+
+    #[test]
+    fn stripe_is_given_up_only_after_parity_is_exhausted_and_all_lost_for_give_up() {
+        let (mut t, base) = tracker_with_one_stripe();
+        let idle = V2_IDLE.as_secs_f64();
+        t.poll(at(base, idle)); // データ 4 本が失われ、パリティを 3 つ要求（これも未着）
+        assert!(!t.gave_up(0, at(base, idle + 60.0)), "足したパリティがまだ失われたとみなされていない");
+        t.poll(at(base, 2.0 * idle)); // パリティの要求も失われたとみなされる
+        assert!(!t.gave_up(0, at(base, 2.0 * idle) + V2_GIVE_UP - Duration::from_millis(1)));
+        assert!(t.gave_up(0, at(base, 2.0 * idle) + V2_GIVE_UP));
+    }
+
+    #[test]
+    fn stripe_with_parity_left_is_not_given_up() {
+        let (mut t, base) = tracker_with_one_stripe();
+        // 位置 0 だけ届き、残りのデータ 3 本が追い越されて失われる → パリティ 3 つを要求（尽きる）
+        // ここでは 1 本だけ失われる例: パリティが残っているうちは何秒経っても諦めない
+        for (secs, pos) in [(1.0, 0usize), (1.0, 1), (1.0, 3)] {
+            t.on_filled(0, pos, at(base, secs));
+        }
+        assert_eq!(t.poll(at(base, 4.0)), vec![(0, 4)]);
+        assert!(!t.gave_up(0, at(base, 1000.0)), "足したパリティの要求が失われたとみなされるまでは諦めない");
+    }
+
+    #[test]
+    fn slow_but_progressing_transfer_is_never_given_up() {
+        let base = Instant::now();
+        let mut t = HedgeTracker::new(base);
+        t.start_stripe(0, 16, &[false; 20], base);
+        for tick in 0..=60 {
+            let now = at(base, tick as f64);
+            if tick % 2 == 0 && tick / 2 < 16 {
+                t.on_filled(0, (tick / 2) as usize, now);
+            }
+            assert!(t.poll(now).is_empty(), "t = {}", tick);
+            assert!(!t.gave_up(0, now), "t = {}", tick);
+        }
+    }
+
+    #[test]
+    fn one_reply_fills_every_position_with_the_same_hash() {
+        let shard = vec![7u8; chunk::V2_SHARD_BYTES];
+        let h = chunk::shard_hash(&shard);
+        let stripes = vec![stripe_of(vec![h, [1u8; 32], h, [2u8; 32]], 3)];
+        let routes = sharding_v2::shard_routes(&stripes);
+        let mut states: Vec<StripeState> = stripes.iter().map(state_for).collect();
+        let base = Instant::now();
+        let mut t = HedgeTracker::new(base);
+        t.start_stripe(0, 3, &[false; 4], base);
+        assert_eq!(t.outstanding(0), 3);
+        for (si, pos) in route_reply(&routes, &mut states, &shard) {
+            t.on_filled(si, pos, at(base, 1.0));
+        }
+        assert_eq!(t.outstanding(0), 1, "同じハッシュの 2 位置の要求はどちらも届いた扱い");
+    }
+
+    #[test]
+    fn requests_for_already_filled_positions_are_not_waited_for() {
+        let base = Instant::now();
+        let mut t = HedgeTracker::new(base);
+        t.start_stripe(0, 2, &[true, false, false], base);
+        assert_eq!(t.outstanding(0), 1);
     }
 
     #[test]
