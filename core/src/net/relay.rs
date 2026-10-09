@@ -12,6 +12,16 @@ use std::time::Duration;
 /// ガード1本への接続を諦めるまでの時間
 const GUARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// 自分の送受信の量（段 A の効果を測る物差し / Part 25 の 25.4.1）
+///
+/// 数えるのは自分の回路の入口（ガード）へ書いたバイト数と、返信トンネルで受け取ったバイト数だけ。
+/// 中継として流したものは数えない。網には何も出さない（手元の数字）。
+#[derive(Debug, Default)]
+pub struct TrafficCounter {
+    pub sent: std::sync::atomic::AtomicU64,
+    pub received: std::sync::atomic::AtomicU64,
+}
+
 pub struct RelayClient {
     quic_client: Arc<QuicClient>,
     /// 入口への接続をノードの keepalive 接続に相乗りさせる（[`RelayClient::via_node`]）
@@ -19,6 +29,8 @@ pub struct RelayClient {
     connection_pool: ConnectionPool,
     entry_connection: Option<QuicConnection>,
     circuit: Option<OnionCircuit>,
+    /// 入口へ送った量の手元の記録（試験と診断用）
+    traffic: Option<Arc<TrafficCounter>>,
     // circuit_id: u32, // unused for now
 }
 
@@ -41,7 +53,14 @@ impl RelayClient {
             connection_pool,
             entry_connection: None,
             circuit: None,
+            traffic: None,
         }
+    }
+
+    /// 入口へ送った量を数えるカウンタを付ける
+    pub fn with_traffic(mut self, traffic: Arc<TrafficCounter>) -> Self {
+        self.traffic = Some(traffic);
+        self
     }
 
     pub fn new() -> Result<Self> {
@@ -53,6 +72,7 @@ impl RelayClient {
             connection_pool,
             entry_connection: None,
             circuit: None,
+            traffic: None,
             // circuit_id: 1,
         })
     }
@@ -166,6 +186,9 @@ impl RelayClient {
             .map_err(|e| AetherError::Quic(e.to_string()))?;
 
         wire::write_packet(&mut send_stream, packet_type, payload).await?;
+        if let Some(t) = &self.traffic {
+            t.sent.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
 
         send_stream.finish()
             .map_err(|e| AetherError::Quic(e.to_string()))?;

@@ -37,6 +37,8 @@ pub struct AetherClient {
     pub(crate) receiver: std::sync::Mutex<Option<Arc<crate::receive::Receiver>>>,
     /// 疎通確認に失敗した回路の中継点。組み直すときに避ける
     pub(crate) suspects: crate::circuit::Suspects,
+    /// 自分の送受信の量（試験と診断用。網には出さない）
+    pub(crate) traffic: Arc<aether_core::net::relay::TrafficCounter>,
 }
 
 impl AetherClient {
@@ -229,6 +231,7 @@ impl AetherClient {
             pending_flush: std::sync::Mutex::new(Vec::new()),
             receiver: std::sync::Mutex::new(None),
             suspects: Default::default(),
+            traffic: Default::default(),
         }))
     }
 
@@ -268,6 +271,14 @@ impl AetherClient {
             stored_entries: self.node.mailbox().len(),
             relay_mode: self.relay_mode,
         }
+    }
+
+    /// （自分が入口へ送ったバイト数, 返信トンネルで受け取ったバイト数）
+    ///
+    /// 試験と診断用。起動からの累計で、中継として流した量は含まない。
+    pub fn traffic(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.traffic.sent.load(Relaxed), self.traffic.received.load(Relaxed))
     }
 
     /// 既知リレーが `min_relays` を超えるまで待つ

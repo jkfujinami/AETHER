@@ -222,10 +222,15 @@ impl AetherClient {
 
     /// 自分宛てに届いた返信を取り出す（取り出したものは消える）
     pub(crate) async fn take_replies(&self, receive_tunnel_id: &[u8; 32]) -> Result<Vec<Vec<u8>>> {
-        Ok(self
+        let replies = self
             .node
             .mailbox()
             .fetch_tunnel_messages(receive_tunnel_id)
-            .await?)
+            .await?;
+        let total: usize = replies.iter().map(Vec::len).sum();
+        self.traffic
+            .received
+            .fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(replies)
     }
 }
