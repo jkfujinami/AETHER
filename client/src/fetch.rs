@@ -15,10 +15,11 @@ use crate::error::Result;
 use crate::events;
 use crate::pull::PullSession;
 use crate::boards::BoardId;
-use aether_core::mailbox::chunk::Manifest;
+use aether_core::mailbox::chunk::{self, Manifest, ManifestV2, StripeV2};
 use aether_core::mailbox::index::IndexDescriptor;
 use aether_core::mailbox::schrodinger::{K_REPLICAS, SchrodingerMailbox};
 use aether_core::mailbox::sharding::{DATA_SHARDS, TOTAL_SHARDS};
+use aether_core::mailbox::sharding_v2;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -78,6 +79,135 @@ fn hedge_plan(elapsed: Duration) -> Vec<(u8, usize)> {
         }
     }
     plan
+}
+
+/// 同時に要求しておくストライプの数（v2 の大きなファイル）
+///
+/// 返信は自分のノードの Mailbox に一旦入る。これは**他人から預かった中身と同じ保管庫**
+/// （既定 100MB）なので、全ストライプを一斉に要求すると、返信が溢れて預かり物を追い出す。
+/// 1 本が揃うたびに次の 1 本を要求する滑る窓にして、受け箱に溜まる量を
+/// 最悪でも `4 × (16 + m) × 256KiB`（m=27 で約 43MB）に抑える。
+const V2_STRIPES_IN_FLIGHT: usize = 4;
+/// 1 ストライプの最初の要求から、揃うまで待つ上限
+///
+/// 1 ストライプは k+m 枚を別々の保持者から集める。段階的に広げる `HEDGE_1`（2 秒）の後に
+/// パリティも全部要求した状態で、落ちた保持者を見切って待ち続けないための上限。
+/// `OBJECT_WAIT`（15 秒）より長いのは、1 回の要求で 4MiB 分（16 枚）を回路と返信トンネルに流すため。
+const V2_STRIPE_WAIT: Duration = Duration::from_secs(30);
+/// 取得の進み具合を知らせる間隔
+const V2_PROGRESS_EVERY: Duration = Duration::from_secs(1);
+
+/// 滑る窓 ── 同時に要求中のストライプを `limit` 本までにして、1 本終わるたびに次を始める
+struct StripeWindow {
+    total: usize,
+    limit: usize,
+    next: usize,
+    active: Vec<usize>,
+    stopped: bool,
+}
+
+impl StripeWindow {
+    fn new(total: usize, limit: usize) -> Self {
+        Self { total, limit, next: 0, active: Vec::new(), stopped: false }
+    }
+
+    /// 窓に空きがあれば新しく始めるストライプを返す（順番どおり）
+    fn start_more(&mut self) -> Vec<usize> {
+        let mut started = Vec::new();
+        while !self.stopped && self.active.len() < self.limit && self.next < self.total {
+            self.active.push(self.next);
+            started.push(self.next);
+            self.next += 1;
+        }
+        started
+    }
+
+    /// そのストライプの要求を終える（揃った・見切った）
+    fn finish(&mut self, stripe: usize) {
+        self.active.retain(|&i| i != stripe);
+    }
+
+    /// これ以上新しいストライプを始めない（1 本でも取れなければ全体が失敗するため）
+    fn stop_launching(&mut self) {
+        self.stopped = true;
+    }
+
+    /// 要求中が無く、これ以上始めるものも無い
+    fn is_finished(&self) -> bool {
+        self.active.is_empty() && (self.stopped || self.next >= self.total)
+    }
+
+    /// 始めなかったストライプの数
+    fn not_started(&self) -> usize {
+        self.total - self.next
+    }
+}
+
+/// ストライプ 1 本の取得状態
+#[derive(Default)]
+struct StripeState {
+    /// データ k 個 → パリティ m 個の順。ハッシュが合って届いたものだけが入る
+    got: Vec<Option<Vec<u8>>>,
+    started: Option<tokio::time::Instant>,
+    parity_requested: bool,
+    done: bool,
+}
+
+impl StripeState {
+    fn have(&self) -> usize {
+        self.got.iter().filter(|s| s.is_some()).count()
+    }
+}
+
+/// 返信 1 枚を振り分ける。表に載る**すべての位置**を埋める（同じ中身のチャンクは同じハッシュ）
+///
+/// 長さが `V2_SHARD_BYTES` でない返信と、表に無いハッシュの返信は捨てる。
+/// 終わったストライプの位置は埋めない。何か 1 か所でも埋まれば true。
+fn route_reply(
+    routes: &HashMap<[u8; 32], Vec<(usize, usize)>>,
+    states: &mut [StripeState],
+    reply: &[u8],
+) -> bool {
+    if reply.len() != chunk::V2_SHARD_BYTES {
+        return false;
+    }
+    let Some(positions) = routes.get(&chunk::shard_hash(reply)) else {
+        return false;
+    };
+    let mut filled = false;
+    for &(si, pos) in positions {
+        let Some(st) = states.get_mut(si) else { continue };
+        if st.done {
+            continue;
+        }
+        if let Some(slot) = st.got.get_mut(pos)
+            && slot.is_none()
+        {
+            *slot = Some(reply.to_vec());
+            filled = true;
+        }
+    }
+    filled
+}
+
+/// このストライプで今要求するシャードのハッシュ
+///
+/// まずデータ k 個、`with_parity` ならパリティ m 個も。届いた位置、すでに要求したハッシュ
+/// （他のストライプや前の段で）は含めない ── 同じハッシュを二度要求しない。
+fn stripe_requests(
+    stripe: &StripeV2,
+    state: &StripeState,
+    requested: &HashSet<[u8; 32]>,
+    with_parity: bool,
+) -> Vec<[u8; 32]> {
+    let k = stripe.data as usize;
+    let end = if with_parity { stripe.shard_hashes.len() } else { k };
+    let mut seen = HashSet::new();
+    (0..end)
+        .filter(|&pos| state.got.get(pos).is_some_and(Option::is_none))
+        .map(|pos| stripe.shard_hashes[pos])
+        .filter(|h| !requested.contains(h) && seen.insert(*h))
+        .collect()
 }
 
 /// 取得した内容
@@ -145,34 +275,13 @@ impl AetherClient {
             })
             .await?;
 
-        if let Some(manifest) = first[0].as_deref().and_then(|b| Manifest::decode(b).ok()) {
-            let total = manifest.chunk_refs.len();
-            events::progress(
-                &self.events,
-                format!("{} を取得します ({} チャンク / {} バイト)", manifest.name, total, manifest.size),
-            );
-            let chunks = self
-                .fetch_objects(
-                    &session,
-                    &manifest.chunk_refs.iter().map(|r| (*r, *r)).collect::<Vec<_>>(),
-                    &k_pub,
-                    OBJECT_WAIT,
-                    |got| {
-                    got.iter().all(Option::is_some)
-                })
-                .await?;
-            let missing = chunks.iter().filter(|c| c.is_none()).count();
-            if missing > 0 {
-                events::warning(
-                    &self.events,
-                    format!("{}/{} チャンクを取得できませんでした（保持者が居ない）", missing, total),
-                );
-                return Ok(None);
-            }
-            return Ok(Some(Fetched {
-                name: Some(manifest.name),
-                bytes: chunks.into_iter().flatten().flatten().collect(),
-            }));
+        if let Some(manifest) = first[0].as_deref().and_then(|b| ManifestV2::decode(b).ok()) {
+            return self.fetch_file_v2(&session, manifest, &k_pub).await;
+        }
+        // 古い形式（v1 の Manifest）は読まない。互換を切った
+        if first[0].as_deref().is_some_and(|b| Manifest::decode(b).is_ok()) {
+            events::warning(&self.events, "古い形式のファイルです（読めません）");
+            return Ok(None);
         }
 
         Ok(first
@@ -180,6 +289,124 @@ impl AetherClient {
             .nth(1)
             .flatten()
             .map(|bytes| Fetched { name: None, bytes }))
+    }
+
+    /// v2 のファイルを取る。ストライプを `V2_STRIPES_IN_FLIGHT` 本ずつの窓で進める
+    ///
+    /// ストライプごとに、まずデータ k 個を要求し、`HEDGE_1` 経っても k 枚に届かなければ
+    /// パリティも全部要求する。届いたシャードは Manifest のハッシュと照合し、合ったものだけ使う。
+    /// 全体をメモリに持つ（最大 約 800MB。逐次ファイルへ書く形は将来）。
+    async fn fetch_file_v2(
+        &self,
+        session: &PullSession,
+        manifest: ManifestV2,
+        k_pub: &[u8; 32],
+    ) -> Result<Option<Fetched>> {
+        let total = manifest.stripes.len();
+        events::progress(
+            &self.events,
+            format!("{} を取得します ({} ストライプ / {} バイト)", manifest.name, total, manifest.size),
+        );
+        let routes = sharding_v2::shard_routes(&manifest.stripes);
+        let mut states: Vec<StripeState> = manifest
+            .stripes
+            .iter()
+            .map(|s| StripeState { got: vec![None; s.shard_hashes.len()], ..Default::default() })
+            .collect();
+        let mut plain: Vec<Vec<u8>> = vec![Vec::new(); total];
+        let mut window = StripeWindow::new(total, V2_STRIPES_IN_FLIGHT);
+        let mut requested: HashSet<[u8; 32]> = HashSet::new();
+        let (mut finished, mut failed) = (0usize, 0usize);
+        let mut last_progress = tokio::time::Instant::now();
+
+        loop {
+            for i in window.start_more() {
+                states[i].started = Some(tokio::time::Instant::now());
+                let wants = stripe_requests(&manifest.stripes[i], &states[i], &requested, false);
+                self.request_v2(session, k_pub, &wants, &mut requested).await?;
+            }
+            if window.is_finished() {
+                break;
+            }
+
+            let raw = self.take_replies(&session.receive_tunnel_id).await?;
+            for reply in session.mailbox.decrypt_replies(&raw) {
+                route_reply(&routes, &mut states, &reply);
+            }
+
+            for i in window.active.clone() {
+                let stripe = &manifest.stripes[i];
+                let elapsed = states[i].started.map(|t| t.elapsed()).unwrap_or_default();
+                if states[i].have() >= stripe.data as usize {
+                    let objects = sharding_v2::restore_stripe(stripe, &states[i].got)?;
+                    let mut bytes = Vec::with_capacity(objects.len() * chunk::V2_CHUNK_PLAIN);
+                    for object in &objects {
+                        // v1 のチャンクと同じ開き方（収束暗号の [nonce][暗号文]）
+                        let piece = session.mailbox.decrypt_mailbox_value(object, k_pub).map_err(|_| {
+                            crate::error::ClientError::invalid("チャンクを開けませんでした（壊れたファイル）")
+                        })?;
+                        bytes.extend_from_slice(&piece);
+                    }
+                    plain[i] = bytes;
+                    states[i].done = true;
+                    states[i].got = Vec::new();
+                    window.finish(i);
+                    finished += 1;
+                } else if elapsed >= V2_STRIPE_WAIT {
+                    states[i].done = true;
+                    states[i].got = Vec::new();
+                    window.finish(i);
+                    window.stop_launching();
+                    failed += 1;
+                } else if elapsed >= HEDGE_1 && !states[i].parity_requested {
+                    states[i].parity_requested = true;
+                    let wants = stripe_requests(stripe, &states[i], &requested, true);
+                    self.request_v2(session, k_pub, &wants, &mut requested).await?;
+                }
+            }
+
+            if last_progress.elapsed() >= V2_PROGRESS_EVERY {
+                last_progress = tokio::time::Instant::now();
+                events::progress(&self.events, format!("取得中 {}/{} ストライプ", finished, total));
+            }
+            tokio::time::sleep(POLL).await;
+        }
+
+        if failed > 0 {
+            let untried = window.not_started();
+            let detail = if untried > 0 { "（残りは試していません）" } else { "" };
+            events::warning(
+                &self.events,
+                format!("{}/{} ストライプを取得できませんでした{}", failed, total, detail),
+            );
+            return Ok(None);
+        }
+
+        let mut bytes: Vec<u8> = plain.into_iter().flatten().collect();
+        if (bytes.len() as u64) < manifest.size {
+            return Err(crate::error::ClientError::invalid("ファイルの大きさが Manifest と合いません"));
+        }
+        bytes.truncate(manifest.size as usize);
+        Ok(Some(Fetched { name: Some(manifest.name), bytes }))
+    }
+
+    /// シャードを要求して、要求済みの印を付ける。担当が 1 台も居なければエラー
+    async fn request_v2(
+        &self,
+        session: &PullSession,
+        k_pub: &[u8; 32],
+        wants: &[[u8; 32]],
+        requested: &mut HashSet<[u8; 32]>,
+    ) -> Result<()> {
+        if wants.is_empty() {
+            return Ok(());
+        }
+        let sent = session.mailbox.request_shards_v2(k_pub, wants).await?;
+        if sent == 0 {
+            return Err(crate::error::ClientError::network("リレーの一覧が空です"));
+        }
+        requested.extend(wants.iter().copied());
+        Ok(())
     }
 
     /// 単一 body の投稿をまとめて取得する（掲示板のスレを開くとき）
@@ -290,6 +517,149 @@ mod tests {
 
     fn no_duplicates(plan: &[(u8, usize)]) -> bool {
         plan.iter().collect::<HashSet<_>>().len() == plan.len()
+    }
+
+    fn stripe_of(hashes: Vec<[u8; 32]>, k: u8) -> StripeV2 {
+        StripeV2 { data: k, parity: hashes.len() as u8 - k, last_object_len: 1000, shard_hashes: hashes }
+    }
+
+    fn state_for(stripe: &StripeV2) -> StripeState {
+        StripeState { got: vec![None; stripe.shard_hashes.len()], ..Default::default() }
+    }
+
+    #[test]
+    fn window_never_exceeds_the_limit_and_slides() {
+        let mut w = StripeWindow::new(10, V2_STRIPES_IN_FLIGHT);
+        assert_eq!(w.start_more(), vec![0, 1, 2, 3], "最初は窓いっぱい");
+        assert!(w.start_more().is_empty(), "空きが無ければ始めない");
+        w.finish(1);
+        assert_eq!(w.start_more(), vec![4], "1 本終われば次の 1 本");
+        w.finish(0);
+        w.finish(2);
+        assert_eq!(w.start_more(), vec![5, 6]);
+        assert!(w.active.len() <= V2_STRIPES_IN_FLIGHT);
+        for i in [3, 4, 5, 6] {
+            w.finish(i);
+            let _ = w.start_more();
+            assert!(w.active.len() <= V2_STRIPES_IN_FLIGHT);
+        }
+        assert!(!w.is_finished());
+        for i in 7..10 {
+            w.finish(i);
+        }
+        assert!(w.is_finished());
+    }
+
+    #[test]
+    fn window_with_fewer_stripes_than_the_limit() {
+        let mut w = StripeWindow::new(2, V2_STRIPES_IN_FLIGHT);
+        assert_eq!(w.start_more(), vec![0, 1]);
+        w.finish(0);
+        w.finish(1);
+        assert!(w.is_finished());
+    }
+
+    #[test]
+    fn window_stops_launching_after_a_failure() {
+        let mut w = StripeWindow::new(10, 2);
+        assert_eq!(w.start_more(), vec![0, 1]);
+        w.stop_launching();
+        w.finish(0);
+        assert!(w.start_more().is_empty());
+        assert!(!w.is_finished(), "要求中のものが残っている");
+        w.finish(1);
+        assert!(w.is_finished());
+        assert_eq!(w.not_started(), 8);
+    }
+
+    #[test]
+    fn reply_fills_every_position_with_the_same_hash() {
+        let shard = vec![7u8; chunk::V2_SHARD_BYTES];
+        let h = chunk::shard_hash(&shard);
+        let other = [9u8; 32];
+        let stripes = vec![
+            stripe_of(vec![h, other, [1u8; 32]], 2),
+            stripe_of(vec![[2u8; 32], h, [3u8; 32]], 2),
+        ];
+        let routes = sharding_v2::shard_routes(&stripes);
+        let mut states: Vec<StripeState> = stripes.iter().map(state_for).collect();
+        assert!(route_reply(&routes, &mut states, &shard));
+        assert_eq!(states[0].got[0].as_deref(), Some(&shard[..]));
+        assert_eq!(states[1].got[1].as_deref(), Some(&shard[..]), "別のストライプの同じ中身も埋まる");
+        assert_eq!(states[0].have() + states[1].have(), 2);
+        // 同じ返信がもう一度来ても何も変わらない
+        assert!(!route_reply(&routes, &mut states, &shard));
+    }
+
+    #[test]
+    fn reply_with_wrong_length_or_unknown_hash_is_dropped() {
+        let shard = vec![7u8; chunk::V2_SHARD_BYTES];
+        let stripes = vec![stripe_of(vec![chunk::shard_hash(&shard), [1u8; 32]], 1)];
+        let routes = sharding_v2::shard_routes(&stripes);
+        let mut states: Vec<StripeState> = stripes.iter().map(state_for).collect();
+        assert!(!route_reply(&routes, &mut states, &[0u8; 100]), "長さが違う");
+        let mut forged = shard.clone();
+        forged[0] ^= 1;
+        assert!(!route_reply(&routes, &mut states, &forged), "表に無いハッシュ");
+        assert_eq!(states[0].have(), 0);
+        // 終わったストライプには入れない
+        states[0].done = true;
+        assert!(!route_reply(&routes, &mut states, &shard));
+    }
+
+    #[test]
+    fn requests_ask_data_first_then_parity_without_duplicates() {
+        let (a, b, p) = ([1u8; 32], [2u8; 32], [4u8; 32]);
+        // データ k=3（a が 2 か所で重複）、パリティ 1
+        let stripe = stripe_of(vec![a, b, a, p], 3);
+        let mut state = state_for(&stripe);
+        let mut requested = HashSet::new();
+        let data = stripe_requests(&stripe, &state, &requested, false);
+        assert_eq!(data, vec![a, b], "データだけ・重複は 1 回");
+        requested.extend(data.iter().copied());
+        let parity = stripe_requests(&stripe, &state, &requested, true);
+        assert_eq!(parity, vec![p], "要求済みは除き、パリティを足す");
+        // 届いた位置は要求しない
+        state.got[1] = Some(vec![]);
+        assert!(stripe_requests(&stripe, &state, &HashSet::new(), false).iter().all(|h| *h != b));
+    }
+
+    #[test]
+    fn v2_pipeline_restores_a_file_from_partial_shards() {
+        // 置く側の純粋な部分（レイアウトとストライプの組み立て）→ 取る側の振り分けと復元
+        let size = (2 * 16 + 3) as u64 * chunk::V2_CHUNK_PLAIN as u64 - 1234;
+        let shapes = chunk::v2_stripe_shapes(size).unwrap();
+        assert_eq!(shapes.len(), 3, "2 本 + 短い 3 本目");
+        let chunks = chunk::v2_chunk_count(size);
+        let mut objects: Vec<Vec<u8>> = (0..chunks)
+            .map(|i| {
+                let len = if i + 1 == chunks { 4321 } else { chunk::V2_SHARD_BYTES };
+                (0..len).map(|j| (i * 11 + j) as u8).collect()
+            })
+            .collect();
+        let originals = objects.clone();
+        let mut built = Vec::new();
+        for (k, m) in &shapes {
+            let part: Vec<Vec<u8>> = objects.drain(..*k).collect();
+            built.push(sharding_v2::build_stripe(&part, *m).unwrap());
+        }
+        let stripes: Vec<StripeV2> = built.iter().map(|b| b.stripe.clone()).collect();
+        let routes = sharding_v2::shard_routes(&stripes);
+        let mut states: Vec<StripeState> = stripes.iter().map(state_for).collect();
+        // 各ストライプのデータシャードを 1 枚ずつ欠いた状態で、返信として届ける
+        for b in &built {
+            for (pos, shard) in b.shards.iter().enumerate() {
+                if pos == 1 {
+                    continue;
+                }
+                route_reply(&routes, &mut states, shard);
+            }
+        }
+        let mut restored = Vec::new();
+        for (st, sp) in states.iter().zip(&stripes) {
+            restored.extend(sharding_v2::restore_stripe(sp, &st.got).unwrap());
+        }
+        assert_eq!(restored, originals, "短い最後のシャードも含めて元に戻る");
     }
 
     #[test]

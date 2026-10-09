@@ -199,17 +199,35 @@ impl AetherClient {
         let k_pub = post.board.key();
         let target = board_target(&k_pub);
 
+        // 大きなファイルは、Manifest が 1 オブジェクトに収まる大きさまで。回路を組む前に、何も送らず断る
+        if chunk::needs_chunking(post.content.len()) {
+            let fits = chunk::manifest_v2_sealed_len(post.name.len(), post.content.len() as u64)
+                .is_ok_and(|n| n <= chunk::SINGLE_BODY_LIMIT);
+            if !fits {
+                let max = chunk::max_file_size_v2(post.name.len());
+                return Err(ClientError::invalid(format!(
+                    "ファイルが大きすぎます（上限 約 {} MB）",
+                    max / 1_000_000
+                )));
+            }
+        }
+
         let (body_c, hint_c) = self.body_and_hint_circuits().await?;
         let body_exit = hex_id(&body_c.exit.node_id);
         let hint_exit = hex_id(&hint_c.exit.node_id);
         let mailbox = self.sending_mailbox(body_c, hint_c, target, k_pub);
 
         let report = if chunk::needs_chunking(post.content.len()) {
-            let content_ref = mailbox.place_chunked(&k_pub, &post.name, &post.content).await?;
-            let chunks = post.content.len().div_ceil(chunk::CHUNK_SIZE);
+            let (content_ref, profile) = mailbox.place_file_v2(&k_pub, &post.name, &post.content).await?;
+            let chunks = chunk::v2_chunk_count(post.content.len() as u64);
             events::progress(
                 &self.events,
-                format!("{} チャンクに分割して配置しました ({} バイト)", chunks, post.content.len()),
+                format!(
+                    "{} チャンクに分割して配置しました ({} バイト、{} バイト送出)",
+                    chunks,
+                    post.content.len(),
+                    profile.bytes
+                ),
             );
             let descriptor = IndexDescriptor {
                 content_ref,

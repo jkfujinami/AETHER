@@ -6,6 +6,7 @@ use crate::net::relay_list::RelayDirectory;
 use crate::mailbox::sharding::{self, Shard};
 use crate::mailbox::index::{self, IndexDescriptor, IndexRecord};
 use crate::mailbox::chunk;
+use crate::mailbox::sharding_v2;
 use crate::mailbox::hint_release::{ReleasePolicy, UploadProfile};
 use crate::net::tunnel::TunnelEndpoint;
 use std::time::Instant;
@@ -371,33 +372,122 @@ impl SchrodingerMailbox {
         Ok((content_ref, object))
     }
 
-    /// 大容量コンテンツをチャンク化して配置し、Manifest の `content_ref` を返す (2-4)
+    /// 大きなファイルを v2 の形で置き、Manifest の `content_ref` を返す（Part 23 の 7 章）
     ///
-    /// 各チャンクと Manifest を content-addressed に置くので、同一ファイルの再公開は
-    /// **重複排除**され、複数保持者から**並列取得（swarm）**できる。**公開コンテンツ専用。**
-    /// 戻り値を索引の記述子（`chunked = true`）の `content_ref` に載せる。
-    pub async fn place_chunked(
+    /// v2 では 16 チャンクごとに RS(16+m) を掛け、**各シャードを担当 1 台にだけ**置く。
+    /// **メモリは 1 ストライプ分**: チャンクを封じ、パリティを作り、その場で全シャードを置いて捨てる。
+    /// 手元に残すのはハッシュだけ。最後に [`ManifestV2`](chunk::ManifestV2) を小さなものの経路
+    /// （[`place_object`](Self::place_object)）で置く。同じ中身のチャンクは収束暗号で同じシャード・
+    /// 同じハッシュになり、2 回目の put は保持者が同じ値として受ける。
+    ///
+    /// Manifest が 1 オブジェクトに収まらない大きさは、何も送らずにエラーにする。
+    /// **互換は無い**（v1 の形では置かない）。公開コンテンツ専用。
+    pub async fn place_file_v2(
         &self,
         secret: &SharedSecret,
         name: &str,
         data: &[u8],
-    ) -> Result<[u8; 32]> {
-        let mut chunk_refs = Vec::new();
-        for piece in chunk::split(data) {
-            let (cref, object) = self.seal_chunk(secret, piece)?;
-            self.place_object(&cref, secret, &object).await?;
-            chunk_refs.push(cref);
+    ) -> Result<([u8; 32], UploadProfile)> {
+        let started = Instant::now();
+        let size = data.len() as u64;
+        // 送る前に確かめる（途中まで置いて断ることのないように）
+        let sealed_len = chunk::manifest_v2_sealed_len(name.len(), size)?;
+        if sealed_len > chunk::SINGLE_BODY_LIMIT {
+            return Err(AetherError::Config(format!(
+                "File too large for a single v2 manifest ({} bytes sealed, max {})",
+                sealed_len,
+                chunk::SINGLE_BODY_LIMIT
+            )));
+        }
+        let shapes = chunk::v2_stripe_shapes(size)?;
+
+        let mut sent_bytes: u64 = 0;
+        let mut stripes = Vec::with_capacity(shapes.len());
+        let mut pieces = data.chunks(chunk::V2_CHUNK_PLAIN);
+        for (k, m) in shapes {
+            let mut objects = Vec::with_capacity(k);
+            for piece in pieces.by_ref().take(k) {
+                objects.push(self.seal_chunk(secret, piece)?.1);
+            }
+            let built = sharding_v2::build_stripe(&objects, m)?;
+            drop(objects);
+            for shard in &built.shards {
+                sent_bytes += self.put_shard_v2(secret, shard).await?;
+            }
+            stripes.push(built.stripe);
         }
 
-        let manifest = chunk::Manifest {
+        let manifest = chunk::ManifestV2 {
+            version: chunk::MANIFEST_V2_VERSION,
             name: name.to_string(),
-            size: data.len() as u64,
-            chunk_refs,
+            size,
+            chunk_plain: chunk::V2_CHUNK_PLAIN as u32,
+            stripes,
         };
-        let manifest_bytes = manifest.encode()?;
-        let (mref, object) = self.seal_chunk(secret, &manifest_bytes)?;
-        self.place_object(&mref, secret, &object).await?;
-        Ok(mref)
+        let (mref, object) = self.seal_chunk(secret, &manifest.encode()?)?;
+        let profile = self.place_object(&mref, secret, &object).await?;
+        Ok((
+            mref,
+            UploadProfile {
+                bytes: sent_bytes + profile.bytes,
+                duration: started.elapsed(),
+            },
+        ))
+    }
+
+    /// v2 のシャード 1 枚を、ハッシュから決まる担当 1 台へ置く。送ったバイト数を返す
+    ///
+    /// 置き場所は `shard_targets(H(シャード), 秘密, 0)` の先頭 1 台、キーは `shard_key(H, 0)`。
+    /// 封（HMAC）は付けない（Manifest のハッシュで 1 枚ずつ照合するため）。
+    /// 保持者側は v1 と区別できない `[put_key 32][値]` の形のまま。
+    /// 担当が居ないときは黙って飛ばさずエラーにする。
+    pub async fn put_shard_v2(&self, secret: &SharedSecret, shard: &[u8]) -> Result<u64> {
+        let hash = chunk::shard_hash(shard);
+        let targets = self.shard_targets(&hash, secret, 0).await;
+        let Some(&target) = targets.first() else {
+            return Err(AetherError::Config(
+                "Relay directory is empty; cannot place shards".into(),
+            ));
+        };
+        let mut put = Vec::with_capacity(32 + shard.len());
+        put.extend_from_slice(&sharding::shard_key(&hash, 0));
+        put.extend_from_slice(shard);
+        self.relay
+            .send_onion_message_typed(wire::PacketType::MailboxPut, &put, target)
+            .await?;
+        Ok(put.len() as u64)
+    }
+
+    /// v2 のシャードをハッシュで指定して、担当 1 台へ要求する（返信は Inbound Tunnel）
+    ///
+    /// 送った本数を返す。担当が居ないシャードは数えない（呼び出し側が 0 ならエラーにする）。
+    pub async fn request_shards_v2(
+        &self,
+        secret: &SharedSecret,
+        hashes: &[[u8; 32]],
+    ) -> Result<usize> {
+        let reply_to = {
+            let tunnels = self.inbound_tunnels.lock().unwrap();
+            tunnels
+                .first()
+                .map(|t| t.endpoint.clone())
+                .ok_or(AetherError::Config(
+                    "No inbound tunnel; cannot receive the reply anonymously".into(),
+                ))?
+        };
+        let mut sent = 0;
+        for hash in hashes {
+            let targets = self.shard_targets(hash, secret, 0).await;
+            let Some(&target) = targets.first() else {
+                continue;
+            };
+            let request = wire::build_mailbox_get(&sharding::shard_key(hash, 0), &reply_to)?;
+            self.relay
+                .send_onion_message_typed(wire::PacketType::MailboxGet, &request, target)
+                .await?;
+            sent += 1;
+        }
+        Ok(sent)
     }
 
     /// content-addressed なオブジェクト（チャンク／Manifest）の取得要求を出す (2-4)
@@ -995,5 +1085,40 @@ mod tests {
         let decrypted_msg = cipher::decrypt(&bob_msg_key, &msg_nonce_arr, msg_ciphertext).unwrap();
         assert_eq!(decrypted_msg, message);
         println!("Bob successfully decrypted message: {:?}", String::from_utf8_lossy(&decrypted_msg));
+    }
+
+    /// 本物の封じ方（seal_chunk）で v2 のストライプを作り、データを欠いた状態から開き直せる
+    ///
+    /// build_stripe は「最後以外のオブジェクトはちょうど V2_SHARD_BYTES」を前提にする。
+    /// 封じたチャンクの長さがずれると公開が必ず失敗するので、偽のオブジェクトではなく実物で確かめる。
+    #[tokio::test]
+    async fn v2_sealed_chunks_survive_striping_and_open_again() {
+        let mailbox = create_dummy_mailbox();
+        let secret = [7u8; 32];
+        let size = 17 * chunk::V2_CHUNK_PLAIN + 1234;
+        let data: Vec<u8> = (0..size).map(|i| (i * 31 % 251) as u8).collect();
+
+        let mut restored = Vec::new();
+        let mut pieces = data.chunks(chunk::V2_CHUNK_PLAIN);
+        for (k, m) in chunk::v2_stripe_shapes(size as u64).unwrap() {
+            let objects: Vec<Vec<u8>> = pieces
+                .by_ref()
+                .take(k)
+                .map(|p| mailbox.seal_chunk(&secret, p).unwrap().1)
+                .collect();
+            let built = sharding_v2::build_stripe(&objects, m).unwrap();
+            // 先頭のデータシャードを欠き、パリティで補う
+            let missing = m.min(k);
+            let got: Vec<Option<Vec<u8>>> = built
+                .shards
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i >= missing).then(|| s.clone()))
+                .collect();
+            for object in sharding_v2::restore_stripe(&built.stripe, &got).unwrap() {
+                restored.extend(mailbox.decrypt_mailbox_value(&object, &secret).unwrap());
+            }
+        }
+        assert_eq!(restored, data);
     }
 }
