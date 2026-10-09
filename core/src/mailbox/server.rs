@@ -214,7 +214,8 @@ impl TunnelInbox {
 }
 
 pub struct MailboxServer {
-    db: Db,
+    /// 捨てるときに取り出して別スレッドで閉じるため `ManuallyDrop`（[`Drop`] の実装を参照）
+    db: std::mem::ManuallyDrop<Db>,
     /// エントリの保持期間（秒）
     ttl_seconds: u64,
     /// DB 全体の容量上限（バイト）。小物・大物の枠に割って使う
@@ -232,6 +233,33 @@ pub struct MailboxServer {
     /// 自分宛ての返信トンネルの受け箱（メモリだけ。預かり物とは別）
     tunnel_inbox: Mutex<TunnelInbox>,
 }
+
+/// 捨てるときは、sled の書き出しと後始末を**別のスレッド**で行い、最大 [`CLOSE_WAIT`] だけ待つ
+///
+/// 保管庫の最後の参照が非同期の仕事（保持者の受け口の処理など）の中で捨てられると、sled は閉じるときの
+/// 書き出しをそのワーカーのスレッドの上で行う。そこで終わらない待ちに入ることがあり、ワーカーが戻らないので
+/// ランタイムを閉じられず、プロセスが終われなかった（試験・CLI の終了）。ふつうはすぐ閉じ終わる
+/// （ファイルのロックも解けるので、同じ場所を開き直せる）。止まったときだけ見切って先へ進む。
+impl Drop for MailboxServer {
+    fn drop(&mut self) {
+        // SAFETY: drop の中で一度だけ取り出し、以後 self.db には触れない
+        let db = unsafe { std::mem::ManuallyDrop::take(&mut self.db) };
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let spawned = std::thread::Builder::new()
+            .name("aether-mailbox-close".into())
+            .spawn(move || {
+                let _ = db.flush();
+                drop(db);
+                let _ = done_tx.send(());
+            });
+        if spawned.is_ok() {
+            let _ = done_rx.recv_timeout(CLOSE_WAIT);
+        }
+    }
+}
+
+/// 保管庫を閉じ終わるのを待つ上限
+const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl MailboxServer {
     /// 平文で開く（テスト・暗号化しない場合）
@@ -269,7 +297,7 @@ impl MailboxServer {
         }
 
         Ok(Self {
-            db,
+            db: std::mem::ManuallyDrop::new(db),
             ttl_seconds: config.message_ttl_hours * 3600,
             capacity_bytes: config.mailbox_capacity_mb * 1024 * 1024,
             cached_size: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -352,19 +380,37 @@ impl MailboxServer {
         let Some(entry) = self.live_entry(&slot)? else {
             return Ok(None);
         };
+        self.extend_on_access(&slot, &entry)?;
+        Ok(Some(entry.value))
+    }
 
-        // アクセスで寿命を延ばす。ただし毎読み込みで書き戻すと書き込み増幅になるため、
-        // TTL の半分を過ぎた時だけ触り直す（読み頻度に依らず書き込みは TTL/2 に1回）。
-        // 取られた回数が増えるときも書き戻す（頭打ちなので 1 件あたり最大 [`ACCESSED_MAX`] 回で済む）。
+    /// 取られたときの寿命の延ばし方（`handle_get` と `touch` で同じ規則を使う）
+    ///
+    /// アクセスで寿命を延ばす。ただし毎読み込みで書き戻すと書き込み増幅になるため、
+    /// TTL の半分を過ぎた時だけ触り直す（読み頻度に依らず書き込みは TTL/2 に1回）。
+    /// 取られた回数が増えるときも書き戻す（頭打ちなので 1 件あたり最大 [`ACCESSED_MAX`] 回で済む）。
+    fn extend_on_access(&self, slot: &[u8], entry: &MailboxEntry) -> Result<()> {
         let accessed = entry.accessed.saturating_add(1).min(ACCESSED_MAX);
         let counts_up = accessed != entry.accessed;
         if counts_up
             || current_timestamp().saturating_sub(entry.refreshed_at) >= self.ttl_seconds / 2
         {
-            self.insert_entry(&slot, &entry.value, accessed)?;
+            self.insert_entry(slot, &entry.value, accessed)?;
         }
+        Ok(())
+    }
 
-        Ok(Some(entry.value))
+    /// 延命だけ（返事なし）。中身があれば `handle_get` と同じ規則で寿命を延ばし `true`、無ければ何もしない
+    ///
+    /// 取った人が、取らなかった欠片（ふつうはパリティ）の寿命を延ばすために送る（Part 25 の P12）。
+    /// 返事をしないので、無いことを第三者に晒さない。
+    pub async fn touch(&self, key: &[u8; 32]) -> Result<bool> {
+        let slot = self.blind(b"mbx", key);
+        let Some(entry) = self.live_entry(&slot)? else {
+            return Ok(false);
+        };
+        self.extend_on_access(&slot, &entry)?;
+        Ok(true)
     }
 
     /// Tunnel 用: 自分宛ての返信を受け箱（メモリ）に入れる
@@ -1112,6 +1158,36 @@ mod tests {
         }
         assert_eq!(accessed_of(&s, 1), ACCESSED_MAX);
         assert_eq!(ACCESSED_MAX, 3);
+    }
+
+    #[tokio::test]
+    async fn touch_counts_access_and_extends_life_without_returning_the_value() {
+        let (s, _dir) = server_with(24);
+        s.handle_put(&put_payload(1, b"parity")).await.unwrap();
+        for _ in 0..5 {
+            assert!(s.touch(&[1u8; 32]).await.unwrap());
+        }
+        assert_eq!(accessed_of(&s, 1), ACCESSED_MAX, "延命も取られた回数を数え、頭打ち");
+
+        // TTL の半分を過ぎた古い中身は、延命で書き戻されて新しくなる
+        let slot = s.blind(b"mbx", &[2u8; 32]);
+        let old = MailboxEntry {
+            value: b"old".to_vec(),
+            refreshed_at: current_timestamp() - 20 * 3600,
+            accessed: ACCESSED_MAX,
+        };
+        s.db.insert(slot.clone(), bincode::serialize(&old).unwrap()).unwrap();
+        assert!(s.touch(&[2u8; 32]).await.unwrap());
+        let after = s.live_entry(&slot).unwrap().unwrap();
+        assert!(after.refreshed_at > old.refreshed_at, "寿命が延びた");
+        assert_eq!(after.value, b"old");
+    }
+
+    #[tokio::test]
+    async fn touch_of_a_missing_key_does_nothing() {
+        let (s, _dir) = server_with(24);
+        assert!(!s.touch(&[9u8; 32]).await.unwrap());
+        assert!(s.is_empty(), "無いキーを作らない");
     }
 
     #[tokio::test]
