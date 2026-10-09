@@ -4,7 +4,7 @@ use crate::net::gossip::GossipClient;
 use crate::net::gossip_server;
 use crate::net::relay_list::RelayDirectory;
 use crate::net::ring::{self, RingPosition};
-use crate::net::holder::{build_gateway_data, HOLDER_GET, HOLDER_PUT};
+use crate::net::holder::{build_gateway_data, HOLDER_GET, HOLDER_PUT, HOLDER_TOUCH};
 use crate::mailbox::sharding::{self, Shard};
 use crate::mailbox::index::{self, IndexDescriptor, IndexRecord};
 use crate::mailbox::chunk;
@@ -571,6 +571,26 @@ impl SchrodingerMailbox {
             }
         }
         Ok(sent)
+    }
+
+    /// v2 のシャードの寿命を延ばすよう、担当の保持者 1 人の受け口へ頼む（返事は無い）
+    ///
+    /// 置いた場所（[`put_shard_v2`](Self::put_shard_v2)）と同じ保持者へ `HOLDER_TOUCH`（本文 = キー 32 バイト）を送る。
+    /// 取る人はデータのシャードしか取らないので、取らなかった位置（パリティ）はこれで延ばす
+    /// （Part 25 の P12）。送った本数を返す。担当が居ない・どの受け口にも送れないものは数えない。
+    pub async fn touch_shards_v2(&self, secret: &SharedSecret, hashes: &[[u8; 32]]) -> usize {
+        let mut sent = 0;
+        for hash in hashes {
+            let position = ring::position_of_shard(hash, secret, 0);
+            let routes = self.holders_at(position, 1).await;
+            let Some(route) = routes.first() else {
+                continue;
+            };
+            if self.send_to_holder(route, HOLDER_TOUCH, &sharding::v2_put_key(hash)).await {
+                sent += 1;
+            }
+        }
+        sent
     }
 
     /// content-addressed なオブジェクト（チャンク／Manifest）の取得要求を出す (2-4)

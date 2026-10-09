@@ -143,6 +143,7 @@ function readSettings() {
       delay_release: $("delay-release").checked,
       save_talk_history: $("save-talk-history").checked,
       pad_file_size: $("pad-file-size").checked,
+      help_keep_files: $("help-keep-files").checked,
     },
   };
 }
@@ -158,6 +159,7 @@ function fillSettings(s) {
   $("delay-release").checked = p.delay_release ?? true;
   $("save-talk-history").checked = p.save_talk_history ?? true;
   $("pad-file-size").checked = p.pad_file_size ?? true;
+  $("help-keep-files").checked = p.help_keep_files ?? true;
   updateModeRows();
 }
 

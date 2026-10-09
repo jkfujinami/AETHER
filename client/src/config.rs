@@ -57,6 +57,12 @@ pub struct PrivacyOptions {
     /// 上げた人がこれを切っていれば、取る人の量からも大きさが出る。
     /// 代わりに、上り・保存と、取る人の下りが最大 2 倍（平均 1.4 倍）になる。切ると切り上げも埋め草もしない。
     pub pad_file_size: bool,
+    /// 取ったファイルの欠片の寿命を延ばし、欠けた欠片を置き直して、網からファイルが消えないよう手伝う（既定: 有効）
+    ///
+    /// 取り終えた後に少し上りを使う（1GB あたり数 MB〜、欠けていた分）。保持者は取った人の IP を知らない
+    /// （回路の出口から届く）。取った人のガードには、取った後の少しの上りが見える。
+    /// 切ると延命も置き直しもしない（Part 25 の P11・P12）。
+    pub help_keep_files: bool,
 }
 
 impl Default for PrivacyOptions {
@@ -66,6 +72,7 @@ impl Default for PrivacyOptions {
             delay_release: true,
             save_talk_history: true,
             pad_file_size: true,
+            help_keep_files: true,
         }
     }
 }
@@ -161,5 +168,9 @@ mod tests {
         // 明示的に切った値は保たれる
         let off: PrivacyOptions = serde_json::from_str(r#"{"pad_file_size":false}"#).unwrap();
         assert!(!off.pad_file_size);
+        // 手伝う切り替えも、無ければ既定の有効
+        assert!(p.help_keep_files && PrivacyOptions::default().help_keep_files);
+        let off: PrivacyOptions = serde_json::from_str(r#"{"help_keep_files":false}"#).unwrap();
+        assert!(!off.help_keep_files && off.pad_file_size);
     }
 }

@@ -203,6 +203,50 @@ pub fn restore_stripe(stripe: &StripeV2, got: &[Option<Vec<u8>>]) -> Result<Vec<
     Ok(objects)
 }
 
+/// 復元したチャンクのオブジェクトから、`positions` の位置のシャードを作り直す（置き直し用）
+///
+/// `objects` は [`restore_stripe`] の戻り値（`[nonce][暗号文]` k 個。最後は埋めが外れている）。
+/// データの位置は埋め直すだけ、パリティの位置は RS で作る。**作り直したシャードのハッシュが
+/// Manifest のものと合わなければその位置は返さない**（壊れたものを網に広げない）。
+/// 範囲外の位置も返さない。
+pub fn rebuild_shards(
+    stripe: &StripeV2,
+    objects: &[Vec<u8>],
+    positions: &[usize],
+) -> Result<Vec<(usize, Vec<u8>)>> {
+    let k = stripe.data as usize;
+    if objects.len() != k {
+        return Err(AetherError::Protocol("rebuild_shards: object count differs from stripe".into()));
+    }
+    let data: Vec<Vec<u8>> = objects
+        .iter()
+        .map(|o| {
+            let mut s = o.clone();
+            s.resize(V2_SHARD_BYTES, 0);
+            s
+        })
+        .collect();
+    let parity = if positions.iter().any(|&p| p >= k) {
+        encode_stripe(&data, stripe.parity as usize)?
+    } else {
+        Vec::new()
+    };
+    Ok(positions
+        .iter()
+        .filter_map(|&pos| {
+            let shard = if pos < k { data.get(pos) } else { parity.get(pos - k) }?;
+            (stripe.shard_hashes.get(pos) == Some(&shard_hash(shard))).then(|| (pos, shard.clone()))
+        })
+        .collect())
+}
+
+/// 取れたシャードのうち、取らなかった（埋まっていない）位置
+///
+/// ふつうはパリティ全部。取った人はこの位置へ延命を送る（Part 25 の P12）。
+pub fn unfetched_positions(filled: &[bool]) -> Vec<usize> {
+    filled.iter().enumerate().filter(|(_, f)| !**f).map(|(i, _)| i).collect()
+}
+
 /// シャードのハッシュ → `(ストライプ, 位置)` の対応表（返信の振り分け用）
 ///
 /// **同じハッシュが複数の位置にあり得る**（同じ中身のチャンクは収束暗号で同じシャードになる）。
@@ -236,6 +280,41 @@ mod tests {
         (0..all.len())
             .map(|i| idx.contains(&i).then(|| all[i].clone()))
             .collect()
+    }
+
+    fn built_stripe(k: usize, m: usize) -> (BuiltStripe, Vec<Vec<u8>>) {
+        let mut objects: Vec<Vec<u8>> = (0..k)
+            .map(|i| (0..V2_SHARD_BYTES).map(|j| (i * 13 + j * 5 + 3) as u8).collect())
+            .collect();
+        objects[k - 1].truncate(V2_SEAL_OVERHEAD + 100);
+        (build_stripe(&objects, m).unwrap(), objects)
+    }
+
+    #[test]
+    fn rebuild_shards_recreates_data_and_parity_that_match_the_manifest() {
+        let (built, objects) = built_stripe(4, 3);
+        let all: Vec<usize> = (0..7).collect();
+        let rebuilt = rebuild_shards(&built.stripe, &objects, &all).unwrap();
+        assert_eq!(rebuilt.len(), 7);
+        for (pos, shard) in rebuilt {
+            assert_eq!(shard, built.shards[pos], "位置 {} が置いたものと一致する", pos);
+        }
+        // 範囲外の位置は返さない
+        assert!(rebuild_shards(&built.stripe, &objects, &[99]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rebuild_shards_drops_positions_whose_hash_does_not_match() {
+        let (built, mut objects) = built_stripe(4, 3);
+        objects[0][10] ^= 0xff; // 壊れた復元（データ 0 と全パリティが合わなくなる）
+        let rebuilt = rebuild_shards(&built.stripe, &objects, &[0, 1, 4, 5]).unwrap();
+        assert_eq!(rebuilt.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![1], "合うのはデータ 1 だけ");
+    }
+
+    #[test]
+    fn unfetched_positions_are_the_ones_not_filled() {
+        assert_eq!(unfetched_positions(&[true, true, false, true, false]), vec![2, 4]);
+        assert!(unfetched_positions(&[true, true]).is_empty());
     }
 
     #[test]

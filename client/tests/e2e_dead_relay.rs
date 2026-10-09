@@ -36,6 +36,7 @@ fn no_delays() -> PrivacyOptions {
         delay_release: false,
         save_talk_history: false,
         pad_file_size: true,
+        help_keep_files: true,
     }
 }
 

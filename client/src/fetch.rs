@@ -263,9 +263,17 @@ impl HedgeTracker {
     }
 
     /// ストライプを終える（揃った・諦めた）。そのストライプの未着はもう見ない
-    fn finish_stripe(&mut self, stripe: usize) {
+    ///
+    /// 終える時点で失われたとみなされ、まだ届いていない要求の位置を返す（昇順・重複なし）。
+    /// 保持者が去った・担当が入れ替わったシャードで、取り終えた人が置き直す対象（Part 25 の P11）。
+    fn finish_stripe(&mut self, stripe: usize) -> Vec<usize> {
         self.stripes.remove(&stripe);
+        let mut lost: Vec<usize> =
+            self.pending.iter().filter(|r| r.stripe == stripe && r.lost_at.is_some()).map(|r| r.pos).collect();
+        lost.sort_unstable();
+        lost.dedup();
         self.pending.retain(|r| r.stripe != stripe);
+        lost
     }
 
     /// 失われた要求を見つけ、足すパリティの（ストライプ, 位置）を返す。返した位置は要求したことになる
@@ -327,6 +335,47 @@ impl HedgeTracker {
     #[cfg(test)]
     fn outstanding(&self, stripe: usize) -> usize {
         self.pending.iter().filter(|r| r.stripe == stripe).count()
+    }
+}
+
+/// 置き直しに溜めるシャードの上限（1 枚 256KB。メモリを抑える。超えた分は延命だけ）
+const MAX_REPAIR_SHARDS: usize = 256;
+/// 延命・置き直しを送る時間の上限（取得の結果を長く待たせない。超えた分は次に取る人に任せる）
+const KEEP_BUDGET: Duration = Duration::from_secs(30);
+/// 延命を送る間に時間を見る単位
+const TOUCH_BATCH: usize = 32;
+
+/// 取り終えたストライプから集めた、ファイルを網に残すための手伝い（延命と置き直し）
+#[derive(Default)]
+struct KeepHelp {
+    /// 延命を送るシャードのハッシュ（取らなかった位置）
+    touch: Vec<[u8; 32]>,
+    /// 置き直すシャード（ハッシュ → 中身）。Manifest のハッシュと合うと確かめたものだけ
+    repairs: HashMap<[u8; 32], Vec<u8>>,
+}
+
+impl KeepHelp {
+    /// 復元できたストライプ 1 本ぶんを足す
+    ///
+    /// `filled` は取った位置、`lost` は失われたとみなされた位置、`objects` は復元したチャンクの
+    /// オブジェクト。失われた位置は延命でなく置き直し（作り直したシャードがハッシュと合わなければ置かない）。
+    fn add_stripe(&mut self, stripe: &StripeV2, filled: &[bool], lost: &[usize], objects: &[Vec<u8>]) {
+        for pos in sharding_v2::unfetched_positions(filled) {
+            if !lost.contains(&pos)
+                && let Some(h) = stripe.shard_hashes.get(pos)
+            {
+                self.touch.push(*h);
+            }
+        }
+        if lost.is_empty() || self.repairs.len() >= MAX_REPAIR_SHARDS {
+            return;
+        }
+        // 作り直せない（壊れた復元）なら置かない
+        for (pos, shard) in sharding_v2::rebuild_shards(stripe, objects, lost).unwrap_or_default() {
+            if self.repairs.len() < MAX_REPAIR_SHARDS {
+                self.repairs.insert(stripe.shard_hashes[pos], shard);
+            }
+        }
     }
 }
 
@@ -484,7 +533,15 @@ impl AetherClient {
             .await?;
 
         if let Some(manifest) = first[0].as_deref().and_then(|b| ManifestV2::decode(b).ok()) {
-            return self.fetch_file_v2(&session, manifest, &k_pub).await;
+            let (fetched, help) = self.fetch_file_v2(&session, manifest, &k_pub).await?;
+            // 取ったファイルを先に返し、網に残す手伝い（延命・置き直し）は裏で送る。
+            // 終わる前に `flush` を呼ぶ側（CLI）は、これを送り終えるまで待つ
+            if let Some(help) = help {
+                let events = self.events.clone();
+                let handle = tokio::spawn(keep_files_alive(session, k_pub, help, events));
+                self.pending_flush.lock().unwrap().push(handle);
+            }
+            return Ok(fetched);
         }
         // 古い形式（v1 の Manifest）は読まない。互換を切った
         if first[0].as_deref().is_some_and(|b| Manifest::decode(b).is_ok()) {
@@ -509,7 +566,7 @@ impl AetherClient {
         session: &PullSession,
         manifest: ManifestV2,
         k_pub: &[u8; 32],
-    ) -> Result<Option<Fetched>> {
+    ) -> Result<(Option<Fetched>, Option<KeepHelp>)> {
         let total = manifest.stripes.len();
         events::progress(
             &self.events,
@@ -522,6 +579,8 @@ impl AetherClient {
             .map(|s| StripeState { got: vec![None; s.shard_hashes.len()], ..Default::default() })
             .collect();
         let mut tracker = HedgeTracker::new(Instant::now());
+        let help_on = self.privacy().help_keep_files;
+        let mut help = KeepHelp::default();
         let mut plain: Vec<Vec<u8>> = vec![Vec::new(); total];
         let mut window = StripeWindow::new(total, V2_STRIPES_IN_FLIGHT);
         let (mut finished, mut failed) = (0usize, 0usize);
@@ -560,9 +619,13 @@ impl AetherClient {
                         bytes.extend_from_slice(&piece);
                     }
                     plain[i] = bytes;
+                    let filled: Vec<bool> = states[i].got.iter().map(Option::is_some).collect();
                     states[i].done = true;
                     states[i].got = Vec::new();
-                    tracker.finish_stripe(i);
+                    let lost = tracker.finish_stripe(i);
+                    if help_on {
+                        help.add_stripe(stripe, &filled, &lost, &objects);
+                    }
                     window.finish(i);
                     finished += 1;
                 }
@@ -604,7 +667,7 @@ impl AetherClient {
                 &self.events,
                 format!("{}/{} ストライプを取得できませんでした{}", failed, total, detail),
             );
-            return Ok(None);
+            return Ok((None, None));
         }
 
         let mut bytes: Vec<u8> = plain.into_iter().flatten().collect();
@@ -612,7 +675,7 @@ impl AetherClient {
             return Err(crate::error::ClientError::invalid("ファイルの大きさが Manifest と合いません"));
         }
         bytes.truncate(manifest.size as usize);
-        Ok(Some(Fetched { name: Some(manifest.name), bytes }))
+        Ok((Some(Fetched { name: Some(manifest.name), bytes }), help_on.then_some(help)))
     }
 
     /// シャードを要求する。担当が 1 台も居なければエラー
@@ -731,6 +794,37 @@ impl AetherClient {
             total += session.mailbox.request_shards(key, secret, &wants).await?;
         }
         Ok(total)
+    }
+}
+
+/// 取り終えたファイルを網に残すのを手伝う ── 取らなかった位置へ延命、失われた位置は置き直す
+///
+/// 取った回路と同じ session から、置き場所と同じ保持者の受け口へ送る。保持者は取った人の IP を
+/// 知らない。結果を長く待たせないよう、`KEEP_BUDGET` までで切る（残りは次に取る人に任せる）。
+/// 失敗しても取得の結果には影響しない。取ったファイルを返した後に裏で走る（[`AetherClient::get`]）。
+async fn keep_files_alive(session: PullSession, k_pub: [u8; 32], help: KeepHelp, events: crate::events::EventSender) {
+    let deadline = Instant::now() + KEEP_BUDGET;
+    let mut touch = help.touch;
+    touch.sort_unstable();
+    touch.dedup();
+    let mut touched = 0;
+    for batch in touch.chunks(TOUCH_BATCH) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        touched += session.mailbox.touch_shards_v2(&k_pub, batch).await;
+    }
+    let mut repaired = 0;
+    for shard in help.repairs.values() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if session.mailbox.put_shard_v2(&k_pub, shard).await.is_ok() {
+            repaired += 1;
+        }
+    }
+    if touched > 0 || repaired > 0 {
+        events::progress(&events, format!("修復 {} 枚・延命 {} 枚", repaired, touched));
     }
 }
 
@@ -861,6 +955,75 @@ mod tests {
             }
             assert!(t.poll(now).is_empty(), "t = {}", tick);
         }
+    }
+
+    #[test]
+    fn finishing_a_stripe_reports_the_lost_positions_only() {
+        let (mut t, base) = tracker_with_one_stripe();
+        for (secs, pos) in [(1.0, 0usize), (2.0, 1), (3.0, 3)] {
+            t.on_filled(0, pos, at(base, secs));
+        }
+        assert_eq!(t.poll(at(base, 6.0)), vec![(0, 4)]);
+        t.on_filled(0, 4, at(base, 6.5));
+        assert_eq!(t.finish_stripe(0), vec![2], "位置 2 は失われたとみなされ、届かなかった");
+
+        // 失われたとみなす前に終えたストライプと、遅れて届いた位置は含めない
+        let (mut t, base) = tracker_with_one_stripe();
+        for (secs, pos) in [(1.0, 0usize), (2.0, 1), (3.0, 3)] {
+            t.on_filled(0, pos, at(base, secs));
+        }
+        assert!(t.finish_stripe(0).is_empty(), "まだ失われたとみなしていない");
+        let (mut t, base) = tracker_with_one_stripe();
+        for (secs, pos) in [(1.0, 0usize), (2.0, 1), (3.0, 3)] {
+            t.on_filled(0, pos, at(base, secs));
+        }
+        t.poll(at(base, 6.0));
+        t.on_filled(0, 2, at(base, 7.0));
+        assert!(t.finish_stripe(0).is_empty(), "遅れて届いた位置は失われていない");
+    }
+
+    fn keep_stripe() -> (StripeV2, Vec<Vec<u8>>) {
+        let mut objects: Vec<Vec<u8>> = (0..4)
+            .map(|i| (0..chunk::V2_SHARD_BYTES).map(|j| (i * 11 + j * 3 + 1) as u8).collect())
+            .collect();
+        objects[3].truncate(chunk::V2_SEAL_OVERHEAD + 50);
+        (sharding_v2::build_stripe(&objects, 3).unwrap().stripe, objects)
+    }
+
+    #[test]
+    fn keep_help_touches_unfetched_and_repairs_lost() {
+        let (stripe, objects) = keep_stripe();
+        // 取ったのは位置 0, 1, 3, 4。位置 2 は失われ、5・6 は取らなかった
+        let filled = [true, true, false, true, true, false, false];
+        let mut help = KeepHelp::default();
+        help.add_stripe(&stripe, &filled, &[2], &objects);
+        assert_eq!(help.touch, vec![stripe.shard_hashes[5], stripe.shard_hashes[6]], "失われた位置には延命でなく置き直し");
+        assert_eq!(help.repairs.len(), 1);
+        let shard = &help.repairs[&stripe.shard_hashes[2]];
+        assert_eq!(chunk::shard_hash(shard), stripe.shard_hashes[2], "置き直すのは Manifest のハッシュと合うシャード");
+    }
+
+    #[test]
+    fn keep_help_does_not_repair_with_a_wrong_rebuild() {
+        let (stripe, mut objects) = keep_stripe();
+        objects[0][5] ^= 0x55; // 壊れた復元からは、パリティが合わない
+        let mut help = KeepHelp::default();
+        help.add_stripe(&stripe, &[true, true, true, true, false, false, true], &[4, 5], &objects);
+        assert!(help.repairs.is_empty(), "ハッシュが合わないものは置かない");
+        assert!(help.touch.is_empty(), "失われた位置は延命にも回さない");
+    }
+
+    #[test]
+    fn keep_help_caps_the_repairs_it_holds() {
+        let (stripe, objects) = keep_stripe();
+        let mut help = KeepHelp::default();
+        for i in 0..MAX_REPAIR_SHARDS + 10 {
+            help.repairs.insert([(i % 251) as u8, (i / 251) as u8, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], vec![0]);
+        }
+        let n = help.repairs.len();
+        help.add_stripe(&stripe, &[true; 7], &[0], &objects);
+        assert!(n >= MAX_REPAIR_SHARDS);
+        assert_eq!(help.repairs.len(), n, "上限を超えたら足さない");
     }
 
     #[test]

@@ -22,16 +22,17 @@ use std::sync::Arc;
 #[command(
     about = "AETHER ── 匿名 P2P（Winny 後継）",
     long_about = "AETHER 匿名 P2P ネットワークの CLI。\n\
-私信（事前共有秘密）と公開共有（キーワード）を同じ匿名基盤に載せる。\n\
+掲示板・ファイル共有と私信を同じ匿名基盤に載せる。\n\
 \n\
 使用例:\n  \
 aether init                                       鍵を生成\n  \
-aether start --connect <種>:<port>                常駐（リレー / 受信）\n  \
-aether start --subscribe 雑談                     板を購読して受信\n  \
+aether start --connect <種>:<port>                常駐（隠れた保持者。一覧に載らない）\n  \
+aether start --connect <種> --relay               中継も引き受けて常駐（IP が一覧に載る）\n  \
+aether start --connect <種> --relay --subscribe 雑談   板を購読して受信\n  \
 \n  \
 # 私信（友だちコードを交換してから）\n  \
 aether invite                                     自分の友だちコードを作る\n  \
-aether start --contact aether:<相手のコード>        相手を受信対象にして常駐\n  \
+aether start --relay --contact aether:<相手のコード>   相手を受信対象にして常駐\n  \
 aether send --to aether:<相手のコード> --message \"やあ\" --connect <種>\n  \
 \n  \
 # 公開：投稿・ファイル共有・掲示板\n  \
@@ -281,6 +282,7 @@ fn privacy_of(cli: &Cli) -> PrivacyOptions {
         // CLI は会話の平文を端末に残さない（受信は表示するだけ）
         save_talk_history: false,
         pad_file_size: true,
+        help_keep_files: true,
     }
 }
 
@@ -530,6 +532,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 },
                 None => println!("取得できませんでした（保持者が居ないか、期限切れ）"),
             }
+            // 取ったファイルを網に残す手伝い（延命・置き直し）を送り終えてから終わる（最大 30 秒）
+            client.flush().await;
         }
 
         Commands::Start {

@@ -30,7 +30,7 @@
 //! すべて自分の回路の出口経由で送る。ログにも、受け口やリレーのアドレスは `debug!` までにしか出さない。
 //!
 //! 受け口で処理する中身は `HOLDER_PROBE`（一周の確認）、`HOLDER_PUT`（置く。自分の `MailboxServer` に
-//! 保存する）、`HOLDER_GET`（取る。引いて、返事を出す）。
+//! 保存する）、`HOLDER_GET`（取る。引いて、返事を出す）、`HOLDER_TOUCH`（延命だけ。返事なし）。
 //! 置く人・取る人は保持者の IP を知らず、置かれる中身・要求は G_h からだけ届く。
 //!
 //! # 取る要求への返事（Part 23 の 5.3）
@@ -56,7 +56,7 @@ use aether_core::crypto::identity::{Identity, NodeId};
 use aether_core::mailbox::server::MailboxServer;
 use aether_core::net::guard::GUARD_ROTATION_SECS;
 use aether_core::net::holder::{
-    build_holder_message, parse_holder_message, parse_probe_marker, HOLDER_GET, HOLDER_PROBE, HOLDER_PUT,
+    build_holder_message, parse_holder_message, parse_probe_marker, HOLDER_GET, HOLDER_PROBE, HOLDER_PUT, HOLDER_TOUCH,
 };
 use aether_core::net::lease_set::{
     slot_count_for_capacity, solve_slots, LeaseGateway, LeaseSet, SlotProof, ISSUED_AT_GRANULARITY_SECS,
@@ -381,6 +381,15 @@ impl HolderShared {
                     debug!("holder: put refused: {}", e);
                 }
             }
+            // 延命だけ。返事はしない（無いことを晒さない）。本文はキー 32 バイトちょうど
+            HOLDER_TOUCH => match <&[u8; 32]>::try_from(body) {
+                Ok(key) => {
+                    if let Err(e) = mailbox.touch(key).await {
+                        debug!("holder: touch failed: {}", e);
+                    }
+                }
+                Err(_) => debug!("holder: bad touch body"),
+            },
             // 取る要求は返事の回路が要るので、受け口の取り込みの側（`serve_get`）で扱う。
             // ここに来たものは返事を出せないので捨てる
             HOLDER_GET => debug!("holder: GET ({} bytes) reached dispatch; dropping", body.len()),
@@ -1236,6 +1245,11 @@ mod tests {
         let mut other = key.to_vec();
         other.extend_from_slice(b"forged");
         shared.dispatch(&build_holder_message(HOLDER_PUT, &other), &mailbox).await;
+        assert_eq!(mailbox.handle_get(&key).await.unwrap().as_deref(), Some(&b"sealed shard"[..]));
+
+        // TOUCH は返事なしで値を変えない。本文が 32 バイトでないものは捨てる
+        shared.dispatch(&build_holder_message(HOLDER_TOUCH, &key), &mailbox).await;
+        shared.dispatch(&build_holder_message(HOLDER_TOUCH, &[1u8; 31]), &mailbox).await;
         assert_eq!(mailbox.handle_get(&key).await.unwrap().as_deref(), Some(&b"sealed shard"[..]));
 
         // GET・壊れた中身・短すぎる PUT・知らない種別は捨てる（落ちない）
