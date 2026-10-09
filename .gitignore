@@ -13,6 +13,8 @@ debug
 .idea/
 .docs/
 .sim/
+# CLI の既定のデータディレクトリ（鍵が入っている）
+aether-data/
 # GUI (Tauri)
 gui/node_modules/
 gui/src-tauri/gen/
