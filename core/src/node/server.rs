@@ -28,6 +28,24 @@ use std::path::Path;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+/// 自分宛てのトンネルの終端で、届いた中身を受け箱ではなく直接受け取る口の表
+///
+/// キーは自分が待ち受ける tunnel_id（`InboundTunnel::receive_tunnel_id`）。
+type TunnelSinks = Arc<Mutex<HashMap<[u8; 32], tokio::sync::mpsc::Sender<Vec<u8>>>>>;
+
+/// 終端の口に溜められる中身の数。満杯なら捨てる（保持者が詰まっても、中継の処理を止めない）
+const TUNNEL_SINK_CAPACITY: usize = 1024;
+
+/// 1 つの TunnelData を、自分が担う役の連なりとして続けて処理する回数の上限
+///
+/// 受け口は gateway → 中間 → ガード の 3 役で、同じノードが全部担っても 3 回で終わる。
+const MAX_LOCAL_TUNNEL_HOPS: usize = 4;
+
+/// `LeaseSetPublish` の中身の大きさの上限（バイト）
+///
+/// 枠 64 個・受け口 3 個でも 1KiB に満たない。余裕を見たうえで、巨大な入力は復号の前に捨てる。
+const MAX_LEASE_SET_PUBLISH_BYTES: usize = 16 * 1024;
+
 /// Hint backlog の複製数（19.1.3）。本体シャードの K と揃える
 const HINT_REPLICAS: usize = 5;
 
@@ -274,6 +292,8 @@ pub struct NodeServer {
     relay_meter: Arc<RelayMeter>,
     /// 見かけた最も新しいプロトコルの版（0 = 見ていない）。更新の案内に使う
     newer_protocol_seen: Arc<AtomicU8>,
+    /// 自分宛てのトンネルの終端で、受け箱を通さず直接受け取る口
+    tunnel_sinks: TunnelSinks,
 }
 
 
@@ -307,6 +327,8 @@ pub struct PacketContext {
     pub relay_meter: Arc<RelayMeter>,
     /// 見かけた最も新しいプロトコルの版（0 = 見ていない）
     pub newer_protocol_seen: Arc<AtomicU8>,
+    /// 自分宛てのトンネルの終端で、受け箱を通さず直接受け取る口
+    tunnel_sinks: TunnelSinks,
 }
 
 impl PacketContext {
@@ -475,6 +497,7 @@ impl NodeServer {
             stem_acks: Arc::new(Mutex::new(HashMap::new())),
             relay_meter: Arc::new(RelayMeter::default()),
             newer_protocol_seen: Arc::new(AtomicU8::new(0)),
+            tunnel_sinks: Arc::new(Mutex::new(HashMap::new())),
             epoch_beacon: config.epoch_beacon,
         })
     }
@@ -711,6 +734,7 @@ impl NodeServer {
                 stem_acks: self.stem_acks.clone(),
                 relay_meter: self.relay_meter.clone(),
                 newer_protocol_seen: self.newer_protocol_seen.clone(),
+                tunnel_sinks: self.tunnel_sinks.clone(),
             };
 
             tokio::spawn(async move {
@@ -740,6 +764,7 @@ impl NodeServer {
             stem_acks: self.stem_acks.clone(),
             relay_meter: self.relay_meter.clone(),
             newer_protocol_seen: self.newer_protocol_seen.clone(),
+            tunnel_sinks: self.tunnel_sinks.clone(),
         };
 
         while let Some(conn) = self.server.accept().await {
@@ -1235,6 +1260,27 @@ impl NodeServer {
 
                 debug!("PEX: learned {} new relay(s) out of {}", added, count);
             },
+            PacketType::LeaseSetPublish => {
+                // 保持者が出口経由で渡してきた leaseSet。検証してディレクトリに入れるだけで、
+                // 以後は PEX が広げる。誰から来たか（出口）は保持者の IP と無関係。
+                // 受けたことは info 以上で出さない（SID と受け口の対応を残さない）。
+                if payload.len() > MAX_LEASE_SET_PUBLISH_BYTES {
+                    debug!("LeaseSetPublish too large ({} bytes); ignoring", payload.len());
+                    return Ok(());
+                }
+                let lease: crate::net::lease_set::LeaseSet = match bincode::deserialize(&payload) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        debug!("LeaseSetPublish is not a lease set: {}", e);
+                        return Ok(());
+                    }
+                };
+                // 検証（署名・丸め・期限・枠の PoW）は insert_lease_set が行う
+                // （持っているものより新しくなければ、重い PoW の検証の前に捨てる）
+                if let Err(e) = ctx.directory.write().await.insert_lease_set(lease) {
+                    debug!("LeaseSetPublish rejected: {}", e);
+                }
+            },
             PacketType::MailboxPut => {
                 ctx.mailbox.handle_put(&payload).await?;
             },
@@ -1334,65 +1380,91 @@ impl NodeServer {
                 }
             },
             PacketType::TunnelData => {
-                // Tunnel Data: [TunnelID(32)][Nonce(12)][EncryptedData]
-                if payload.len() < 32 + 12 {
-                    error!("TunnelData packet too short");
-                    return Ok(());
-                }
-
-                let tunnel_id: [u8; 32] = payload[0..32].try_into().unwrap();
-                let data = &payload[32..];
-
-                let relay = ctx.tunnel_relay.read().await;
-                match relay.process_tunnel_data(&tunnel_id, data) {
-                    Ok(Some((next_hop, next_tunnel_id, forwarded_data))) => {
-                        // Check if we are the destination (Inbound Tunnel Endpoint)
-                        if ctx.is_self(next_hop) {
-                             debug!("Tunnel: reached endpoint (self), storing message for ID {:?}", tunnel_id);
-                             // Store raw tunnel data. The client will fetch and decrypt it later.
-                             // Not using next_tunnel_id, but the original tunnel_id as key.
-                             if let Err(e) = ctx.mailbox.store_tunnel_message(&tunnel_id, &forwarded_data).await {
-                                 error!("Store tunnel msg failed: {}", e);
-                             }
-                        } else {
-                             // Forwarding
-                             debug!("Tunnel: forwarding to {}", next_hop);
-
-                             // New packet: [NextTunnelID][Nonce][EncData]
-                             let mut next_payload = Vec::with_capacity(32 + forwarded_data.len());
-                             next_payload.extend_from_slice(&next_tunnel_id);
-                             next_payload.extend_from_slice(&forwarded_data);
-
-                             // Drop lock before async call
-                             drop(relay); // Important: drop lock here, not inside block if possible, but we branch
-
-                             if let Err(e) = ctx.router.send_packet(next_hop, PacketType::TunnelData, &next_payload).await {
-                                  error!("Tunnel forwarding failed: {}", e);
-                                  ctx.suspect_unreachable(next_hop);
-                             } else {
-                                  ctx.relay_meter.add(next_payload.len());
-                             }
-                             return Ok(()); // Lock already dropped or not needed
-                        }
-                        // If we didn't return, drop lock
-                        // drop(relay); // Already dropped above if forwarding. If stored, drop now.
-                    },
-                    Ok(None) => {
-                         // Should not happen with current logic, but just in case
-                         debug!("Tunnel: process_tunnel_data returned None");
-                    },
-                    Err(e) => {
-                        error!("Tunnel processing error: {}", e);
-                    }
-                }
-                // Explicit drop if not forwarded (compiler will handle scope drop, but manual drop for clarity)
-                // drop(relay);
+                Self::handle_tunnel_data(&ctx, payload).await;
             },
             _ => {
                 info!("Unhandled packet type: {:?}", packet_type);
             }
         }
         Ok(())
+    }
+
+    /// TunnelData を 1 つ処理する
+    ///
+    /// 形は `[TunnelID(32)][Nonce(12)][EncryptedData]`。
+    ///
+    /// **同じノードが 1 本のトンネルの隣り合う 2 役（例: gateway と中間）を担うことがある**
+    /// （小さな網では保持者の受け口の gateway・中間・ガードが重なりうる）。次の宛先が自分で、
+    /// かつ次の役の ID（`next_tunnel_id`）が入っているなら、終端ではなく自分の次の役なので
+    /// ネットワークを通さずそのまま処理を続ける。終端（自分宛て）の登録だけが
+    /// `next_tunnel_id` を 0 のままにする。ループを作る登録（自分の ID を指す）に回されないよう、
+    /// 続ける回数に上限を置く。
+    async fn handle_tunnel_data(ctx: &PacketContext, mut payload: Vec<u8>) {
+        for _ in 0..MAX_LOCAL_TUNNEL_HOPS {
+            if payload.len() < 32 + 12 {
+                error!("TunnelData packet too short");
+                return;
+            }
+
+            let tunnel_id: [u8; 32] = payload[0..32].try_into().unwrap();
+            let data = &payload[32..];
+
+            let step = ctx.tunnel_relay.read().await.process_tunnel_data(&tunnel_id, data);
+            match step {
+                Ok(Some((next_hop, next_tunnel_id, forwarded_data))) => {
+                    if ctx.is_self(next_hop) && next_tunnel_id != [0u8; 32] {
+                        debug!("Tunnel: next role is also ours; continuing locally");
+                        let mut next_payload = Vec::with_capacity(32 + forwarded_data.len());
+                        next_payload.extend_from_slice(&next_tunnel_id);
+                        next_payload.extend_from_slice(&forwarded_data);
+                        payload = next_payload;
+                        continue;
+                    }
+                    // Check if we are the destination (Inbound Tunnel Endpoint)
+                    if ctx.is_self(next_hop) {
+                        debug!("Tunnel: reached endpoint (self), storing message for ID {:?}", tunnel_id);
+                        // 口が登録されている終端（保持者の受け口）には、受け箱を通さず直接渡す。
+                        // 受け箱は自分の取得と共用で、溜まると取得の返信を押し出してしまう。
+                        let sink = ctx.tunnel_sinks.lock().unwrap().get(&tunnel_id).cloned();
+                        if let Some(sink) = sink {
+                            if sink.try_send(forwarded_data).is_err() {
+                                debug!("Tunnel sink for ID {:?} is full or closed; dropping", tunnel_id);
+                            }
+                        } else {
+                            // Store raw tunnel data. The client will fetch and decrypt it later.
+                            // Not using next_tunnel_id, but the original tunnel_id as key.
+                            if let Err(e) = ctx.mailbox.store_tunnel_message(&tunnel_id, &forwarded_data).await {
+                                error!("Store tunnel msg failed: {}", e);
+                            }
+                        }
+                    } else {
+                        // Forwarding
+                        debug!("Tunnel: forwarding to {}", next_hop);
+
+                        // New packet: [NextTunnelID][Nonce][EncData]
+                        let mut next_payload = Vec::with_capacity(32 + forwarded_data.len());
+                        next_payload.extend_from_slice(&next_tunnel_id);
+                        next_payload.extend_from_slice(&forwarded_data);
+
+                        if let Err(e) = ctx.router.send_packet(next_hop, PacketType::TunnelData, &next_payload).await {
+                            error!("Tunnel forwarding failed: {}", e);
+                            ctx.suspect_unreachable(next_hop);
+                        } else {
+                            ctx.relay_meter.add(next_payload.len());
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Should not happen with current logic, but just in case
+                    debug!("Tunnel: process_tunnel_data returned None");
+                }
+                Err(e) => {
+                    error!("Tunnel processing error: {}", e);
+                }
+            }
+            return;
+        }
+        debug!("Tunnel: too many local hops; dropping");
     }
 
     /// アドレスの取り合い（同じ IP:port・IP ごとの上限）を到達確認で決着させる
@@ -2224,6 +2296,22 @@ impl NodeServer {
                 tokio::time::sleep(HINT_RECONCILE_INTERVAL).await;
             }
         });
+    }
+
+    /// 自分が終端のトンネルに届いた中身を、受け箱を通さず直接受け取る口を作る
+    ///
+    /// `receive_tunnel_id` は `InboundTunnel::receive_tunnel_id`。届くのは
+    /// `InboundTunnel::decrypt` で開く前の暗号文。受け手が遅くて口が満杯になったら、
+    /// 新しい中身を捨てる（中継の処理は止めない）。同じ ID を登録し直すと、前の口は閉じる。
+    pub fn register_tunnel_sink(&self, receive_tunnel_id: [u8; 32]) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = tokio::sync::mpsc::channel(TUNNEL_SINK_CAPACITY);
+        self.tunnel_sinks.lock().unwrap().insert(receive_tunnel_id, tx);
+        rx
+    }
+
+    /// [`register_tunnel_sink`](Self::register_tunnel_sink) の口を外す（以後は受け箱に入る）
+    pub fn unregister_tunnel_sink(&self, receive_tunnel_id: &[u8; 32]) {
+        self.tunnel_sinks.lock().unwrap().remove(receive_tunnel_id);
     }
 
     /// 登録済みトンネル数（テスト・診断用）

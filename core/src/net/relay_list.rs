@@ -208,6 +208,8 @@ pub struct RelayDirectory {
     evicted: HashMap<NodeId, u64>,
     /// 保持者の leaseSet（SID ごとに最新の 1 つ）。リレーの記述子とは別に持つ
     lease_sets: HashMap<[u8; 32], LeaseSet>,
+    /// 自分が保持者として使う SID（PEX で配らない）
+    own_sids: std::collections::HashSet<[u8; 32]>,
 }
 
 impl Default for RelayDirectory {
@@ -225,7 +227,17 @@ impl RelayDirectory {
             pow_difficulty,
             evicted: HashMap::new(),
             lease_sets: HashMap::new(),
+            own_sids: std::collections::HashSet::new(),
         }
+    }
+
+    /// 自分が保持者として使う SID を覚える（PEX でその leaseSet を配らないため）
+    pub fn mark_own_sid(&mut self, sid: [u8; 32]) {
+        self.own_sids.insert(sid);
+    }
+
+    pub fn is_own_sid(&self, sid: &[u8; 32]) -> bool {
+        self.own_sids.contains(sid)
     }
 
     /// リレーを登録する

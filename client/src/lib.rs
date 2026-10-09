@@ -47,6 +47,7 @@ pub mod keys;
 mod pull;
 mod receive;
 mod send;
+mod storage;
 pub mod talks;
 
 pub use board::{Board, Post, Thread};
@@ -60,6 +61,7 @@ pub use friends::{Friend, FriendCode, friend_code, parse_friend_code, parse_frie
 pub use keys::KeyFiles;
 pub use receive::Contact;
 pub use send::{PublicPost, SendReport};
+pub use storage::HolderStatus;
 pub use talks::TalkMessage;
 
 /// hex 64 文字を 32 バイトにする（NodeId・共有秘密・content_ref の入力用）

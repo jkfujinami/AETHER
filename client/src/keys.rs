@@ -62,6 +62,16 @@ impl KeyFiles {
         self.data_dir.join("storage.key")
     }
 
+    /// 保持者の中間（vanguard）の記録。60 日固定で、ガードと同じく端末に紐付ける
+    pub fn storage_vanguard_path(&self) -> PathBuf {
+        self.data_dir.join("storage_vanguard.bin")
+    }
+
+    /// 保持者の枠の PoW の解（SID・難易度・枠の数が同じ間は解き直さない）
+    pub fn storage_slots_path(&self) -> PathBuf {
+        self.data_dir.join("storage_slots.bin")
+    }
+
     pub fn mailbox_db_path(&self) -> PathBuf {
         self.data_dir.join("mailbox.db")
     }

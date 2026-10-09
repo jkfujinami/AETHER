@@ -41,6 +41,8 @@ pub struct AetherClient {
     pub(crate) traffic: Arc<aether_core::net::relay::TrafficCounter>,
     /// 一周確認済みの回路の待機場所（クライアントごと。1 本は 1 回の操作で使い捨てる）
     pub(crate) circuit_pool: tokio::sync::Mutex<Vec<crate::pull::PooledCircuit>>,
+    /// 保持者の役割と外（試験・診断）の共有部分。常駐のときだけ中身が動く
+    pub(crate) holder: Arc<crate::storage::HolderShared>,
 }
 
 impl AetherClient {
@@ -235,9 +237,17 @@ impl AetherClient {
             suspects: Default::default(),
             traffic: Default::default(),
             circuit_pool: Default::default(),
+            holder: Default::default(),
         });
         // 一回限りでも動かす（CLI の send/get も待たずに済む）
         client.spawn_circuit_pool_refill();
+        // 保持者の役割は常駐のときだけ（一回限りは枠も受け口も持たない）
+        if relay_mode {
+            client.spawn_holder(
+                config.network.directory_pow_difficulty,
+                Config::default().mailbox_capacity_mb,
+            );
+        }
         Ok(client)
     }
 

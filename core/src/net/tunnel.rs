@@ -391,6 +391,12 @@ impl TunnelRelay {
     /// 返信トンネルを乗っ取れてしまう。呼び出し側は戻り値が `false` なら
     /// 登録が拒否されたことをログに残すこと。
     ///
+    /// **例外: 鍵・次の宛先・次の tunnel_id がすべて同じ登録は「延長」として、
+    /// 登録時刻だけを新しくして `true` を返す。** 保持者の受け口は 3 時間以上使うので、
+    /// 構築者が同じ指示を送り直して寿命（[`TUNNEL_TTL`]）を延ばす。鍵は構築者と
+    /// そのホップだけが知る DH の出力なので、同じ指示を作れるのは構築者本人だけ。
+    /// 1 つでも違えば今までどおり拒む（乗っ取りは延長を装っても通らない）。
+    ///
     /// 登録のたびに期限切れエントリを掃除し、上限（[`MAX_TUNNELS`]）を超える
     /// 新規登録も拒否する（誰でも登録できる以上、無制限の蓄積を防ぐ必要がある）。
     #[must_use = "登録が拒否された場合、呼び出し側はログに残すこと"]
@@ -403,7 +409,11 @@ impl TunnelRelay {
     ) -> bool {
         self.cleanup_expired();
 
-        if self.tunnels.contains_key(&tunnel_id) {
+        if let Some(existing) = self.tunnels.get_mut(&tunnel_id) {
+            if existing.0 == shared_key && existing.1 == next_hop && existing.2 == next_tunnel_id {
+                existing.3 = Instant::now();
+                return true;
+            }
             return false;
         }
         if self.tunnels.len() >= MAX_TUNNELS {
@@ -631,6 +641,32 @@ mod tests {
 
         let (next_hop, _, _) = relay.process_tunnel_data(&tid, b"hello").unwrap().unwrap();
         assert_eq!(next_hop, original_next, "後から送りつけた登録に乗っ取られた");
+    }
+
+    /// 同じ登録（鍵・次の宛先・次の ID がすべて同じ）は延長として通り、登録時刻が新しくなること。
+    /// 1 つでも違えば拒む
+    #[test]
+    fn identical_registration_extends_the_lifetime_and_any_difference_is_refused() {
+        let mut relay = TunnelRelay::new();
+        let mut tid = [4u8; 32];
+        tid[0] |= GATEWAY_ID_BIT;
+        let next: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        // 寿命の終わり近くまで古くした登録
+        let age = TUNNEL_TTL - Duration::from_secs(5);
+        relay.insert_raw(tid, [1u8; 32], next, [2u8; 32], age);
+
+        assert!(relay.register_tunnel(tid, [1u8; 32], next, [2u8; 32]), "同じ登録は延長として通る");
+        assert!(
+            relay.tunnels.get(&tid).unwrap().3.elapsed() < Duration::from_secs(5),
+            "登録時刻が新しくなっていない"
+        );
+        assert!(!relay.register_tunnel(tid, [9u8; 32], next, [2u8; 32]), "鍵が違うのに通った");
+        assert!(
+            !relay.register_tunnel(tid, [1u8; 32], "10.0.0.2:9000".parse().unwrap(), [2u8; 32]),
+            "次の宛先が違うのに通った"
+        );
+        assert!(!relay.register_tunnel(tid, [1u8; 32], next, [9u8; 32]), "次の ID が違うのに通った");
+        assert!(relay.process_tunnel_data(&tid, b"x").is_ok(), "延長後は使える");
     }
 
     /// TTL を過ぎた登録は無効に扱われ、次の登録で掃除されて上書きできること

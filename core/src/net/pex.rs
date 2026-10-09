@@ -149,7 +149,14 @@ pub fn select_response(
     pool.truncate(want);
 
     // leaseSet もランダムに選ぶ（近い順に返すと一部の領域だけが濃く伝わる）
-    let mut lease_sets: Vec<LeaseSet> = directory.lease_sets().into_iter().cloned().collect();
+    // 自分が保持者として出した leaseSet は配らない。自分のリレーが真っ先に配ると
+    // 「この SID はこのリレー（IP）」と結びつく。他の経路から十分に広がる
+    let mut lease_sets: Vec<LeaseSet> = directory
+        .lease_sets()
+        .into_iter()
+        .filter(|l| !directory.is_own_sid(&l.sid))
+        .cloned()
+        .collect();
     lease_sets.shuffle(&mut rand::thread_rng());
     lease_sets.truncate(MAX_LEASE_SETS_PER_RESPONSE);
 
@@ -415,6 +422,19 @@ mod tests {
             lease_sets: vec![lease(&id); MAX_LEASE_SETS_PER_RESPONSE],
         };
         assert!(PexResponse::decode(&at_limit.encode().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn own_lease_set_is_never_served_over_pex() {
+        let mine = crate::crypto::identity::Identity::generate();
+        let other = crate::crypto::identity::Identity::generate();
+        let mut dir = directory(3);
+        dir.insert_lease_set(lease(&mine)).unwrap();
+        dir.insert_lease_set(lease(&other)).unwrap();
+        dir.mark_own_sid(mine.public_id().0);
+        let response = select_response(&dir, &PexRequest::new(descriptor(250)), None);
+        assert_eq!(response.lease_sets.len(), 1);
+        assert_eq!(response.lease_sets[0].sid, other.public_id().0, "自分の SID は配らない");
     }
 
     #[test]

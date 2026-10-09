@@ -51,6 +51,10 @@ pub enum PacketType {
     // Peer Exchange (0x4x)
     PexRequest = 0x40,
     PexResponse = 0x41,
+    /// 保持者の leaseSet を 1 件渡す (bincode `LeaseSet`)。受けたリレーは検証して
+    /// ディレクトリに入れるだけで、以後は PEX が広げる。
+    /// 保持者の IP を見せないよう、必ず出口経由（`TypedForward`）で届く。
+    LeaseSetPublish = 0x42,
 
     // NAT 越え (0x5x)
     PunchRequest = 0x50,
@@ -167,6 +171,8 @@ pub fn parse_typed_forward(body: &[u8]) -> Result<(SocketAddr, PacketType, &[u8]
         // 自分の返信トンネルの疎通確認。回路 → gateway → … → 自分と一周させる。
         // 出口は取得要求の返信先（gateway）をもともと見ているので、新たに漏れるものは無い。
         0x30 => PacketType::TunnelData,
+        // 保持者の leaseSet の配布。保持者の IP を見せないよう、出口経由で届ける。
+        0x42 => PacketType::LeaseSetPublish,
         other => {
             return Err(AetherError::Protocol(format!(
                 "TypedForward may not carry packet type 0x{:02x}",
@@ -273,6 +279,7 @@ pub async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Packet
         0x53 => PacketType::FilterProbeOrder,
         0x40 => PacketType::PexRequest,
         0x41 => PacketType::PexResponse,
+        0x42 => PacketType::LeaseSetPublish,
         0x30 => PacketType::TunnelData,
         0x31 => PacketType::TunnelBuild,
         0xF0 => PacketType::Handshake,
@@ -397,5 +404,22 @@ mod tests {
             }
             other => panic!("新しい版は theirs: Some になるはず: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn lease_set_publish_roundtrips_on_the_wire_and_through_typed_forward() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        write_packet(&mut client, PacketType::LeaseSetPublish, b"lease").await.unwrap();
+        let (t, payload) = read_packet(&mut server).await.unwrap();
+        assert_eq!((t, payload.as_slice()), (PacketType::LeaseSetPublish, b"lease".as_slice()));
+
+        // 出口経由（TypedForward）で運べる
+        let dest: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let mut body = vec![PacketType::LeaseSetPublish as u8];
+        body.extend_from_slice(b"lease");
+        let built = build_typed_forward(dest, &body).unwrap();
+        let (_, rest) = built.split_first().unwrap();
+        let (d, t, inner) = parse_typed_forward(rest).unwrap();
+        assert_eq!((d, t, inner), (dest, PacketType::LeaseSetPublish, b"lease".as_slice()));
     }
 }
