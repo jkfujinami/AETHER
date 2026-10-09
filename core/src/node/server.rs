@@ -452,9 +452,8 @@ impl NodeServer {
         // 自分自身もリレーとしてリストに入れる。
         //
         // **これを入れないと、自分のリストだけが1件欠けた状態になり、
-        // K最近接が他ノードと食い違う。** 自分が担当に選ばれていることに
-        // 気づけず、置かれたはずのシャードを取りに来た相手に応答できない。
-        // MailboxForward は既に「宛先が自分」の場合をローカル保存で処理している。
+        // K最近接が他ノードと食い違う。** 索引のページの担当に自分が選ばれていることに
+        // 気づけず、置かれた索引を取りに来た相手に応答できない。
         //
         // 検証難易度は網全体の値（directory_pow_difficulty）。自分が解いた難易度とは別。
         // 自分の記述子は自分で作ったものなので検証を通さずに入れる
@@ -899,34 +898,11 @@ impl NodeServer {
                         debug!("Onion packet reached exit. Inner type: {:?}", inner_type);
 
                         match inner_type {
-                            wire::InnerPacketType::MailboxPut => {
-                                ctx.mailbox.handle_put(body).await?;
-                            }
-                            wire::InnerPacketType::MailboxForward => {
-                                // 出口リレーは中身を保存せず、指定された Mailbox へ渡すだけ。
-                                // Mailbox 側から見える送信元は「出口リレーの IP」であり、
-                                // Sybil で Mailbox の座を取っても発信者には近づけない。
-                                let (dest, payload) = wire::parse_mailbox_forward(body)?;
-                                debug!("Forwarding mailbox payload to {}", dest);
-
-                                if ctx.is_self(dest) {
-                                    // 自分自身が Mailbox に選ばれている場合は素直に保存する
-                                    ctx.mailbox.handle_put(payload).await?;
-                                } else if is_known_relay_addr(&*ctx.directory.read().await, dest) {
-                                    if let Err(e) = ctx
-                                        .router
-                                        .send_packet(dest, PacketType::MailboxPut, payload)
-                                        .await
-                                    {
-                                        ctx.suspect_unreachable(dest);
-                                        return Err(e);
-                                    }
-                                    ctx.relay_meter.add(payload.len());
-                                } else {
-                                    // **転送先は既知リレーに限る。** そうでないと、出口リレーが
-                                    // 踏み台や内部アドレスへの任意ダイヤルに使われる。
-                                    debug!("MailboxForward dest {} is not a known relay; discarding", dest);
-                                }
+                            wire::InnerPacketType::MailboxPut | wire::InnerPacketType::MailboxForward => {
+                                // リレーは中身（シャード・私信の本体）を預からない。中身はすべて、
+                                // 保持者の受け口（TunnelData）を通って隠れた保持者へ届く。残すと、
+                                // リレーにゴミを置かれる攻撃面になる（Part 25 の P1）
+                                debug!("Onion {:?} is not accepted by relays; discarding", inner_type);
                             }
                             wire::InnerPacketType::TypedForward => {
                                 // 出口リレーは中身を解釈せず、指定ノードへそのまま渡す。
@@ -1292,8 +1268,9 @@ impl NodeServer {
                     debug!("LeaseSetPublish rejected: {}", e);
                 }
             },
-            PacketType::MailboxPut => {
-                ctx.mailbox.handle_put(&payload).await?;
+            PacketType::MailboxPut | PacketType::MailboxGet => {
+                // リレーは中身を預からない（保持者は受け口経由でだけ受ける）。もう誰も送らない経路
+                debug!("{:?} is not accepted by relays; discarding", packet_type);
             },
             PacketType::IndexPut => {
                 // 索引に記述子を1件追加（19.7 / Phase 2-3）
@@ -1332,48 +1309,6 @@ impl NodeServer {
                         .await
                     {
                         debug!("Failed to reply to index query tunnel: {}", e);
-                    }
-                }
-            },
-            PacketType::MailboxGet => {
-                // 要求側が返信先の Inbound Tunnel を同梱している。
-                // uni-directional stream なので直接は返せず、
-                // また直接返せてしまうと要求者の IP が割れる。
-                let (key, reply_to) = wire::parse_mailbox_get(&payload)?;
-
-                let trusted = {
-                    let dir = ctx.directory.read().await;
-                    is_trusted_reply_gateway(&dir, reply_to.gateway)
-                };
-                if !trusted {
-                    debug!(
-                        "MailboxGet reply_to.gateway {} is not a known relay accepting strangers; discarding",
-                        reply_to.gateway
-                    );
-                    return Ok(());
-                }
-
-                match ctx.mailbox.handle_get(&key).await? {
-                    Some(value) => {
-                        debug!("Mailbox GET hit. Replying via tunnel {}", reply_to.gateway);
-
-                        // TunnelData: [TunnelID(32)][Data]
-                        let mut tunnel_payload = Vec::with_capacity(32 + value.len());
-                        tunnel_payload.extend_from_slice(&reply_to.tunnel_id);
-                        tunnel_payload.extend_from_slice(&value);
-
-                        if let Err(e) = ctx
-                            .router
-                            .send_packet(reply_to.gateway, PacketType::TunnelData, &tunnel_payload)
-                            .await
-                        {
-                            debug!("Failed to reply to tunnel gateway: {}", e);
-                        }
-                    }
-                    None => {
-                        // 見つからなかったことは返さない。
-                        // 「無い」という応答自体が、要求されたキーの不在を第三者に晒す。
-                        debug!("Mailbox GET miss");
                     }
                 }
             },

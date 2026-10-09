@@ -80,7 +80,7 @@ pub async fn spawn_relays(n: usize) -> (Vec<Arc<NodeServer>>, Vec<tempfile::Temp
     (nodes, dirs)
 }
 
-/// 隠れた保持者を `n` 台立てる（常駐のクライアント。leaseSet が網に行き渡るまで待つ）
+/// 隠れた保持者を `n` 台立てる（`NodeMode::Resident` のクライアント。leaseSet が網に行き渡るまで待つ）
 ///
 /// 今の試験網のリレー（`spawn_relays`）は `NodeServer` だけで保持者にならない。置く・取るには、
 /// leaseSet を出す常駐クライアントが要る。待つのは、各保持者が leaseSet を出し、
@@ -95,7 +95,7 @@ pub async fn spawn_holders(
     let mut dirs = Vec::new();
     for _ in 0..n {
         let dir = tempfile::tempdir().unwrap();
-        holders.push(resident(dir.path(), seed, aether_client::event_channel()).await);
+        holders.push(hidden_holder(dir.path(), seed, aether_client::event_channel()).await);
         dirs.push(dir);
     }
     for (i, holder) in holders.iter().enumerate() {
@@ -172,7 +172,30 @@ pub fn ephemeral(data_dir: &std::path::Path, seed: SocketAddr) -> ClientConfig {
     }
 }
 
-/// 常駐クライアントを 1 台立てる（私信の身元 `identity` は data_dir に作ってある前提）
+/// 隠れた保持者（常駐。一覧に載らず、私信は受け取らない）を 1 台立てる
+pub async fn hidden_holder(
+    data_dir: &std::path::Path,
+    seed: SocketAddr,
+    events: aether_client::EventSender,
+) -> Arc<AetherClient> {
+    AetherClient::start(
+        ClientConfig {
+            data_dir: data_dir.to_path_buf(),
+            passphrase: None,
+            port: free_port(),
+            seed: Some(seed),
+            min_relays: 4,
+            mode: NodeMode::Resident,
+            network: test_network(),
+            privacy: Default::default(),
+        },
+        events,
+    )
+    .await
+    .unwrap()
+}
+
+/// 常駐＋中継のクライアントを 1 台立てる（私信の身元 `identity` は data_dir に作ってある前提）
 pub async fn resident(
     data_dir: &std::path::Path,
     seed: SocketAddr,

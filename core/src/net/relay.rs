@@ -208,17 +208,6 @@ impl RelayClient {
         Ok(())
     }
 
-    /// Mailbox へ本体を送る (Onion 経由)
-    ///
-    /// **出口リレーは `mailbox` へ転送するだけで、自分では保存しない。**
-    /// 出口と Mailbox が同一だと、Mailbox の位置が `H(mailbox_key ‖ K)` で
-    /// 決定論的に決まる以上、攻撃者は Sybil 配置で狙ったコンテンツの
-    /// 出口リレーになれてしまう（確率 f ではなく確定）。
-    pub async fn send_onion_message(&self, message: &[u8], mailbox: SocketAddr) -> Result<()> {
-        let inner = wire::build_mailbox_forward(mailbox, message)?;
-        self.send_onion_raw(&inner).await
-    }
-
     /// 任意の PacketType を出口リレー経由で `dest` へ届ける
     ///
     /// 出口リレーは中身を解釈せず、そのまま `dest` へ転送する。
@@ -229,8 +218,7 @@ impl RelayClient {
         message: &[u8],
         dest: SocketAddr,
     ) -> Result<()> {
-        // MailboxForward は MailboxPut を前提とするため、
-        // 他の種別は種別バイトを前置してから転送させる
+        // 種別バイトを前置してから転送させる
         let mut body = Vec::with_capacity(1 + message.len());
         body.push(packet_type as u8);
         body.extend_from_slice(message);

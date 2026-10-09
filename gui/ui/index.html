@@ -49,10 +49,12 @@
 
             <fieldset>
               <legend>参加のしかた</legend>
-              <label class="choice"><input type="radio" name="mode" value="relay" checked>
-                <span><strong>常駐</strong> ── トークを受け取れます。中継役として網に広告されます</span></label>
+              <label class="choice"><input type="radio" name="mode" value="resident" checked>
+                <span><strong>常駐</strong> ── 起動している間、暗号化された欠片を預かって網を支えます。あなたの IP は一覧に載りません</span></label>
+              <label class="choice"><input type="radio" name="mode" value="relay">
+                <span><strong>常駐＋中継</strong> ── 中継も引き受けます。IP がリレーの一覧に載ります（AETHER を使っていることが分かります）。私信を受け取るには今はこれが必要です</span></label>
               <label class="choice"><input type="radio" name="mode" value="ephemeral">
-                <span><strong>一回限り</strong> ── 掲示板と送信だけ。網に自分を広告しません（トークは受け取れません）</span></label>
+                <span><strong>一回限り</strong> ── 掲示板と送信だけ。網に自分を広告せず、何も預かりません（トークは受け取れません）</span></label>
             </fieldset>
 
             <label id="advertise-row">到達可能と宣言するアドレス（空なら自動判定）
@@ -204,7 +206,7 @@
               <button id="btn-add-friend" title="友だち追加">友だち追加</button>
             </div>
             <div class="receive-warn" id="receive-warn" hidden>
-              受け取るには「常駐」で参加し、自分の鍵が必要です
+              私信を受け取るには「常駐＋中継」で参加し、自分の鍵が必要です（送るのはできます）
             </div>
             <ul id="friend-list"></ul>
             <p class="muted small pad" id="friend-empty">まだ友だちがいません</p>

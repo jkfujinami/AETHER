@@ -70,7 +70,8 @@ impl AetherClient {
 
             // ノードの鍵：一回限りなら使い捨て、常駐なら relay.key（どちらも私信の身元ではない）
             let (identity, core_config) = match &config.mode {
-                NodeMode::Ephemeral => (
+                // 常駐（隠れた保持者）も同じ。広告しないので NodeId と IP の対応を残さない
+                NodeMode::Ephemeral | NodeMode::Resident => (
                     Identity::generate(),
                     Config {
                         listen_port: port,
@@ -150,7 +151,7 @@ impl AetherClient {
                 }
             };
 
-            // 到達性を確定させる（しないと 127.0.0.1 を広告し続ける）。一回限りは広告しないので不要
+            // 到達性を確定させる（しないと 127.0.0.1 を広告し続ける）。広告しない一回限り・常駐は不要
             if let NodeMode::Relay(opts) = &config.mode {
                 // 解いた PoW を残す（次回の起動は検証だけで済む）
                 if keys.load_relay_pow() != Some(node.descriptor.pow_nonce) {
@@ -248,8 +249,8 @@ impl AetherClient {
         });
         // 一回限りでも動かす（CLI の send/get も待たずに済む）
         client.spawn_circuit_pool_refill();
-        // 保持者の役割は常駐のときだけ（一回限りは枠も受け口も持たない）
-        if relay_mode {
+        // 保持者の役割は常駐（隠れた保持者・中継）のときだけ（一回限りは枠も受け口も持たない）
+        if !matches!(config.mode, NodeMode::Ephemeral) {
             client.spawn_holder(
                 config.network.directory_pow_difficulty,
                 Config::default().mailbox_capacity_mb,

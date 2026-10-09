@@ -1,22 +1,20 @@
-//! 出口リレーと Mailbox が別ノードになることの検証 (設計書 18.8.2 / 穴2)
+//! リレーは MailboxForward・MailboxPut を受け付けない（段 B・設計書 18.8.2 の置き換え）
 //!
-//! Mailbox の位置は `H(mailbox_key ‖ K)` で決定論的に決まる。
-//! 出口リレー = Mailbox だと、攻撃者は Sybil で座標を合わせるだけで
-//! 狙ったコンテンツの出口リレーになれてしまう（確率 f ではなく確定）。
-//! 入口さえ引けばタイミング相関が成立する。
-//!
-//! 分離すると、Mailbox から見える送信元は「出口リレーの IP」になり、
-//! Sybil で Mailbox の座を取っても発信者には近づけない。
+//! 以前は、出口リレーが別ノードの Mailbox へ中身を転送した（出口 = Mailbox を避けるため）。
+//! 段 B で中身は保持者の受け口（TunnelData）経由でしか届かなくなり、リレーは中身を
+//! 預からない。出口を通した MailboxForward も、出口にも転送先にも保存されない
+//! （残すと、リレーにゴミを置かれる攻撃面になる）。
 
 use aether_core::crypto::identity::Identity;
 use aether_core::net::onion::OnionCircuit;
 use aether_core::net::relay::RelayClient;
+use aether_core::protocol::wire::{self, InnerPacketType};
 use std::net::SocketAddr;
 
 mod common;
 
 #[tokio::test]
-async fn exit_relay_forwards_to_a_different_mailbox() {
+async fn exit_relay_neither_keeps_nor_forwards_mailbox_payloads() {
     let exit_port = 19301;
     let mailbox_port = 19302;
 
@@ -49,38 +47,29 @@ async fn exit_relay_forwards_to_a_different_mailbox() {
 
     // Mailbox ペイロード: [Key(32)][Value]
     let mailbox_key = [0x7Au8; 32];
-    let body = b"payload the exit relay must not keep";
-
     let mut payload = Vec::new();
     payload.extend_from_slice(&mailbox_key);
-    payload.extend_from_slice(body);
+    payload.extend_from_slice(b"payload no relay may keep");
 
-    // 出口リレー(exit_addr)を通して、別ノード(mailbox_addr)の Mailbox へ送る
+    // 出口リレー(exit_addr)を通して、別ノード(mailbox_addr)へ MailboxForward を送る
+    let forward = wire::build_mailbox_forward(mailbox_addr, &payload).unwrap();
     client
-        .send_onion_message(&payload, mailbox_addr)
+        .send_onion_inner(InnerPacketType::MailboxForward, &forward[1..])
         .await
         .expect("failed to send onion message");
 
-    // 転送が完了するまで待つ
-    common::wait_for_mailbox_entries(&mailbox_node, 1).await;
+    // 転送されていれば届くはずの猶予を置く
+    common::settle().await;
 
-    // 本体は Mailbox ノードにだけ存在すること
-    let stored = mailbox_node
-        .mailbox()
-        .handle_get(&mailbox_key)
-        .await
-        .unwrap();
     assert_eq!(
-        stored.as_deref(),
-        Some(&body[..]),
-        "指定した Mailbox ノードに本体が届いていない"
+        mailbox_node.mailbox().handle_get(&mailbox_key).await.unwrap(),
+        None,
+        "転送先のリレーが MailboxForward 経由の中身を保存している"
     );
-
-    // 出口リレーは中身を保持していないこと
-    let leaked = exit_node.mailbox().handle_get(&mailbox_key).await.unwrap();
     assert_eq!(
-        leaked, None,
-        "出口リレーが本体を保持している。これでは出口 = Mailbox となり、\
-         Sybil で狙ったコンテンツの出口を確定で取られてしまう"
+        exit_node.mailbox().handle_get(&mailbox_key).await.unwrap(),
+        None,
+        "出口リレーが中身を保存している"
     );
+    assert_eq!(exit_node.mailbox().len() + mailbox_node.mailbox().len(), 0);
 }

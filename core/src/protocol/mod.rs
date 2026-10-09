@@ -5,5 +5,6 @@ pub mod wire;
 ///
 /// 互換を切る変更を入れたら上げる。上げたら Part 25 の「決まったこと」に書く。
 /// 版 1 = 版の無かった旧形式（枠に印と版が無い）。2 = 印と版を枠に載せ、
-/// 大容量（段 A）の形式の互換を切った後の形。
-pub const PROTOCOL_VERSION: u8 = 2;
+/// 大容量（段 A）の形式の互換を切った後の形。3 = 段 B（隠れた保持者）で互換を切った後の形
+/// （中身は保持者の受け口経由でだけ届き、リレーは MailboxPut・MailboxGet・MailboxForward を受け付けない）。
+pub const PROTOCOL_VERSION: u8 = 3;

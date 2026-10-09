@@ -126,6 +126,7 @@ listen("aether-event", ({ payload }) => {
 
 function updateModeRows() {
   const relay = document.querySelector('input[name="mode"]:checked').value === "relay";
+  // 到達可能と宣言するアドレスは中継のときだけ（隠れた保持者は広告しない）
   $("advertise-row").hidden = !relay;
 }
 document.querySelectorAll('input[name="mode"]').forEach((r) => r.addEventListener("change", updateModeRows));
@@ -134,7 +135,7 @@ document.querySelectorAll('input[name="mode"]').forEach((r) => r.addEventListene
 function readSettings() {
   return {
     seed: $("seed").value.trim(),
-    relay: document.querySelector('input[name="mode"]:checked').value === "relay",
+    mode: document.querySelector('input[name="mode"]:checked').value,
     advertise: $("advertise").value.trim(),
     auto_connect: $("auto-connect").checked,
     privacy: {
@@ -149,7 +150,7 @@ function readSettings() {
 /** 保存した設定を画面に入れる */
 function fillSettings(s) {
   $("seed").value = s.seed ?? "";
-  document.querySelector(`input[name="mode"][value="${s.relay === false ? "ephemeral" : "relay"}"]`).checked = true;
+  document.querySelector(`input[name="mode"][value="${s.mode ?? "resident"}"]`).checked = true;
   $("advertise").value = s.advertise ?? "";
   $("auto-connect").checked = s.auto_connect ?? true;
   const p = s.privacy ?? {};

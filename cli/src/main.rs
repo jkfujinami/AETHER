@@ -72,8 +72,17 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// ネットワークに参加して常駐する
+    /// ネットワークに参加して常駐する（既定は隠れた保持者。中継は `--relay` で選ぶ）
+    ///
+    /// 既定では、暗号化された欠片を預かって網を支える。IP は一覧に載らない。
+    /// 私信の受信・購読と、到達性・PoW の設定は `--relay`（IP が一覧に載る）のときだけ使える。
     Start {
+        /// 中継も引き受ける（リレーとして一覧に載る。AETHER を使っていることが分かる）
+        ///
+        /// 私信を受け取る・板を購読するには今はこれが要る（Hint は一覧のリレーにしか流れない）。
+        #[arg(long)]
+        relay: bool,
+
         /// 待ち受けポート（0 = 初回にランダムに選んで保存し、以後は同じポート）
         ///
         /// 全員が同じ既定ポートで待ち受けると、ポート番号だけで利用者を一覧化できる。
@@ -88,18 +97,18 @@ enum Commands {
         ///
         /// 公開 IP や手動ポート開放で到達性が分かっている場合に指定する。
         /// 省略すると STUN で自動判定する。
-        #[arg(long)]
+        #[arg(long, requires = "relay")]
         advertise: Option<String>,
 
         /// ルータへのポートマッピングを許可する
         ///
         /// **ルータのリース表に痕跡が残る**（既定は無効）。
-        #[arg(long)]
+        #[arg(long, requires = "relay")]
         allow_port_mapping: bool,
 
         /// NodeId の PoW 難易度
         ///
-        /// 高いほど Sybil 耐性が上がるが、起動時に1回だけその時間がかかる。
+        /// 高いほど Sybil 耐性が上がるが、起動時に1回だけその時間がかかる。`--relay` のときだけ効く。
         #[arg(long, default_value_t = 16)]
         pow_difficulty: u32,
 
@@ -110,13 +119,13 @@ enum Commands {
         /// `<NodeId hex>:<共有秘密 hex>` で事前共有の秘密も指定できる。
         /// 1つでも指定すると受信用の Inbound Tunnel を張り、
         /// 自分宛ての Hint を手元で拾って本文を表示する。
-        #[arg(long = "contact")]
+        #[arg(long = "contact", requires = "relay")]
         contacts: Vec<String>,
 
         /// 購読する板（公式の板の名前か aether-board:…、複数指定可）
         ///
         /// 指定すると、その板に書かれた投稿を拾って表示する。
-        #[arg(long = "subscribe")]
+        #[arg(long = "subscribe", requires = "relay")]
         subscribe: Vec<String>,
 
         /// エポックビーコン（drand 由来の日次シード）を有効にする (3-4)
@@ -124,7 +133,7 @@ enum Commands {
         /// 位置グラインディング対策。**網全体で揃える必要がある**（一部だけ有効にすると
         /// 保持者計算がずれて分裂する）。有効時は日次で drand へ HTTPS 取得する
         /// （弱いフィンガープリント）。
-        #[arg(long)]
+        #[arg(long, requires = "relay")]
         epoch_beacon: bool,
 
     },
@@ -524,6 +533,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Start {
+            relay,
             port,
             connect,
             advertise,
@@ -548,12 +558,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     port: *port,
                     seed: connect.as_deref().map(str::parse::<SocketAddr>).transpose()?,
                     min_relays: 2,
-                    mode: NodeMode::Relay(RelayOptions {
-                        advertise: advertise.as_deref().map(str::parse).transpose()?,
-                        allow_port_mapping: *allow_port_mapping,
-                        pow_difficulty: *pow_difficulty,
-                        epoch_beacon: *epoch_beacon,
-                    }),
+                    mode: if *relay {
+                        NodeMode::Relay(RelayOptions {
+                            advertise: advertise.as_deref().map(str::parse).transpose()?,
+                            allow_port_mapping: *allow_port_mapping,
+                            pow_difficulty: *pow_difficulty,
+                            epoch_beacon: *epoch_beacon,
+                        })
+                    } else {
+                        NodeMode::Resident
+                    },
                     network: Default::default(),
                     privacy: privacy_of(&cli),
                 },

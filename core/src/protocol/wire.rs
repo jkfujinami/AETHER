@@ -83,9 +83,9 @@ pub enum PacketType {
 pub enum InnerPacketType {
     /// Gossip ネットワークへ Hint を投入する
     GossipHint = 0x10,
-    /// 出口リレー自身の Mailbox へ保存する
+    /// 出口リレー自身の Mailbox へ保存する（**版 3 以降、リレーは受け付けず捨てる**）
     MailboxPut = 0x20,
-    /// 別ノードの Mailbox へ転送する
+    /// 別ノードの Mailbox へ転送する（**版 3 以降、リレーは受け付けず捨てる**。形だけ残す）
     ///
     /// ペイロード形式: `[bincode(SocketAddr)][MailboxPut ペイロード]`
     ///

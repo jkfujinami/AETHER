@@ -2,7 +2,7 @@ use aether_core::net::relay::RelayClient;
 use aether_core::crypto::identity::Identity;
 use aether_core::net::onion::OnionCircuit;
 use aether_core::mailbox::schrodinger::SchrodingerMailbox;
-use aether_core::protocol::wire::InnerPacketType;
+use aether_core::protocol::wire::{self, InnerPacketType};
 use aether_core::net::gossip::GossipClient;
 use aether_core::net::gossip_server::HintAction;
 
@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 
 #[tokio::test]
-async fn test_local_e2e_mailbox_put() {
+async fn test_local_e2e_relay_rejects_mailbox_put_but_takes_hints() {
     // 1. Setup Bob (Server)
     let bob_id = Identity::generate();
 
@@ -60,26 +60,25 @@ async fn test_local_e2e_mailbox_put() {
     // 中身のハッシュと照合する（置き場所の先書き対策）ので、v1 のキーの決まりどおり 0 にする
     payload[0] &= 0x7F;
 
-    // 5. Send Onion Packet (Mailbox Put)
-    // payload = [Key][Nonce][EncMsg]
-    println!("Sending Onion Packet ({} bytes)...", payload.len());
-    relay_client.send_onion_message(&payload, bob_addr).await.expect("Failed to send onion");
-
-    common::wait_for_mailbox_entries(&bob_server, 1).await;
-
-    // 6. Verify Bob received Mailbox Put
-    // Key is first 32 bytes
-    let mailbox_key: [u8; 32] = payload[0..32].try_into().unwrap();
-
-    // Check Bob's Mailbox Server directly
-    let stored = bob_server.mailbox().handle_get(&mailbox_key).await.unwrap();
-    assert!(stored.is_some(), "Message should be saved in Bob's mailbox");
-
-    let stored_bytes = stored.unwrap();
-    // stored content: [MsgNonce(12)] + [EncMsg(msg+tag)]
-    assert_eq!(stored_bytes.len(), 12 + message.len() + 16);
-
-    println!("E2E Mailbox PUT Test Passed!");
+    // 5. リレーは中身を預からない（段 B）。出口の MailboxPut・MailboxForward（自分宛て）は捨てられる
+    println!("Sending Onion MailboxPut / MailboxForward ({} bytes)...", payload.len());
+    relay_client
+        .send_onion_inner(InnerPacketType::MailboxPut, &payload)
+        .await
+        .expect("Failed to send onion");
+    let forward = wire::build_mailbox_forward(bob_addr, &payload).unwrap();
+    relay_client
+        .send_onion_inner(InnerPacketType::MailboxForward, &forward[1..])
+        .await
+        .expect("Failed to send onion");
+    // 直接の MailboxPut・MailboxGet も同じ
+    let get_body = wire::build_mailbox_get(&[0x11u8; 32], &aether_core::net::tunnel::TunnelEndpoint {
+        gateway: bob_addr,
+        tunnel_id: [0u8; 32],
+    })
+    .unwrap();
+    relay_client.send_raw_packet(wire::PacketType::MailboxPut, &payload).await.expect("direct put");
+    relay_client.send_raw_packet(wire::PacketType::MailboxGet, &get_body).await.expect("direct get");
 
     // 7. Send Gossip Hint (Onion 経由)
     // Hint を素で Entry Relay に投げると発信源 IP が割れるため、
@@ -108,6 +107,13 @@ async fn test_local_e2e_mailbox_put() {
         HintAction::Drop,
         "Onion 経由で届いた Hint が GossipServer に登録されていない"
     );
+
+    // Hint は同じ回路で後に送ったので、先の MailboxPut・MailboxForward は処理され終わっている。
+    // どれも保存されていない
+    common::settle().await;
+    assert_eq!(bob_server.mailbox().len(), 0, "リレーが MailboxPut・MailboxForward を受け付けている");
+    let mailbox_key: [u8; 32] = payload[0..32].try_into().unwrap();
+    assert!(bob_server.mailbox().handle_get(&mailbox_key).await.unwrap().is_none());
 
     println!("E2E Gossip Hint Test Passed!");
 }

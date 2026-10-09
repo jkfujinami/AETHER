@@ -8,7 +8,7 @@ use aether_client::{
     RelayOptions, SendReport, Status, TalkMessage, builtin_boards, event_channel,
     parse_friend_id,
 };
-use crate::settings::{self, Settings};
+use crate::settings::{self, JoinMode, Settings};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -129,7 +129,9 @@ pub async fn connect(
         .trim()
         .parse()
         .map_err(|_| format!("種ノードのアドレスが不正です: {}", settings.seed))?;
+    // 広告アドレスは中継のときだけ使う（隠れた保持者は広告しない）
     let advertise = match settings.advertise.trim() {
+        _ if settings.mode != JoinMode::Relay => None,
         "" => None,
         a => Some(
             a.parse::<SocketAddr>()
@@ -153,13 +155,13 @@ pub async fn connect(
         }
     });
 
-    let mode = if settings.relay {
-        NodeMode::Relay(RelayOptions {
+    let mode = match settings.mode {
+        JoinMode::Relay => NodeMode::Relay(RelayOptions {
             advertise,
             ..Default::default()
-        })
-    } else {
-        NodeMode::Ephemeral
+        }),
+        JoinMode::Resident => NodeMode::Resident,
+        JoinMode::Ephemeral => NodeMode::Ephemeral,
     };
     let client = AetherClient::start(
         ClientConfig {
@@ -179,7 +181,7 @@ pub async fn connect(
     .map_err(err)?;
 
     // 常駐で鍵があれば、友だち全員からのトークを受信する
-    let receiving = settings.relay && client.keys().has_identity();
+    let receiving = settings.mode == JoinMode::Relay && client.keys().has_identity();
     if receiving {
         let contacts = client
             .keys()

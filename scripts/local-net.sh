@@ -25,9 +25,9 @@ while [ "$i" -lt "$N" ]; do
   dir="$DATA/relay$i"
   [ -f "$dir/identity.key" ] || "$BIN" --data-dir "$dir" init >/dev/null 2>&1
   if [ "$i" -eq 0 ]; then
-    "$BIN" --data-dir "$dir" start --port "$port" --advertise "127.0.0.1:$port" >"$dir.log" 2>&1 &
+    "$BIN" --data-dir "$dir" start --relay --port "$port" --advertise "127.0.0.1:$port" >"$dir.log" 2>&1 &
   else
-    "$BIN" --data-dir "$dir" start --port "$port" --advertise "127.0.0.1:$port" \
+    "$BIN" --data-dir "$dir" start --relay --port "$port" --advertise "127.0.0.1:$port" \
       --connect "127.0.0.1:$BASE" >"$dir.log" 2>&1 &
   fi
   PIDS="$PIDS $!"

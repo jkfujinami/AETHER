@@ -7,7 +7,7 @@
 //!
 //! を確かめる。さらに、別の一回限りのクライアントが同じものを取れること（バイト単位で一致）、
 //! 取る間も保持者の IP 宛てに送ったのはそのガードだけであること、保持者の返事が保持者の IP から
-//! 返信トンネルの入口へ直接送られないことを確かめる。今の試験網では常駐はリレーでもある。保持者がリレーとして受けるパケット（PEX・
+//! 返信トンネルの入口へ直接送られないことを確かめる。保持者は一覧に載らない（`NodeMode::Resident`）。念のため、保持者がリレー相手に受けるパケット（PEX・
 //! 索引・他人の回路など）と区別するため、保持者の受け口の `tunnel_id` が先頭に付いた `TunnelData` と、
 //! `MailboxPut`・`MailboxGet`（リレーの保存の旧い経路）だけを数える。
 
@@ -49,8 +49,8 @@ async fn shards_go_to_holders_through_their_inlets_and_only_the_guard_sends_to_a
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
     let holders = vec![
-        resident(dir_a.path(), seed, event_channel()).await,
-        resident(dir_b.path(), seed, event_channel()).await,
+        hidden_holder(dir_a.path(), seed, event_channel()).await,
+        hidden_holder(dir_b.path(), seed, event_channel()).await,
     ];
     for (i, holder) in holders.iter().enumerate() {
         wait_until(&format!("holder {} issues a lease set", i), Duration::from_secs(120), || {

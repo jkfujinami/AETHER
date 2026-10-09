@@ -121,7 +121,7 @@ impl AetherClient {
     ) -> Result<()> {
         if !self.relay_mode {
             return Err(ClientError::invalid(
-                "受信には常駐（リレー）モードが必要です（Hint はリレーにしか流れません）",
+                "受信には「常駐＋中継」で参加する必要があります（Hint はリレーにしか流れません）",
             ));
         }
         let identity = self.keys.load_identity()?;

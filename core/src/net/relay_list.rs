@@ -766,17 +766,6 @@ impl RelayDirectory {
             .any(|d| &d.node_id == me)
     }
 
-    /// シャードの担当リレーを決める (18.5.4)
-    pub fn shard_targets(
-        &self,
-        mailbox_key: &[u8; 32],
-        key: &[u8; 32],
-        shard_index: u8,
-        k: usize,
-    ) -> Vec<RelayDescriptor> {
-        self.k_nearest_reachable(ring::position_of_shard(mailbox_key, key, shard_index), k)
-    }
-
     /// ガード候補
     ///
     /// **Tier 0 だけを返す。** punch が要る相手をガードにすると、
@@ -951,27 +940,6 @@ mod tests {
         assert_ne!(
             with_k1.iter().map(|r| r.node_id).collect::<Vec<_>>(),
             with_k2.iter().map(|r| r.node_id).collect::<Vec<_>>(),
-        );
-    }
-
-    #[test]
-    fn shards_land_on_different_relays() {
-        // 1つの弧を支配しても復元に足るシャードを集められないこと (18.5.4)
-        let dir = directory(50);
-        let mailbox_key = [0x11u8; 32];
-        let key = [0x22u8; 32];
-
-        let mut first_choice = Vec::new();
-        for i in 0..5u8 {
-            let t = dir.shard_targets(&mailbox_key, &key, i, 1);
-            first_choice.push(t[0].node_id);
-        }
-
-        let unique: std::collections::HashSet<_> = first_choice.iter().collect();
-        assert!(
-            unique.len() >= 4,
-            "5シャードが同じリレーに集中している: {:?}",
-            first_choice
         );
     }
 

@@ -72,3 +72,40 @@ async fn holder_publishes_its_lease_set_and_receives_probes_through_its_inlets()
         .await;
     }
 }
+
+/// R8: 中継を引き受けない常駐（隠れた保持者）の IP は、どのノードのディレクトリにも現れない
+///
+/// leaseSet は届く（置く・取る相手として知られる）が、リレーの記述子としては配られない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ノードを 8 台立てる重い試験。`cargo test -p aether-client --test e2e_holder_tunnel -- --ignored --nocapture`"]
+async fn hidden_holder_never_appears_in_any_directory() {
+    let (relays, _dirs) = spawn_relays(6).await;
+    let seed = relays[0].descriptor.addr;
+    let (holders, _holder_dirs) = spawn_holders(&relays, 1).await;
+    let holder = holders[0].clone();
+    let holder_addr = holder.node().descriptor.addr;
+    let holder_id = holder.node().descriptor.node_id;
+    let lease = holder.holder_status().lease_set.unwrap();
+
+    // 見張り役の一回限りのクライアント。leaseSet を受け取るまで待つ
+    let observer_dir = tempfile::tempdir().unwrap();
+    let observer = AetherClient::start(ephemeral(observer_dir.path(), seed), event_channel())
+        .await
+        .unwrap();
+    wait_for_leases(std::slice::from_ref(&observer), &holders).await;
+    // PEX が何周かする猶予（広告していれば、この間に記述子が広がる）
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let mut directories = relays.iter().map(|r| r.directory()).collect::<Vec<_>>();
+    directories.push(observer.node().directory());
+    for (i, dir) in directories.iter().enumerate() {
+        let dir = dir.read().await;
+        assert!(dir.get(&holder_id).is_none(), "ディレクトリ {} に保持者の NodeId がある", i);
+        assert!(
+            dir.all().iter().all(|d| d.addr != holder_addr),
+            "ディレクトリ {} に保持者の待ち受けアドレスがある",
+            i
+        );
+        assert!(dir.lease_set(&lease.sid).is_some(), "ディレクトリ {} に leaseSet が届いていない", i);
+    }
+}

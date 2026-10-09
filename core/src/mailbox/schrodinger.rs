@@ -1359,9 +1359,6 @@ mod tests {
             // 送り先は受け口の gateway のアドレスだけ（リング上で近いリレーは使われない）
             assert!(route.inlets.iter().all(|(a, _)| relay_addrs.contains(a)));
         }
-        // 担当のリレーを K 最近接で決める旧方式とは無関係（旧方式の先頭 5 台は 1〜3 番に限られない）
-        let old = dir.shard_targets(&[3u8; 32], &[4u8; 32], 2, 5);
-        assert!(old.iter().any(|d| !relay_addrs.contains(&d.addr)) || old.len() < 5);
     }
 
     /// 記述子の無い受け口は試す対象に載らない。受け口の順はランダム
