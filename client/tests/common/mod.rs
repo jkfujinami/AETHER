@@ -18,6 +18,9 @@ pub fn test_network() -> NetworkParams {
     NetworkParams {
         directory_pow_difficulty: 0,
         hint_pow_difficulty: 0,
+        // 全部 127.0.0.1 なので、IP ごとの上り制限は外す
+        guest_upload_rate: 0,
+        relay_upload_rate: 0,
     }
 }
 
@@ -35,6 +38,8 @@ pub async fn spawn_relays(n: usize) -> (Vec<Arc<NodeServer>>, Vec<tempfile::Temp
         node_id_pow_difficulty: 0,
         directory_pow_difficulty: 0,
         pow_difficulty: 0,
+        guest_upload_rate: 0,
+        relay_upload_rate: 0,
         ..Default::default()
     };
     let mut nodes = Vec::new();

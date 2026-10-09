@@ -59,6 +59,9 @@ pub fn test_config() -> Config {
         directory_pow_difficulty: 0,
         // Hint PoW もテストでは無効化（生成・検証の一致を保ちつつ即座に回す）
         pow_difficulty: 0,
+        // 全部 127.0.0.1 なので、IP ごとの上り制限は外す
+        guest_upload_rate: 0,
+        relay_upload_rate: 0,
         ..Default::default()
     }
 }

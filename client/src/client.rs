@@ -76,6 +76,8 @@ impl AetherClient {
                         advertise_self: false,
                         directory_pow_difficulty: config.network.directory_pow_difficulty,
                         pow_difficulty: config.network.hint_pow_difficulty,
+                        guest_upload_rate: config.network.guest_upload_rate,
+                        relay_upload_rate: config.network.relay_upload_rate,
                         ..Default::default()
                     },
                 ),
@@ -88,6 +90,8 @@ impl AetherClient {
                         node_id_pow_nonce: keys.load_relay_pow(),
                         directory_pow_difficulty: config.network.directory_pow_difficulty,
                         pow_difficulty: config.network.hint_pow_difficulty,
+                        guest_upload_rate: config.network.guest_upload_rate,
+                        relay_upload_rate: config.network.relay_upload_rate,
                         ..Default::default()
                     };
                     if opts.pow_difficulty < core_config.directory_pow_difficulty {

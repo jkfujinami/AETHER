@@ -62,6 +62,20 @@ pub struct Config {
     /// 有効時は各ノードが日次で drand へ HTTPS 取得する（弱いフィンガープリント。
     /// 将来 exit/Tor 経由に差し替え可能）。
     pub epoch_beacon: bool,
+
+    // 上りの制限（ガードの手元の判断。網全体で揃える値ではない）
+    /// 一覧に載っていない送り手から受ける上りの、IP ごとの速さ（バイト/秒。0 = 無制限）
+    ///
+    /// 1MB/s なら、1 つの IP で 1,000 台 × 1GiB の網を押し流すのに 10 日かかる
+    /// （Part 23 の 12 章）。試験網は全部 127.0.0.1 なので 0 にする。
+    pub guest_upload_rate: u64,
+    /// 同じ IP が待たされずに送れる量（バイト）。溜められる上限
+    pub guest_upload_burst: u64,
+    /// 一覧に載っているリレーから受ける上りの、IP ごとの速さ（0 = 無制限）
+    ///
+    /// 1 台のリレーを踏み台に押し流すのを防ぐだけの、ずっと緩い上限。
+    pub relay_upload_rate: u64,
+    pub relay_upload_burst: u64,
 }
 
 impl Default for Config {
@@ -90,6 +104,11 @@ impl Default for Config {
             target_fps: 30,
 
             epoch_beacon: false,
+
+            guest_upload_rate: 1_000_000,
+            guest_upload_burst: 4_000_000,
+            relay_upload_rate: 20_000_000,
+            relay_upload_burst: 80_000_000,
         }
     }
 }

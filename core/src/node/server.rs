@@ -274,6 +274,8 @@ pub struct NodeServer {
     relay_meter: Arc<RelayMeter>,
     /// 見かけた最も新しいプロトコルの版（0 = 見ていない）。更新の案内に使う
     newer_protocol_seen: Arc<AtomicU8>,
+    /// 送り手の IP ごとの上り制限（記録は手元のメモリだけ）
+    upload_limiter: Arc<crate::net::rate_limit::UploadLimiter>,
 }
 
 
@@ -307,6 +309,8 @@ pub struct PacketContext {
     pub relay_meter: Arc<RelayMeter>,
     /// 見かけた最も新しいプロトコルの版（0 = 見ていない）
     pub newer_protocol_seen: Arc<AtomicU8>,
+    /// 送り手の IP ごとの上り制限
+    pub upload_limiter: Arc<crate::net::rate_limit::UploadLimiter>,
 }
 
 impl PacketContext {
@@ -475,6 +479,7 @@ impl NodeServer {
             stem_acks: Arc::new(Mutex::new(HashMap::new())),
             relay_meter: Arc::new(RelayMeter::default()),
             newer_protocol_seen: Arc::new(AtomicU8::new(0)),
+            upload_limiter: Arc::new(crate::net::rate_limit::UploadLimiter::from_config(&config)),
             epoch_beacon: config.epoch_beacon,
         })
     }
@@ -711,6 +716,7 @@ impl NodeServer {
                 stem_acks: self.stem_acks.clone(),
                 relay_meter: self.relay_meter.clone(),
                 newer_protocol_seen: self.newer_protocol_seen.clone(),
+                upload_limiter: self.upload_limiter.clone(),
             };
 
             tokio::spawn(async move {
@@ -740,6 +746,7 @@ impl NodeServer {
             stem_acks: self.stem_acks.clone(),
             relay_meter: self.relay_meter.clone(),
             newer_protocol_seen: self.newer_protocol_seen.clone(),
+            upload_limiter: self.upload_limiter.clone(),
         };
 
         while let Some(conn) = self.server.accept().await {
@@ -765,6 +772,10 @@ impl NodeServer {
             ctx.remote_addr = Some(remote);
 
             tokio::spawn(async move {
+                // 一覧に載っていない送り手は IP ごとに絞る。借りがある間は読まずに待つので、
+                // 送り手の側が止まる（捨てない）。待つのはこのストリームだけで、受け付けは止まらない
+                let class = ctx.upload_limiter.classify(&ctx.directory, remote).await;
+                let mut recv_stream = ctx.upload_limiter.wrap(&mut recv_stream, class, remote);
                 match wire::read_packet(&mut recv_stream).await {
                     Ok((packet_type, payload)) => {
                         debug!("Received packet: {:?} ({} bytes)", packet_type, payload.len());
