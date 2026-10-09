@@ -103,29 +103,24 @@ impl StunResolver {
                 AetherError::Network(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
             })?;
 
-            return Ok(SocketAddr::new(xor_addr.ip, xor_addr.port));
+            // 両用ソケットで v4 のサーバへ撃つと、環境によって IPv4-mapped で
+            // 観測されることがある。素の v4 に戻して他の箇所と揃える
+            return Ok(crate::net::addr::normalize(SocketAddr::new(xor_addr.ip, xor_addr.port)));
         }
     }
 
-    async fn first_addr(server: &str, want_ipv6: bool) -> Result<SocketAddr> {
+    async fn first_addr(server: &str, socket_is_ipv6: bool) -> Result<SocketAddr> {
         let addrs: Vec<SocketAddr> = tokio::net::lookup_host(server)
             .await
             .map_err(AetherError::Network)?
             .collect();
 
-        // ソケットのファミリに合うものを選ぶ。
-        // v6 ソケットに v4 アドレスへ送らせると失敗する
-        addrs
-            .iter()
-            .find(|a| a.is_ipv6() == want_ipv6)
-            .or_else(|| addrs.first())
-            .copied()
-            .ok_or_else(|| {
-                AetherError::Network(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("No address for STUN server {}", server),
-                ))
-            })
+        pick_server_addr(&addrs, socket_is_ipv6).ok_or_else(|| {
+            AetherError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("No usable address for STUN server {}", server),
+            ))
+        })
     }
 
     /// 独立ソケットで問い合わせる（**診断専用**）
@@ -195,9 +190,56 @@ impl StunResolver {
     }
 }
 
+/// STUN サーバの候補から、このソケットで撃てるアドレスを選ぶ
+///
+/// 待ち受けは v4・v6 両用なので `socket_is_ipv6` は事実上常に真になる。
+/// サーバに AAAA が無くても観測できるよう、v6 が無ければ v4 を
+/// IPv4-mapped にして撃つ。v4 だけのソケット（`0.0.0.0` に bind）では v4 だけ。
+fn pick_server_addr(addrs: &[SocketAddr], socket_is_ipv6: bool) -> Option<SocketAddr> {
+    if !socket_is_ipv6 {
+        return addrs.iter().find(|a| a.is_ipv4()).copied();
+    }
+    if let Some(v6) = addrs.iter().find(|a| a.is_ipv6()) {
+        return Some(*v6);
+    }
+    addrs.iter().find_map(|a| match a {
+        SocketAddr::V4(v4) => Some(SocketAddr::new(
+            std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()),
+            v4.port(),
+        )),
+        SocketAddr::V6(_) => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn dual_stack_socket_prefers_ipv6_server() {
+        let addrs = [sa("192.0.2.1:3478"), sa("[2001:db8::1]:3478")];
+        assert_eq!(pick_server_addr(&addrs, true), Some(sa("[2001:db8::1]:3478")));
+    }
+
+    #[test]
+    fn dual_stack_socket_maps_ipv4_only_server() {
+        let addrs = [sa("192.0.2.1:3478")];
+        let picked = pick_server_addr(&addrs, true).unwrap();
+        assert!(picked.is_ipv6());
+        assert_eq!(crate::net::addr::normalize(picked), sa("192.0.2.1:3478"));
+    }
+
+    #[test]
+    fn ipv4_socket_uses_only_ipv4() {
+        let addrs = [sa("[2001:db8::1]:3478"), sa("192.0.2.1:3478")];
+        assert_eq!(pick_server_addr(&addrs, false), Some(sa("192.0.2.1:3478")));
+        assert_eq!(pick_server_addr(&[sa("[2001:db8::1]:3478")], false), None);
+    }
+
     use crate::net::shared_socket::SharedSocket;
     use quinn::default_runtime;
 

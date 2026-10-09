@@ -5,7 +5,8 @@
 //! 上ほど安くて強い。成功したところで打ち切る。
 //!
 //! ```text
-//! 1. IPv6 が使える              → NAT が存在しない。Tier 0
+//! 1. IPv6 が使える              → NAT は無いが、ルータが外からの接続を遮断していることが多い。
+//!                                  確かめるまで Tier 2（`ipv6-unverified`）。届くと分かれば Tier 0
 //! 2. PCP / NAT-PMP が通る       → 本物の開放ポート。Tier 0
 //! 3. **EIM かつ EIF**           → 送っていない相手からも入れる。**Tier 0**
 //! 4. EIM だがフィルタ制限あり    → 調整付き punch で届く。Tier 1
@@ -138,19 +139,22 @@ pub async fn probe_with_filtering(
     let external = observations.first().copied();
     let mapping = classify_mapping(&observations);
 
-    // --- 2. IPv6 ネイティブなら NAT が無い ---
-    if let Some(addr) = external
-        && addr.is_ipv6()
-        && !addr.ip().is_loopback()
-    {
-        info!("Reachability: native IPv6, no NAT");
+    // --- 2. IPv6 ネイティブなら NAT は無い。ただし外から届くかは別 ---
+    //
+    // 家庭用ルータの IPv6 は既定で外からの接続を遮断していることが多い。
+    // 確かめずに Tier 0 を名乗ると、届かないのにガード・保持者に選ばれて
+    // 黙って落ちる。フィルタが既に EIF と分かっているときだけ Tier 0 にし、
+    // それ以外は仮に Reversed とする。ネットワーク参加後の
+    // check_filtering_shared で届くと分かれば Tier 0 に昇格する。
+    if let Some((tier, reason)) = native_ipv6_tier(external, filtering) {
+        info!("Reachability: native IPv6 ({})", reason);
         return Reachability {
-            advertised: addr,
-            tier: Tier::Open,
+            advertised: external.unwrap_or(local_addr),
+            tier,
             mapping,
             filtering,
             port_mapping: None,
-            reason: "ipv6",
+            reason,
         };
     }
 
@@ -231,6 +235,25 @@ pub async fn probe_with_filtering(
                 reason: "no-observation",
             }
         }
+    }
+}
+
+/// 観測した外部アドレスが（loopback でない）IPv6 のときの Tier
+///
+/// 外から届くと確かめられていない限り Tier 0 にしない。
+/// 届かないのに名乗るより、届くのに名乗らない方が安全。
+fn native_ipv6_tier(
+    external: Option<SocketAddr>,
+    filtering: NatFiltering,
+) -> Option<(Tier, &'static str)> {
+    let addr = external?;
+    if !addr.is_ipv6() || addr.ip().is_loopback() {
+        return None;
+    }
+    if filtering.accepts_unsolicited() {
+        Some((Tier::Open, "ipv6"))
+    } else {
+        Some((Tier::Reversed, "ipv6-unverified"))
     }
 }
 
@@ -342,6 +365,31 @@ mod tests {
 
         // 判定していない状態では安全側（punch が要る前提）に倒す
         assert!(!NatFiltering::Unknown.accepts_unsolicited());
+    }
+
+    #[test]
+    fn native_ipv6_is_unverified_until_filtering_is_known() {
+        let v6: SocketAddr = "[2001:db8::1]:4000".parse().unwrap();
+        for f in [NatFiltering::Unknown, NatFiltering::Restricted] {
+            assert_eq!(
+                native_ipv6_tier(Some(v6), f),
+                Some((Tier::Reversed, "ipv6-unverified")),
+                "届くと確かめていない IPv6 を Tier 0 にしてはならない"
+            );
+        }
+        assert_eq!(
+            native_ipv6_tier(Some(v6), NatFiltering::EndpointIndependent),
+            Some((Tier::Open, "ipv6"))
+        );
+    }
+
+    #[test]
+    fn ipv4_or_loopback_is_not_native_ipv6() {
+        let v4: SocketAddr = "203.0.113.1:4000".parse().unwrap();
+        let lo: SocketAddr = "[::1]:4000".parse().unwrap();
+        assert_eq!(native_ipv6_tier(Some(v4), NatFiltering::Unknown), None);
+        assert_eq!(native_ipv6_tier(Some(lo), NatFiltering::Unknown), None);
+        assert_eq!(native_ipv6_tier(None, NatFiltering::Unknown), None);
     }
 
     #[tokio::test]
