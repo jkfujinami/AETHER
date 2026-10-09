@@ -30,6 +30,18 @@ pub fn build_holder_message(kind: u8, body: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// 受け口の gateway に渡す `TunnelData` の中身 `[tunnel_id 32][種別 1][本文]` を組み立てる
+///
+/// 置く人は、これを自分の回路の出口に `TunnelData` として gateway へ渡させる。
+/// 組み立てを 1 か所にしておくのは、v2 のシャードの大きさを決める試験が実物の長さで確かめるため。
+pub fn build_gateway_data(tunnel_id: &[u8; 32], kind: u8, body: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32 + 1 + body.len());
+    buf.extend_from_slice(tunnel_id);
+    buf.push(kind);
+    buf.extend_from_slice(body);
+    buf
+}
+
 /// 受け口に届いた中身を種別と本文に分ける
 ///
 /// 空の中身は拒む。種別の値の検査は呼び出し側が振り分けるときに行う
@@ -59,6 +71,13 @@ mod tests {
             assert_eq!(k, kind);
             assert_eq!(b, body.as_slice());
         }
+    }
+
+    #[test]
+    fn gateway_data_is_tunnel_id_then_holder_message() {
+        let data = build_gateway_data(&[7u8; 32], HOLDER_PUT, b"body");
+        assert_eq!(&data[..32], &[7u8; 32]);
+        assert_eq!(&data[32..], build_holder_message(HOLDER_PUT, b"body").as_slice());
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::Config;
 use crate::mailbox::index::IndexRecord;
+use crate::mailbox::sharding::{v2_put_key, V2_KEY_FLAG};
 
 /// 暗号鍵から sled キー用の HMAC 鍵を導く（暗号鍵そのものは使い回さない）
 fn derive_blind_key(cipher_key: &[u8; 32]) -> [u8; 32] {
@@ -306,6 +307,17 @@ impl MailboxServer {
             )));
         }
 
+        // v2 のシャード用のキー（最上位ビットが 1）は、値のハッシュから導けるものだけを受ける。
+        // 先に別の値を書かれると first-write-wins のせいで本物が置けなくなる（Part 25 の P10）。
+        if key[0] & V2_KEY_FLAG != 0 {
+            let hash = crate::mailbox::chunk::shard_hash(value);
+            if key != v2_put_key(&hash) {
+                return Err(AetherError::Mailbox(
+                    "Value does not match its v2 shard key; refusing".into(),
+                ));
+            }
+        }
+
         let slot = self.blind(b"mbx", key);
         if let Some(existing) = self.live_entry(&slot)? {
             if existing.value != value {
@@ -509,6 +521,13 @@ impl MailboxServer {
 
     pub fn is_empty(&self) -> bool {
         self.db.is_empty()
+    }
+
+    /// 索引を除いた預かり物（シャード・小さなもの）の件数（試験と診断用）
+    ///
+    /// リレーは索引だけを持ち、シャードは保持者だけが持つ、を数えて確かめるために使う。
+    pub fn shard_entries_len(&self) -> usize {
+        self.db.len().saturating_sub(self.db.scan_prefix(INDEX_PREFIX).count())
     }
 
     /// 自分宛ての返信の受け箱（メモリ）に溜まっている件数。取り出さずに数える（試験と診断用）
@@ -761,6 +780,45 @@ mod tests {
         let mut p = vec![key; 32];
         p.extend_from_slice(value);
         p
+    }
+
+    fn v2_payload(key: [u8; 32], value: &[u8]) -> Vec<u8> {
+        let mut p = key.to_vec();
+        p.extend_from_slice(value);
+        p
+    }
+
+    #[tokio::test]
+    async fn v2_key_accepts_only_the_shard_it_names() {
+        let (s, _dir) = server_with(1);
+        let shard = vec![0xA5u8; 4096];
+        let hash = crate::mailbox::chunk::shard_hash(&shard);
+        let key = v2_put_key(&hash);
+
+        // 先書き: 置き場所（キー）は計算できても、ハッシュに合わない値は置けない
+        let err = s.handle_put(&v2_payload(key, b"garbage")).await.unwrap_err();
+        assert!(matches!(err, AetherError::Mailbox(_)));
+        assert!(s.is_empty(), "拒んだゴミが残ってはいけない");
+
+        // 正しいシャードは置ける（先書きの試みの後でも）
+        s.handle_put(&v2_payload(key, &shard)).await.unwrap();
+        assert_eq!(s.handle_get(&key).await.unwrap().as_deref(), Some(&shard[..]));
+        // 同じ値の置き直しは通る
+        s.handle_put(&v2_payload(key, &shard)).await.unwrap();
+
+        // 別のハッシュのキーに、この値は置けない
+        let other = v2_put_key(&[7u8; 32]);
+        assert!(s.handle_put(&v2_payload(other, &shard)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn v1_keys_with_the_top_bit_clear_are_not_checked() {
+        let (s, _dir) = server_with(1);
+        // v1 のキー（最上位ビット 0）は、値と無関係なキーのままで置ける
+        let key = crate::mailbox::sharding::shard_key(&[3u8; 32], 2);
+        assert_eq!(key[0] & V2_KEY_FLAG, 0);
+        s.handle_put(&v2_payload(key, b"sealed shard")).await.unwrap();
+        assert_eq!(s.handle_get(&key).await.unwrap().as_deref(), Some(&b"sealed shard"[..]));
     }
 
     #[tokio::test]

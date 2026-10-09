@@ -27,12 +27,17 @@ const ONION_REPLAY_TTL: std::time::Duration =
 /// リプレイ検出に覚えておく件数（1世代あたり）
 const ONION_REPLAY_CAPACITY: usize = 1_000_000;
 
+/// 送信の観測の口。`(宛先, 種別, 中身)` を受け取る
+pub type SendObserver = Arc<dyn Fn(SocketAddr, PacketType, &[u8]) + Send + Sync>;
+
 /// Onion Routing のパケット処理を担当するコンポーネント
 pub struct Router {
     identity: Arc<Identity>,
     connection_pool: ConnectionPool,
     /// 処理した Onion パケットの一時公開鍵。同じパケットを二度処理しない
     seen_layers: std::sync::Mutex<SeenCache>,
+    /// 送信の観測の口（試験専用。本番では誰も設定しない）
+    send_observer: std::sync::RwLock<Option<SendObserver>>,
 }
 
 fn replay_cache() -> std::sync::Mutex<SeenCache> {
@@ -47,7 +52,7 @@ impl Router {
     pub fn new(identity: Arc<Identity>) -> Result<Self> {
         let quic_client = Arc::new(QuicClient::new()?);
         let connection_pool = ConnectionPool::new(quic_client);
-        Ok(Self { identity, connection_pool, seen_layers: replay_cache() })
+        Ok(Self { identity, connection_pool, seen_layers: replay_cache(), send_observer: std::sync::RwLock::new(None) })
     }
 
     /// 待ち受けと同じエンドポイントから発信する Router
@@ -60,7 +65,24 @@ impl Router {
             identity,
             connection_pool: ConnectionPool::from_endpoint(endpoint),
             seen_layers: replay_cache(),
+            send_observer: std::sync::RwLock::new(None),
         })
+    }
+
+    /// 送るパケットの宛先・種別・中身を通知する口を付ける（試験専用）
+    ///
+    /// **本番では設定しない。** 設定しなければ何も記録しない（宛先の記録は、押収されたときに
+    /// 「誰と通信したか」として残る）。結合テストが「保持者の IP 宛てのパケットを送ったのは
+    /// そのガードだけ」を確かめるために、各ノードの送信を集める目的でだけ使う。
+    #[doc(hidden)]
+    pub fn set_send_observer(&self, f: SendObserver) {
+        *self.send_observer.write().unwrap() = Some(f);
+    }
+
+    fn observe_send(&self, addr: SocketAddr, packet_type: PacketType, payload: &[u8]) {
+        if let Some(f) = self.send_observer.read().unwrap().as_ref() {
+            f(addr, packet_type, payload);
+        }
     }
 
     /// 受信した Onion パケットの 1 層を処理する
@@ -134,6 +156,7 @@ impl Router {
         packet_type: PacketType,
         payload: &[u8],
     ) -> Result<()> {
+        self.observe_send(addr, packet_type, payload);
         let conn = self
             .connection_pool
             .live_connection(addr)
@@ -195,6 +218,7 @@ impl Router {
 
     /// 任意のパケットを指定した宛先に送信する
     pub async fn send_packet(&self, addr: SocketAddr, packet_type: PacketType, payload: &[u8]) -> Result<()> {
+        self.observe_send(addr, packet_type, payload);
         // Connection Pool から接続を取得
         let conn = self.connection_pool.get_connection(addr).await?;
         let mut stream = conn.open_uni().await.map_err(|e| AetherError::Quic(e.to_string()))?;

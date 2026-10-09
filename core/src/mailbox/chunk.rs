@@ -77,13 +77,18 @@ impl Manifest {
 /// v2 のシャード 1 枚の大きさ（バイト）。データもパリティも同じ長さ
 ///
 /// **`chunk::tests::v2_shard_bytes_fills_the_256k_onion_bucket` で決めた値。**
-/// 保持者へ `send_onion_message_typed(MailboxPut, [put_key 32][シャード], 宛先)` で送るとき、
-/// 出口に届く本文は `[内側の種別 1][宛先 SocketAddr（bincode。IPv6 で 22）][PacketType 1][put_key 32][シャード]`
+/// 置く向きは、置く人の回路の出口が保持者の受け口（GW_h）へ `TunnelData` を渡す形
+/// （`send_onion_message_typed(TunnelData, [tunnel_id 32][HOLDER_PUT 1][put_key 32][シャード], GW_h)`）。
+/// 出口に届く本文は
+/// `[内側の種別 1][宛先 SocketAddr（bincode。IPv6 で 22）][PacketType 1][tunnel_id 32][HOLDER_PUT 1][put_key 32][シャード]`
 /// で、onion はこれに長さ 4 バイトを前置して `padded_len` で切り上げる。
 /// その結果がちょうど 262,144（256KiB のバケット）に収まる最大のシャードが
-/// `262_144 − 4 − 1 − 22 − 1 − 32 = 262_084`。1 バイト増やすと 524,288 に跳ねて倍になる。
+/// `262_144 − 4 − 1 − 22 − 1 − 32 − 1 − 32 = 262_051`。1 バイト増やすと 524,288 に跳ねて倍になる。
 /// 宛先が IPv4（bincode で 10）なら 12 バイト短くなるが、同じバケットに切り上がるので長さは変わらない。
-pub const V2_SHARD_BYTES: usize = 262_084;
+/// 返す向き（保持者の回路の出口 → 取る人の返信トンネルの gateway）は
+/// `[内側の種別 1][宛先 22][TunnelData 1][tunnel_id 32][シャード]` で、置く向きより 33 バイト短く、
+/// 同じバケットに収まる。
+pub const V2_SHARD_BYTES: usize = 262_051;
 
 /// 収束暗号のオブジェクトの付加分: nonce 12 + 認証タグ 16
 pub const V2_SEAL_OVERHEAD: usize = 12 + 16;
@@ -525,14 +530,14 @@ mod tests {
         assert!(decode_stripe(k, m, &stripe.keep_verified(&got)).is_err());
     }
 
-    /// 保持者へ送る 1 件を、実際の onion の組み立てで包んだときの切り上げ後の本文の大きさ
+    /// `send_onion_message_typed(packet_type, message, dest)` と同じ組み立て（`[PacketType 1][message]` を
+    /// `build_typed_forward` で包み、`OnionCircuit::wrap_packet` を通す）のパケット長から、
+    /// 切り上げ後の本文の大きさを逆算する
     ///
-    /// `RelayClient::send_onion_message_typed(MailboxPut, [put_key][シャード], dest)` と同じ
-    /// `build_typed_forward` → `OnionCircuit::wrap_packet` を通し、パケット長から逆算する。
     /// パケット = `HEADER_LEN` + 切り上げた本文 + AEAD タグ 16。
-    fn onion_bucket_for_shard(shard_len: usize, dest: std::net::SocketAddr) -> usize {
+    fn onion_bucket(packet_type: crate::protocol::wire::PacketType, message: &[u8], dest: std::net::SocketAddr) -> usize {
         use crate::net::onion::{OnionCircuit, HEADER_LEN};
-        use crate::protocol::wire::{self, PacketType};
+        use crate::protocol::wire;
         use x25519_dalek::{PublicKey, StaticSecret};
 
         let mut circuit = OnionCircuit::new();
@@ -541,14 +546,29 @@ mod tests {
             let addr: std::net::SocketAddr = format!("10.0.0.{}:9000", i + 1).parse().unwrap();
             circuit.add_hop(addr, PublicKey::from(&s).to_bytes()).unwrap();
         }
-        // send_onion_message_typed と同じ組み立て: [PacketType 1][message] を TypedForward で包む
-        let mut message = vec![0u8; 32];
-        message.extend(vec![0xAB; shard_len]);
-        let mut body = vec![PacketType::MailboxPut as u8];
-        body.extend_from_slice(&message);
+        let mut body = vec![packet_type as u8];
+        body.extend_from_slice(message);
         let inner = wire::build_typed_forward(dest, &body).unwrap();
         let packet = circuit.wrap_packet(&inner).unwrap();
         packet.len() - HEADER_LEN - 16
+    }
+
+    /// 置く向き: 置く人の回路の出口が、保持者の受け口（GW_h）へ `TunnelData` を渡す
+    fn put_bucket(shard_len: usize, gateway: std::net::SocketAddr) -> usize {
+        use crate::net::holder::{build_gateway_data, HOLDER_PUT};
+        let mut put = vec![0x80u8; 32]; // [put_key 32][シャード]
+        put.extend(vec![0xAB; shard_len]);
+        let message = build_gateway_data(&[5u8; 32], HOLDER_PUT, &put);
+        onion_bucket(crate::protocol::wire::PacketType::TunnelData, &message, gateway)
+    }
+
+    /// 返す向き: 保持者の回路の出口が、取る人の返信トンネルの gateway へ `TunnelData` を渡す
+    ///
+    /// 保持者の返事は `[reply tunnel_id 32][値]`（値 = 保存されたシャードそのもの）。
+    fn reply_bucket(shard_len: usize, reply_gateway: std::net::SocketAddr) -> usize {
+        let mut message = vec![6u8; 32];
+        message.extend(vec![0xAB; shard_len]);
+        onion_bucket(crate::protocol::wire::PacketType::TunnelData, &message, reply_gateway)
     }
 
     #[test]
@@ -556,23 +576,25 @@ mod tests {
         use crate::net::onion::padded_len;
         let v6: std::net::SocketAddr = "[2001:db8::1]:9443".parse().unwrap();
         let v4: std::net::SocketAddr = "192.0.2.1:9443".parse().unwrap();
-
-        // 組み立てた本文の長さを数式でも出し、実際のパケット長と一致することを確かめる
-        let inner_len = |dest: &std::net::SocketAddr| 1 + bincode::serialize(dest).unwrap().len() + 1 + 32;
         assert_eq!(bincode::serialize(&v6).unwrap().len(), 22);
         assert_eq!(bincode::serialize(&v4).unwrap().len(), 10);
 
-        // 最悪の宛先（IPv6）で、ちょうど 262,144 に収まる最大
-        let body_v6 = 4 + inner_len(&v6) + V2_SHARD_BYTES;
-        assert_eq!(padded_len(body_v6), 262_144, "IPv6 宛先でちょうど 256KiB");
-        assert_eq!(padded_len(body_v6 + 1), 524_288, "1 バイト増やすと倍のバケットに跳ねる");
-        assert_eq!(body_v6, 262_144, "IPv6 では隙間が無い");
+        // 組み立てた本文の長さを数式でも出す: 長さ 4 + 内側の種別 1 + 宛先 + PacketType 1 + tunnel_id 32
+        // + HOLDER_PUT 1 + put_key 32 + シャード
+        let put_fixed = |dest: &std::net::SocketAddr| 4 + 1 + bincode::serialize(dest).unwrap().len() + 1 + 32 + 1 + 32;
+        assert_eq!(put_fixed(&v6) + V2_SHARD_BYTES, 262_144, "置く向きは IPv6 で隙間が無い");
+        assert_eq!(padded_len(put_fixed(&v6) + V2_SHARD_BYTES), 262_144);
+        assert_eq!(padded_len(put_fixed(&v6) + V2_SHARD_BYTES + 1), 524_288, "1 バイト増やすと倍のバケットに跳ねる");
 
-        // 実際の onion パケットの長さからも確かめる（数式の転記ミスを防ぐ）
-        assert_eq!(onion_bucket_for_shard(V2_SHARD_BYTES, v6), 262_144);
-        assert_eq!(onion_bucket_for_shard(V2_SHARD_BYTES + 1, v6), 524_288);
+        // 実際の onion パケットの長さからも確かめる（数式の転記ミスを防ぐ）。置く向き
+        assert_eq!(put_bucket(V2_SHARD_BYTES, v6), 262_144);
+        assert_eq!(put_bucket(V2_SHARD_BYTES + 1, v6), 524_288, "1 バイト増やすと置く向きが 524,288 に跳ねる");
         // IPv4 宛先でも同じバケット（長さで宛先の種類は見えない）
-        assert_eq!(onion_bucket_for_shard(V2_SHARD_BYTES, v4), 262_144);
+        assert_eq!(put_bucket(V2_SHARD_BYTES, v4), 262_144);
+
+        // 返す向き。置く向きより短いので同じバケットに収まる
+        assert_eq!(reply_bucket(V2_SHARD_BYTES, v6), 262_144, "返す向きも 256KiB に収まる");
+        assert_eq!(reply_bucket(V2_SHARD_BYTES, v4), 262_144);
 
         // 保持者の 1 件の上限（MAX_ENTRY_BYTES = 1MiB）に収まる
         const { assert!(32 + V2_SHARD_BYTES <= 1024 * 1024) };
@@ -583,7 +605,7 @@ mod tests {
     #[test]
     fn manifest_v2_sealed_len_matches_a_real_manifest() {
         // 切り上げ込みのチャンク数（5MB → 20 → 32 など）でも、見積もりが実物と一致する
-        let sizes = [(7usize, 5_000_000u64), (100, 300_000), (3, 40_000_000), (100, 805_036_032)];
+        let sizes = [(7usize, 5_000_000u64), (100, 300_000), (3, 40_000_000), (100, 3072 * V2_CHUNK_PLAIN as u64)];
         for (name_len, size) in sizes {
             for pad in [false, true] {
                 let chunks = v2_layout_chunks(name_len, size, pad).unwrap();
@@ -629,7 +651,7 @@ mod tests {
         assert_eq!(padded_chunks_for_size(4 * mib + 1, 20), 20);
         assert_eq!(padded_chunks_for_size(1, 3), 3, "最小の刻みより上限が小さいときも上限");
         // 本物のチャンク数以上になる（上限に収まるファイルについて）
-        for size in [1u64, 262_056, 262_057, mib, 4 * mib, 4 * mib + 1, 100_000_000] {
+        for size in [1u64, V2_CHUNK_PLAIN as u64, V2_CHUNK_PLAIN as u64 + 1, mib, 4 * mib, 4 * mib + 1, 100_000_000] {
             assert!(padded_chunks_for_size(size, 10_000) >= v2_chunk_count(size), "size = {}", size);
         }
     }

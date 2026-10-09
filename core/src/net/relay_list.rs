@@ -13,8 +13,46 @@ use crate::error::{AetherError, Result};
 use crate::net::lease_set::{LeaseSet, MAX_LEASE_SETS};
 use crate::net::ring::{self, RingPosition};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
+
+/// 位置で並べた枠の表の 1 行
+///
+/// 順序は (位置, SID, 枠の番号)。位置は `[0, 1)` の正の f64 なので、ビット列の大小が位置の大小と一致する。
+#[derive(Debug, Clone, Copy)]
+struct SlotKey {
+    pos: RingPosition,
+    sid: [u8; 32],
+    index: u32,
+}
+
+impl SlotKey {
+    fn order(&self) -> (u64, &[u8; 32], u32) {
+        (self.pos.value().to_bits(), &self.sid, self.index)
+    }
+
+    /// 範囲検索の起点（同じ位置の行より前に並ぶ）
+    fn probe(pos: RingPosition) -> Self {
+        Self { pos, sid: [0; 32], index: 0 }
+    }
+}
+
+impl PartialEq for SlotKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.order() == other.order()
+    }
+}
+impl Eq for SlotKey {}
+impl PartialOrd for SlotKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for SlotKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
+    }
+}
 
 /// リレー1台の記述子
 ///
@@ -208,6 +246,12 @@ pub struct RelayDirectory {
     evicted: HashMap<NodeId, u64>,
     /// 保持者の leaseSet（SID ごとに最新の 1 つ）。リレーの記述子とは別に持つ
     lease_sets: HashMap<[u8; 32], LeaseSet>,
+    /// 全 leaseSet の全枠を、位置で並べた表
+    ///
+    /// 置き場所を引くたびに全枠の位置をハッシュし直すと、1GB のファイル（シャード 3,000 枚以上）で
+    /// 数億回のハッシュになる。位置は leaseSet を入れたとき・消したとき・`epoch_seed` が変わったときだけ
+    /// 計算して、ここに持つ。**常に現在の `epoch_seed` での位置**（`lease_sets` と同じ内容を指す）。
+    slot_table: BTreeSet<SlotKey>,
     /// 自分が保持者として使う SID（PEX で配らない）
     own_sids: std::collections::HashSet<[u8; 32]>,
 }
@@ -227,6 +271,7 @@ impl RelayDirectory {
             pow_difficulty,
             evicted: HashMap::new(),
             lease_sets: HashMap::new(),
+            slot_table: BTreeSet::new(),
             own_sids: std::collections::HashSet::new(),
         }
     }
@@ -425,7 +470,8 @@ impl RelayDirectory {
         lease.verify_with_known_slots(now, self.pow_difficulty, &known_slots)?;
 
         if self.lease_sets.contains_key(&lease.sid) {
-            // 上で新しいことを確かめ済み。置き換える
+            // 上で新しいことを確かめ済み。置き換える（古い枠は表から外す）
+            self.unindex_lease(&lease.sid);
         } else if self.lease_sets.len() >= MAX_LEASE_SETS {
             // 満杯。入れるものより期限の近い（古い）ものがあれば、一番近いものを捨てる。
             // 入れるものが一番近いなら、入れない。
@@ -436,20 +482,63 @@ impl RelayDirectory {
                 .map(|l| (l.sid, l.expires_at));
             match soonest {
                 Some((sid, expires_at)) if expires_at < lease.expires_at => {
+                    self.unindex_lease(&sid);
                     self.lease_sets.remove(&sid);
                 }
                 _ => return Ok(()),
             }
         }
+        self.index_lease(&lease);
         self.lease_sets.insert(lease.sid, lease);
         Ok(())
     }
 
+    /// leaseSet の全枠を位置の表に足す
+    fn index_lease(&mut self, lease: &LeaseSet) {
+        for s in &lease.slots {
+            self.slot_table.insert(SlotKey {
+                pos: s.position(&lease.sid, &self.epoch_seed),
+                sid: lease.sid,
+                index: s.index,
+            });
+        }
+    }
+
+    /// `sid` の leaseSet の全枠を位置の表から外す（`lease_sets` から消す前に呼ぶ）
+    fn unindex_lease(&mut self, sid: &[u8; 32]) {
+        let Some(lease) = self.lease_sets.get(sid) else { return };
+        for s in &lease.slots {
+            self.slot_table.remove(&SlotKey {
+                pos: s.position(sid, &self.epoch_seed),
+                sid: *sid,
+                index: s.index,
+            });
+        }
+    }
+
+    /// 検証を省いて入れる（試験専用。期限切れなどの形を作るため）
+    #[cfg(test)]
+    fn insert_lease_unchecked(&mut self, lease: LeaseSet) {
+        if self.lease_sets.contains_key(&lease.sid) {
+            self.unindex_lease(&lease.sid);
+        }
+        self.index_lease(&lease);
+        self.lease_sets.insert(lease.sid, lease);
+    }
+
     /// 期限切れの leaseSet を消す。消した数を返す
     pub fn prune_expired_lease_sets(&mut self, now: u64) -> usize {
-        let before = self.lease_sets.len();
-        self.lease_sets.retain(|_, l| !l.is_expired(now));
-        before - self.lease_sets.len()
+        let expired: Vec<[u8; 32]> = self
+            .lease_sets
+            .values()
+            .filter(|l| l.is_expired(now))
+            .map(|l| l.sid)
+            .collect();
+        for sid in &expired {
+            self.unindex_lease(sid);
+            self.lease_sets.remove(sid);
+        }
+        expired.len()
     }
 
     pub fn lease_set(&self, sid: &[u8; 32]) -> Option<&LeaseSet> {
@@ -466,28 +555,72 @@ impl RelayDirectory {
         self.lease_sets.len()
     }
 
-    /// 指定座標に近い順に、保持者の枠を最大 `k` 個（期限内の leaseSet だけ）
+    /// 指定座標に近い順に、保持者を最大 `k` 人（期限内の leaseSet だけ）
     ///
     /// リレーの [`k_nearest`](Self::k_nearest) と同じく問い合わせを行わない。送り手と受け手が
     /// 同じ leaseSet を持っていれば同じ集合に到達する。
+    /// **担当は SID ごとに 1 つまで。** 同じ SID の別の枠が近くにあっても飛ばして次の SID へ進む
+    /// （飛ばさないと、複製の 5 つが 2〜3 人に集まって、独立した複製にならない）。
     /// 戻り値は `(その枠を持つ leaseSet, 枠の番号)`。
     pub fn storage_targets(&self, target: RingPosition, k: usize) -> Vec<(LeaseSet, u32)> {
-        let now = crate::protocol::hint::current_timestamp();
-        let seed = self.epoch_seed;
-        let slots: Vec<(&LeaseSet, u32, RingPosition)> = self
-            .lease_sets
-            .values()
-            .filter(|l| !l.is_expired(now))
-            .flat_map(|l| {
-                l.slots
-                    .iter()
-                    .map(move |s| (l, s.index, s.position(&l.sid, &seed)))
-            })
-            .collect();
-        ring::k_nearest(&slots, target, k, |(_, _, p)| *p)
+        self.nearest_slots(target, k, true)
             .into_iter()
-            .map(|(l, i, _)| ((*l).clone(), *i))
+            .map(|(l, i, _)| (l.clone(), i))
             .collect()
+    }
+
+    /// 位置の表を `target` から両側へ歩いて、近い順に枠を最大 `k` 個返す
+    ///
+    /// `distinct_sid` なら同じ SID は最初の（一番近い）枠だけ。期限切れの leaseSet の枠は飛ばす。
+    /// 順序は [`ring::k_nearest`] と同じ（距離、同じなら位置）。
+    fn nearest_slots(
+        &self,
+        target: RingPosition,
+        k: usize,
+        distinct_sid: bool,
+    ) -> Vec<(&LeaseSet, u32, RingPosition)> {
+        let now = crate::protocol::hint::current_timestamp();
+        let total = self.slot_table.len();
+        let probe = SlotKey::probe(target);
+        // 時計回り（位置が大きくなる向き）と反時計回り。端で反対側へ回り込む。
+        // 2 つの歩みが取った行の数の合計が total になれば、全部の行を見終わっている
+        // （合計が total 未満の間は、2 つの歩みが同じ行を取ることはない）。
+        let mut cw = self.slot_table.range(probe..).chain(self.slot_table.range(..probe));
+        let mut ccw = self
+            .slot_table
+            .range(..probe)
+            .rev()
+            .chain(self.slot_table.range(probe..).rev());
+        let (mut next_cw, mut next_ccw) = (cw.next(), ccw.next());
+        let key_of = |row: &SlotKey| (RingPosition::distance(target, row.pos), row.pos.value());
+
+        let mut out: Vec<(&LeaseSet, u32, RingPosition)> = Vec::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let mut taken = 0;
+        while out.len() < k && taken < total {
+            let take_cw = match (next_cw, next_ccw) {
+                (Some(a), Some(b)) => key_of(a) <= key_of(b),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            let row = if take_cw {
+                let row = next_cw.take();
+                next_cw = cw.next();
+                row
+            } else {
+                let row = next_ccw.take();
+                next_ccw = ccw.next();
+                row
+            };
+            taken += 1;
+            let Some(row) = row else { break };
+            let Some(lease) = self.lease_sets.get(&row.sid) else { continue };
+            if lease.is_expired(now) || (distinct_sid && !seen.insert(row.sid)) {
+                continue;
+            }
+            out.push((lease, row.index, row.pos));
+        }
+        out
     }
 
     /// 生死の確認で応答しなかったリレーを外す
@@ -565,7 +698,16 @@ impl RelayDirectory {
     /// 回転で保持者集合が変わったコンテンツは、既存の republish ループ（保持者による
     /// 定期再配置）が現在の K 最近接へ移すので、境界後しばらくで追従する。
     pub fn set_epoch_seed(&mut self, seed: [u8; 32]) {
+        if seed == self.epoch_seed {
+            return;
+        }
         self.epoch_seed = seed;
+        // 枠の位置も seed に依るので、表を作り直す
+        self.slot_table.clear();
+        let leases: Vec<LeaseSet> = self.lease_sets.values().cloned().collect();
+        for lease in &leases {
+            self.index_lease(lease);
+        }
     }
 
     /// 指定座標に近い順に最大 k 台
@@ -1256,15 +1398,67 @@ mod tests {
         assert_eq!(dir.lease_set_count(), 0);
     }
 
-    #[test]
-    fn storage_targets_returns_the_nearest_slots_in_order() {
+    /// 素朴な全探索（全枠の位置を毎回ハッシュして並べる）。表を引く実装の正解として使う
+    fn naive_slots(dir: &RelayDirectory, target: RingPosition) -> Vec<([u8; 32], u32)> {
+        let seed = dir.epoch_seed();
+        let all: Vec<(&LeaseSet, u32, RingPosition)> = dir
+            .lease_sets()
+            .into_iter()
+            .flat_map(|l| l.slots.iter().map(move |s| (l, s.index, s.position(&l.sid, &seed))))
+            .collect();
+        ring::k_nearest(&all, target, usize::MAX, |(_, _, p)| *p)
+            .into_iter()
+            .map(|(l, i, _)| (l.sid, *i))
+            .collect()
+    }
+
+    fn lease_dir_with(sizes: &[u32]) -> RelayDirectory {
         let mut dir = lease_dir();
-        for _ in 0..6 {
-            dir.insert_lease_set(lease_now(&crate::crypto::identity::Identity::generate(), 4)).unwrap();
+        for &n in sizes {
+            dir.insert_lease_set(lease_now(&crate::crypto::identity::Identity::generate(), n)).unwrap();
         }
-        let target = ring::position_of_hint(&[0x55; 32], &ring::EPOCH_SEED_PLACEHOLDER);
+        dir
+    }
+
+    fn target_of(n: u8) -> RingPosition {
+        ring::position_of_hint(&[n; 32], &ring::EPOCH_SEED_PLACEHOLDER)
+    }
+
+    #[test]
+    fn slot_table_walk_matches_a_naive_scan() {
+        let dir = lease_dir_with(&[1, 2, 4, 8, 4, 2, 1, 8, 16, 1, 2, 4]);
+        assert_eq!(dir.slot_table.len(), 53);
+        for n in 0..40u8 {
+            let target = target_of(n);
+            let naive = naive_slots(&dir, target);
+            // SID の重複除去を除いた比較: 表を歩いた結果が、全探索の先頭と同じ並びになる
+            for k in [1usize, 5, 20, 53, 100] {
+                let walked: Vec<_> = dir
+                    .nearest_slots(target, k, false)
+                    .into_iter()
+                    .map(|(l, i, _)| (l.sid, i))
+                    .collect();
+                assert_eq!(walked, naive[..k.min(naive.len())], "target {} k {}", n, k);
+            }
+            // 除去したときは、全探索の結果から同じ SID の 2 つ目以降を落としたものと同じ
+            let mut seen = HashSet::new();
+            let deduped: Vec<_> = naive.iter().filter(|(sid, _)| seen.insert(*sid)).copied().collect();
+            for k in [1usize, 5, 12, 50] {
+                let got: Vec<_> = dir.storage_targets(target, k).into_iter().map(|(l, i)| (l.sid, i)).collect();
+                assert_eq!(got, deduped[..k.min(deduped.len())], "target {} k {}", n, k);
+            }
+        }
+    }
+
+    #[test]
+    fn storage_targets_gives_one_slot_per_sid_in_distance_order() {
+        // 1 人が 64 枠を持っていても、5 人の担当に 1 人は 1 回だけ現れる
+        let dir = lease_dir_with(&[64, 1, 1, 1, 1, 1, 1]);
+        let target = target_of(0x55);
         let got = dir.storage_targets(target, 5);
         assert_eq!(got.len(), 5);
+        let sids: HashSet<_> = got.iter().map(|(l, _)| l.sid).collect();
+        assert_eq!(sids.len(), 5, "同じ SID が複数の担当になっている");
 
         let dist = |(l, i): &(LeaseSet, u32)| {
             let slot = l.slots.iter().find(|s| s.index == *i).unwrap();
@@ -1273,15 +1467,57 @@ mod tests {
         let dists: Vec<f64> = got.iter().map(dist).collect();
         assert!(dists.windows(2).all(|w| w[0] <= w[1]), "近い順でない: {:?}", dists);
 
-        // 全 24 枠のうち、返した 5 枠より近いものが無いこと
-        let farthest = dists[4];
-        let nearer = dir
-            .lease_sets()
-            .iter()
-            .flat_map(|l| l.slots.iter().map(move |s| (l, s)))
-            .filter(|(l, s)| RingPosition::distance(target, s.position(&l.sid, &dir.epoch_seed())) < farthest)
-            .count();
-        assert_eq!(nearer, 4);
+        // SID の数より多くは返らない
+        assert_eq!(dir.storage_targets(target, 50).len(), 7);
+        assert!(dir.storage_targets(target, 0).is_empty());
+    }
+
+    #[test]
+    fn slot_table_follows_replacement_pruning_and_epoch_seed() {
+        let id = crate::crypto::identity::Identity::generate();
+        let now = crate::protocol::hint::current_timestamp();
+        let mut dir = lease_dir();
+        dir.insert_lease_set(lease_at(&id, 4, now - 1800)).unwrap();
+        dir.insert_lease_set(lease_dir_with(&[2]).lease_sets()[0].clone()).unwrap();
+        assert_eq!(dir.slot_table.len(), 6);
+
+        // 同じ SID の置き換えで、古い枠が残らない
+        dir.insert_lease_set(lease_at(&id, 2, now)).unwrap();
+        assert_eq!(dir.slot_table.len(), 4);
+
+        // seed が変わると位置が変わり、表も作り直される（全探索と一致し続ける）
+        dir.set_epoch_seed([9u8; 32]);
+        assert_eq!(dir.slot_table.len(), 4);
+        for n in 0..10u8 {
+            let target = target_of(n);
+            let walked: Vec<_> = dir.nearest_slots(target, 10, false).into_iter().map(|(l, i, _)| (l.sid, i)).collect();
+            assert_eq!(walked, naive_slots(&dir, target));
+        }
+
+        // 期限切れの掃除で表からも消える
+        let far = dir.lease_sets().iter().map(|l| l.expires_at).max().unwrap();
+        assert_eq!(dir.prune_expired_lease_sets(far), 2);
+        assert!(dir.slot_table.is_empty());
+        assert!(dir.storage_targets(target_of(1), 3).is_empty());
+    }
+
+    #[test]
+    fn storage_targets_never_returns_an_expired_slot_even_when_it_is_nearest() {
+        let mut dir = lease_dir_with(&[2, 2, 2]);
+        // 期限切れの leaseSet を、目標のすぐそばに枠が来るまで探して直接入れる
+        let target = target_of(7);
+        let expired = (0..2000)
+            .map(|_| lease_at(&crate::crypto::identity::Identity::generate(), 1, LEASE_NOW))
+            .min_by(|a, b| {
+                let d = |l: &LeaseSet| RingPosition::distance(target, l.slots[0].position(&l.sid, &dir.epoch_seed()));
+                d(a).partial_cmp(&d(b)).unwrap()
+            })
+            .unwrap();
+        let expired_sid = expired.sid;
+        dir.insert_lease_unchecked(expired);
+        let got = dir.storage_targets(target, 10);
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|(l, _)| l.sid != expired_sid && !l.is_expired(crate::protocol::hint::current_timestamp())));
     }
 
     #[test]
@@ -1289,7 +1525,7 @@ mod tests {
         let mut dir = lease_dir();
         let id = crate::crypto::identity::Identity::generate();
         // 検証を通さず、期限切れのものを直接入れる
-        dir.lease_sets.insert(id.public_id().0, lease_at(&id, 1, LEASE_NOW));
+        dir.insert_lease_unchecked(lease_at(&id, 1, LEASE_NOW));
         assert!(dir.storage_targets(ring::position_of_hint(&[0x11; 32], &ring::EPOCH_SEED_PLACEHOLDER), 3).is_empty());
     }
 
@@ -1304,7 +1540,7 @@ mod tests {
             l.sid = [0; 32];
             l.sid[..8].copy_from_slice(&n.to_be_bytes());
             l.expires_at = now + 1000 + n;
-            dir.lease_sets.insert(l.sid, l);
+            dir.insert_lease_unchecked(l);
         }
         assert_eq!(dir.lease_set_count(), MAX_LEASE_SETS);
 

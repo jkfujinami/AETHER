@@ -29,8 +29,9 @@
 //! （ガードは元々こちらの IP を知っている）。構築・延長・leaseSet の配布・一周の確認は、
 //! すべて自分の回路の出口経由で送る。ログにも、受け口やリレーのアドレスは `debug!` までにしか出さない。
 //!
-//! このタスクで処理する受け口の中身は `HOLDER_PROBE` だけ。`HOLDER_PUT`・`HOLDER_GET` は
-//! 今は捨てる（置く・取るの経路は後の段で足す）。
+//! 受け口で処理する中身は `HOLDER_PROBE`（一周の確認）と `HOLDER_PUT`（置く。自分の `MailboxServer` に
+//! 保存する）。`HOLDER_GET` は今は捨てる（取る経路は後の段で足す）。
+//! 置く人は保持者の IP を知らず、置かれる中身は G_h からだけ届く。
 
 use crate::circuit::Circuit;
 use crate::client::AetherClient;
@@ -38,6 +39,7 @@ use crate::error::{ClientError, Result};
 use crate::events;
 use crate::keys::KeyFiles;
 use aether_core::crypto::identity::{Identity, NodeId};
+use aether_core::mailbox::server::MailboxServer;
 use aether_core::net::guard::GUARD_ROTATION_SECS;
 use aether_core::net::holder::{
     build_holder_message, parse_holder_message, parse_probe_marker, HOLDER_GET, HOLDER_PROBE, HOLDER_PUT,
@@ -109,6 +111,9 @@ const PUBLISH_FANOUT: usize = 3;
 
 /// 自分宛てではない目印（試験と診断用）を覚えておく数
 const EXTERNAL_PROBES_KEPT: usize = 64;
+
+/// 診断用に覚えておく受け口の数（受け口は 3 本 × 作り直し数回分）
+const DIAG_TUNNELS_KEPT: usize = 16;
 
 // ---------------------------------------------------------------------------
 // 純粋な部分（選び方・時刻・保存）
@@ -257,6 +262,10 @@ pub(crate) struct HolderShared {
     external: Mutex<VecDeque<[u8; 32]>>,
     /// 最後に出した leaseSet
     lease: Mutex<Option<LeaseSet>>,
+    /// 張った受け口の受信側 tunnel_id（新しい方から最大 [`DIAG_TUNNELS_KEPT`] 本。試験と診断用）
+    tunnel_ids: Mutex<VecDeque<[u8; 32]>>,
+    /// 受け口を張るのに使ったガードのアドレス（試験と診断用。ガードは元々こちらの IP を知っている）
+    guard_addr: Mutex<Option<SocketAddr>>,
 }
 
 /// 保持者の役割の状態（試験と診断用）
@@ -266,11 +275,29 @@ pub struct HolderStatus {
     pub lease_set: Option<LeaseSet>,
     /// 受け口に届いた、自分の確認ではない `HOLDER_PROBE` の目印
     pub probes_received: Vec<[u8; 32]>,
+    /// 張った受け口の受信側 tunnel_id（G_h が H へ送るパケットの先頭 32 バイトと一致する）
+    pub receive_tunnel_ids: Vec<[u8; 32]>,
+    /// 受け口のガード（G_h）のアドレス
+    pub guard_addr: Option<SocketAddr>,
 }
 
 impl HolderShared {
+    /// 張った受け口を診断用に覚える
+    fn note_tunnel(&self, receive_tunnel_id: [u8; 32], guard_addr: SocketAddr) {
+        let mut ids = self.tunnel_ids.lock().unwrap();
+        if ids.len() >= DIAG_TUNNELS_KEPT {
+            ids.pop_front();
+        }
+        ids.push_back(receive_tunnel_id);
+        *self.guard_addr.lock().unwrap() = Some(guard_addr);
+    }
+
     /// 受け口で開いた中身を種別で振り分ける
-    fn dispatch(&self, plain: &[u8]) {
+    ///
+    /// `HOLDER_PUT` は本文（`[put_key 32][値]`）を自分の `MailboxServer` に保存する。
+    /// first-write-wins・容量・枠・v2 のキーの照合は `handle_put` の規則のまま。
+    /// 拒まれたことは詳細（キー）を出さずに `debug!` に残すだけで、置いた人には返さない。
+    async fn dispatch(&self, plain: &[u8], mailbox: &MailboxServer) {
         let (kind, body) = match parse_holder_message(plain) {
             Ok(v) => v,
             Err(e) => {
@@ -294,8 +321,12 @@ impl HolderShared {
                     seen.push_back(marker);
                 }
             }
-            // 置く・取るの処理は後の段で足す。今は捨てる
-            HOLDER_PUT => debug!("holder: PUT ({} bytes) is not handled yet; dropping", body.len()),
+            HOLDER_PUT => {
+                if let Err(e) = mailbox.handle_put(body).await {
+                    debug!("holder: put refused: {}", e);
+                }
+            }
+            // 取る処理は後の段で足す。今は捨てる
             HOLDER_GET => debug!("holder: GET ({} bytes) is not handled yet; dropping", body.len()),
             other => debug!("holder: unknown message kind {}; dropping", other),
         }
@@ -375,6 +406,8 @@ impl AetherClient {
         HolderStatus {
             lease_set: self.holder.lease.lock().unwrap().clone(),
             probes_received: self.holder.external.lock().unwrap().iter().copied().collect(),
+            receive_tunnel_ids: self.holder.tunnel_ids.lock().unwrap().iter().copied().collect(),
+            guard_addr: *self.holder.guard_addr.lock().unwrap(),
         }
     }
 
@@ -668,13 +701,14 @@ impl Holder {
         let tunnel = Arc::new(tunnel);
         // 口は指示を出す前に登録する（最初の確認が受け箱に落ちないように）
         let mut rx = client.node.register_tunnel_sink(tunnel.receive_tunnel_id);
+        shared.note_tunnel(tunnel.receive_tunnel_id, guard.addr);
         {
-            let (shared, tunnel) = (shared.clone(), tunnel.clone());
+            let (shared, tunnel, mailbox) = (shared.clone(), tunnel.clone(), client.node.mailbox());
             tokio::spawn(async move {
                 // 口が外されると rx が閉じて終わる
                 while let Some(raw) = rx.recv().await {
                     match tunnel.decrypt(&raw) {
-                        Ok(plain) => shared.dispatch(&plain),
+                        Ok(plain) => shared.dispatch(&plain, &mailbox).await,
                         Err(e) => debug!("holder: undecryptable tunnel data: {}", e),
                     }
                 }
@@ -987,37 +1021,91 @@ mod tests {
         assert_eq!(ensure_slots(&keys, &sid, 0, 4).await.unwrap(), first);
     }
 
-    #[test]
-    fn dispatch_routes_probe_markers_and_drops_put_and_get() {
+    fn test_mailbox() -> (MailboxServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = MailboxServer::new(dir.path(), &aether_core::Config::default()).unwrap();
+        (mailbox, dir)
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_probe_markers_stores_puts_and_drops_get_and_garbage() {
         let shared = HolderShared::default();
+        let (mailbox, _dir) = test_mailbox();
 
         // 自分の確認の目印は、待っている側へ渡り、外の目印には数えない
         let marker = [5u8; 32];
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         shared.pending.lock().unwrap().insert(marker, tx);
-        shared.dispatch(&build_holder_message(HOLDER_PROBE, &marker));
+        shared.dispatch(&build_holder_message(HOLDER_PROBE, &marker), &mailbox).await;
         assert!(rx.try_recv().is_ok(), "待っている側に渡っていない");
         assert!(shared.external.lock().unwrap().is_empty());
 
         // 待っていない目印は、外から届いたものとして覚える
-        shared.dispatch(&build_holder_message(HOLDER_PROBE, &[6u8; 32]));
+        shared.dispatch(&build_holder_message(HOLDER_PROBE, &[6u8; 32]), &mailbox).await;
         assert_eq!(shared.external.lock().unwrap().iter().copied().collect::<Vec<_>>(), vec![[6u8; 32]]);
 
-        // PUT・GET・壊れた中身・知らない種別は捨てる（落ちない）
-        shared.dispatch(&build_holder_message(HOLDER_PUT, &[1u8; 40]));
-        shared.dispatch(&build_holder_message(HOLDER_GET, &[1u8; 40]));
-        shared.dispatch(&build_holder_message(HOLDER_PROBE, &[1u8; 5]));
-        shared.dispatch(&build_holder_message(99, &[1u8; 5]));
-        shared.dispatch(&[]);
+        // PUT は自分の MailboxServer に保存する（v1 のキー: 最上位ビット 0）
+        let key = aether_core::mailbox::sharding::shard_key(&[1u8; 32], 0);
+        let mut put = key.to_vec();
+        put.extend_from_slice(b"sealed shard");
+        shared.dispatch(&build_holder_message(HOLDER_PUT, &put), &mailbox).await;
+        assert_eq!(mailbox.handle_get(&key).await.unwrap().as_deref(), Some(&b"sealed shard"[..]));
+
+        // 先に置かれた値は上書きしない（first-write-wins は handle_put の規則のまま）
+        let mut other = key.to_vec();
+        other.extend_from_slice(b"forged");
+        shared.dispatch(&build_holder_message(HOLDER_PUT, &other), &mailbox).await;
+        assert_eq!(mailbox.handle_get(&key).await.unwrap().as_deref(), Some(&b"sealed shard"[..]));
+
+        // GET・壊れた中身・短すぎる PUT・知らない種別は捨てる（落ちない）
+        let before = mailbox.len();
+        shared.dispatch(&build_holder_message(HOLDER_GET, &[1u8; 40]), &mailbox).await;
+        shared.dispatch(&build_holder_message(HOLDER_PROBE, &[1u8; 5]), &mailbox).await;
+        shared.dispatch(&build_holder_message(HOLDER_PUT, &[1u8; 5]), &mailbox).await;
+        shared.dispatch(&build_holder_message(99, &[1u8; 5]), &mailbox).await;
+        shared.dispatch(&[], &mailbox).await;
         assert_eq!(shared.external.lock().unwrap().len(), 1, "捨てるはずのものを覚えた");
+        assert_eq!(mailbox.len(), before, "捨てるはずのものを保存した");
+    }
+
+    #[tokio::test]
+    async fn dispatch_refuses_a_garbage_value_under_a_v2_key() {
+        use aether_core::mailbox::{chunk::shard_hash, sharding::v2_put_key};
+        let shared = HolderShared::default();
+        let (mailbox, _dir) = test_mailbox();
+        let shard = vec![0x42u8; 2048];
+        let key = v2_put_key(&shard_hash(&shard));
+
+        // 先書きのゴミは置けず、そのあとに正しいシャードが置ける
+        let mut garbage = key.to_vec();
+        garbage.extend_from_slice(b"garbage");
+        shared.dispatch(&build_holder_message(HOLDER_PUT, &garbage), &mailbox).await;
+        assert!(mailbox.handle_get(&key).await.unwrap().is_none());
+        let mut good = key.to_vec();
+        good.extend_from_slice(&shard);
+        shared.dispatch(&build_holder_message(HOLDER_PUT, &good), &mailbox).await;
+        assert_eq!(mailbox.handle_get(&key).await.unwrap().as_deref(), Some(&shard[..]));
+    }
+
+    #[tokio::test]
+    async fn external_probes_are_capped() {
+        let shared = HolderShared::default();
+        let (mailbox, _dir) = test_mailbox();
+        for i in 0..(EXTERNAL_PROBES_KEPT + 10) {
+            shared.dispatch(&build_holder_message(HOLDER_PROBE, &[i as u8; 32]), &mailbox).await;
+        }
+        assert_eq!(shared.external.lock().unwrap().len(), EXTERNAL_PROBES_KEPT);
     }
 
     #[test]
-    fn external_probes_are_capped() {
+    fn diagnostic_tunnel_list_is_capped_and_keeps_the_newest() {
         let shared = HolderShared::default();
-        for i in 0..(EXTERNAL_PROBES_KEPT + 10) {
-            shared.dispatch(&build_holder_message(HOLDER_PROBE, &[i as u8; 32]));
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        for i in 0..(DIAG_TUNNELS_KEPT + 3) {
+            shared.note_tunnel([i as u8; 32], addr);
         }
-        assert_eq!(shared.external.lock().unwrap().len(), EXTERNAL_PROBES_KEPT);
+        let ids = shared.tunnel_ids.lock().unwrap();
+        assert_eq!(ids.len(), DIAG_TUNNELS_KEPT);
+        assert_eq!(ids.back(), Some(&[(DIAG_TUNNELS_KEPT + 2) as u8; 32]));
     }
 }

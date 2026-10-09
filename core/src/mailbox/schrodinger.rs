@@ -3,6 +3,8 @@ use crate::net::relay::RelayClient;
 use crate::net::gossip::GossipClient;
 use crate::net::gossip_server;
 use crate::net::relay_list::RelayDirectory;
+use crate::net::ring::{self, RingPosition};
+use crate::net::holder::{build_gateway_data, HOLDER_PUT};
 use crate::mailbox::sharding::{self, Shard};
 use crate::mailbox::index::{self, IndexDescriptor, IndexRecord};
 use crate::mailbox::chunk;
@@ -47,6 +49,43 @@ const INDEX_RECORD_MIN_POW: u32 = 16;
 /// 板の読者なら誰でも封の通る偽シャードを作れるので、最初に届いた組が正しいとは限らない。
 /// 上限は、偽シャードを大量に送りつけられても CPU を食い尽くされないため。
 const MAX_REASSEMBLY_ATTEMPTS: usize = 256;
+
+/// 保持者 1 人への届け方。受け口を試す順に並べたもの
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolderRoute {
+    /// 保持者の SID
+    pub sid: [u8; 32],
+    /// `(受け口の gateway のアドレス, その tunnel_id)`。先頭から試す
+    pub inlets: Vec<(SocketAddr, [u8; 32])>,
+}
+
+/// `position` の担当の保持者（SID ごとに 1 人、近い順に最大 `k` 人）と、その受け口を試す順を決める
+///
+/// 担当は leaseSet の枠から決める（リレーの K 最近接ではない）。受け口は**一様にランダムな順**に並べ、
+/// 先頭から試す（偏らせると、特定の受け口に置く人が集まる）。leaseSet に載っている gateway は NodeId だけなので、
+/// アドレスはディレクトリのリレーの記述子から引く。記述子が無い受け口は載せない。
+/// **保持者の IP はここには出てこない**（受け口の gateway のアドレスだけ）。
+pub fn holder_routes(
+    directory: &RelayDirectory,
+    position: RingPosition,
+    k: usize,
+    rng: &mut impl rand::Rng,
+) -> Vec<HolderRoute> {
+    use rand::seq::SliceRandom;
+    directory
+        .storage_targets(position, k)
+        .into_iter()
+        .map(|(lease, _slot)| {
+            let mut inlets: Vec<(SocketAddr, [u8; 32])> = lease
+                .gateways
+                .iter()
+                .filter_map(|g| directory.get(&g.gateway).map(|d| (d.addr, g.tunnel_id)))
+                .collect();
+            inlets.shuffle(rng);
+            HolderRoute { sid: lease.sid, inlets }
+        })
+        .collect()
+}
 
 /// シュレーディンガーMailboxの実装
 pub struct SchrodingerMailbox {
@@ -116,6 +155,9 @@ impl SchrodingerMailbox {
 
     /// シャード `i` の担当リレーをローカル計算で決める (18.5.4)
     ///
+    /// **取る経路用。** 置く経路は保持者（leaseSet の枠）の担当を使う（[`holder_routes`]）。
+    /// 取る経路を保持者へ切り替えるまでは、ここはリレーのままで、置いたものとは一致しない。
+    ///
     /// シャードごとに独立した座標を使うのでリング全体に散る。
     /// 攻撃者が1つの弧を支配しても取れるシャードは1個で、復元には届かない。
     pub async fn shard_targets(
@@ -131,6 +173,53 @@ impl SchrodingerMailbox {
             .into_iter()
             .map(|r| r.addr)
             .collect()
+    }
+
+    /// `[put_key 32][値]` を、`position` の担当の保持者（SID ごとに 1 人、最大 `k` 人）の受け口へ置く
+    ///
+    /// 送り方は、自分の回路の出口に、受け口の gateway（GW_h）へ `TunnelData` を渡させる
+    /// （`[tunnel_id 32][HOLDER_PUT][put]`）。gateway から先は保持者のトンネル（M_h → G_h → H）が運ぶ。
+    /// **保持者の IP へは、この経路のどこからも直接送らない**（H へ届くのは G_h からだけ）。
+    /// 受け口は保持者ごとにランダムな順で試し、記述子が無い・送れないときは次の受け口へ進む。
+    /// 全部の受け口が駄目な保持者はその分だけ飛ばし、**誰にも届かなければエラー**。
+    /// 送ったバイト数（届いた保持者の数 × `put` の長さ）を返す。
+    async fn put_to_holders(&self, position: RingPosition, put: &[u8], k: usize) -> Result<u64> {
+        let routes = {
+            let directory = self.directory.read().await;
+            holder_routes(&directory, position, k, &mut rand::thread_rng())
+        };
+        if routes.is_empty() {
+            return Err(AetherError::Config(
+                "No storage holders known; cannot place shards".into(),
+            ));
+        }
+        let mut sent_bytes = 0u64;
+        for route in &routes {
+            let mut delivered = false;
+            for (gateway, tunnel_id) in &route.inlets {
+                let data = build_gateway_data(tunnel_id, HOLDER_PUT, put);
+                match self
+                    .relay
+                    .send_onion_message_typed(wire::PacketType::TunnelData, &data, *gateway)
+                    .await
+                {
+                    Ok(()) => {
+                        delivered = true;
+                        break;
+                    }
+                    Err(e) => tracing::debug!("holder inlet unavailable; trying another: {}", e),
+                }
+            }
+            if delivered {
+                sent_bytes += put.len() as u64;
+            }
+        }
+        if sent_bytes == 0 {
+            return Err(AetherError::Network(std::io::Error::other(
+                "no storage holder inlet accepted the data",
+            )));
+        }
+        Ok(sent_bytes)
     }
 
     /// メッセージを暗号化し、Mailbox保存用ペイロードとHintパケットを生成する
@@ -310,7 +399,7 @@ impl SchrodingerMailbox {
     /// 任意のオブジェクト（`[nonce(12)][ciphertext]`）を指定 mailbox_key に配置する
     ///
     /// Reed-Solomon 3+2 に割り、シャードごとに封をして `H(mailbox_key ‖ K ‖ i)` の
-    /// 担当へ置く。**本体・チャンク・Manifest すべてこれを通る**（Hint は作らない）。
+    /// 担当の保持者（SID ごとに 1 人、K=5）の受け口へ置く（[`put_to_holders`](Self::put_to_holders)）。**本体・チャンク・Manifest すべてこれを通る**（Hint は作らない）。
     ///
     /// - どの保持者もオブジェクト全体を持たない（5個中3個で復元）。
     /// - 封（HMAC）が無いと、K レプリカの1台が偽シャードを返すだけで復元が止まる。
@@ -327,13 +416,7 @@ impl SchrodingerMailbox {
         let shards = sharding::encode(object)?;
 
         for shard in &shards {
-            let targets = self.shard_targets(mailbox_key, secret, shard.index).await;
-
-            if targets.is_empty() {
-                return Err(AetherError::Config(
-                    "Relay directory is empty; cannot place shards".into(),
-                ));
-            }
+            let position = ring::position_of_shard(mailbox_key, secret, shard.index);
 
             let shard_key = sharding::shard_key(mailbox_key, shard.index);
             let sealed = sharding::seal(shard, mailbox_key, &mac_key);
@@ -342,10 +425,7 @@ impl SchrodingerMailbox {
             put.extend_from_slice(&shard_key);
             put.extend_from_slice(&sealed);
 
-            for target in targets {
-                self.relay.send_onion_message(&put, target).await?;
-                sent_bytes += put.len() as u64;
-            }
+            sent_bytes += self.put_to_holders(position, &put, K_REPLICAS).await?;
         }
 
         Ok(UploadProfile {
@@ -446,27 +526,19 @@ impl SchrodingerMailbox {
         ))
     }
 
-    /// v2 のシャード 1 枚を、ハッシュから決まる担当 1 台へ置く。送ったバイト数を返す
+    /// v2 のシャード 1 枚を、ハッシュから決まる担当の保持者 1 人へ、受け口経由で置く。送ったバイト数を返す
     ///
-    /// 置き場所は `shard_targets(H(シャード), 秘密, 0)` の先頭 1 台、キーは `shard_key(H, 0)`。
+    /// 置き場所は `position_of_shard(H(シャード), 秘密, 0)` に最も近い保持者 1 人、キーは
+    /// `v2_put_key(H)`（最上位ビット 1。保持者が値のハッシュと照合する）。
     /// 封（HMAC）は付けない（Manifest のハッシュで 1 枚ずつ照合するため）。
-    /// 保持者側は v1 と区別できない `[put_key 32][値]` の形のまま。
     /// 担当が居ないときは黙って飛ばさずエラーにする。
     pub async fn put_shard_v2(&self, secret: &SharedSecret, shard: &[u8]) -> Result<u64> {
         let hash = chunk::shard_hash(shard);
-        let targets = self.shard_targets(&hash, secret, 0).await;
-        let Some(&target) = targets.first() else {
-            return Err(AetherError::Config(
-                "Relay directory is empty; cannot place shards".into(),
-            ));
-        };
+        let position = ring::position_of_shard(&hash, secret, 0);
         let mut put = Vec::with_capacity(32 + shard.len());
-        put.extend_from_slice(&sharding::shard_key(&hash, 0));
+        put.extend_from_slice(&sharding::v2_put_key(&hash));
         put.extend_from_slice(shard);
-        self.relay
-            .send_onion_message_typed(wire::PacketType::MailboxPut, &put, target)
-            .await?;
-        Ok(put.len() as u64)
+        self.put_to_holders(position, &put, 1).await
     }
 
     /// v2 のシャードをハッシュで指定して、担当 1 台へ要求する（返信は Inbound Tunnel）
@@ -492,7 +564,7 @@ impl SchrodingerMailbox {
             let Some(&target) = targets.first() else {
                 continue;
             };
-            let request = wire::build_mailbox_get(&sharding::shard_key(hash, 0), &reply_to)?;
+            let request = wire::build_mailbox_get(&sharding::v2_put_key(hash), &reply_to)?;
             self.relay
                 .send_onion_message_typed(wire::PacketType::MailboxGet, &request, target)
                 .await?;
@@ -1190,5 +1262,96 @@ mod tests {
         assert_eq!(restored, data, "size で切ると元のファイル");
         let distinct: std::collections::HashSet<_> = all_hashes.iter().collect();
         assert_eq!(distinct.len(), 9, "埋め草も含めて、データシャードのハッシュはすべて別");
+    }
+
+    fn relay(n: u8) -> crate::net::relay_list::RelayDescriptor {
+        crate::net::relay_list::RelayDescriptor {
+            node_id: NodeId([n; 32]),
+            addr: format!("127.0.0.1:{}", 9000 + u16::from(n)).parse().unwrap(),
+            x25519_pub: [n; 32],
+            pow_nonce: 0,
+            uptime_secs: 0,
+            tier: crate::net::reachability::Tier::Open,
+            issued_at: 0,
+            signature: Vec::new(),
+        }
+    }
+
+    /// 置き先は保持者（leaseSet の枠）の担当で、リレーの K 最近接ではない
+    #[test]
+    fn holder_routes_follow_storage_targets_and_not_the_relay_ring() {
+        use crate::net::lease_set::{solve_slots, LeaseGateway, LeaseSet};
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        // リレー 12 台。受け口に使うのはこのうち 1〜3 番だけ
+        for n in 1..=12u8 {
+            dir.insert_unchecked(relay(n));
+        }
+        let now = crate::protocol::hint::current_timestamp();
+        let mut leases = Vec::new();
+        for i in 0..7u8 {
+            let id = Identity::generate();
+            let gateways = (1..=3u8)
+                .map(|g| LeaseGateway { gateway: NodeId([g; 32]), tunnel_id: [i * 10 + g; 32] })
+                .collect();
+            let lease = LeaseSet::new_signed(&id, solve_slots(&id.public_id().0, 4, 0, 1).unwrap(), gateways, now).unwrap();
+            dir.insert_lease_set(lease.clone()).unwrap();
+            leases.push(lease);
+        }
+        let position = ring::position_of_shard(&[3u8; 32], &[4u8; 32], 2);
+        let routes = holder_routes(&dir, position, 5, &mut rand::thread_rng());
+
+        let want: Vec<[u8; 32]> = dir.storage_targets(position, 5).into_iter().map(|(l, _)| l.sid).collect();
+        let got: Vec<[u8; 32]> = routes.iter().map(|r| r.sid).collect();
+        assert_eq!(got, want, "担当は storage_targets と同じ並び");
+        assert_eq!(got.iter().collect::<std::collections::HashSet<_>>().len(), 5, "SID ごとに 1 人");
+
+        let relay_addrs: std::collections::HashSet<SocketAddr> = (1..=3u8).map(|n| relay(n).addr).collect();
+        for route in &routes {
+            let lease = leases.iter().find(|l| l.sid == route.sid).unwrap();
+            // 受け口は、その leaseSet の gateway と tunnel_id の組をすべて含む（試す順は別）
+            let mut have: Vec<[u8; 32]> = route.inlets.iter().map(|(_, t)| *t).collect();
+            let mut expect: Vec<[u8; 32]> = lease.gateways.iter().map(|g| g.tunnel_id).collect();
+            have.sort();
+            expect.sort();
+            assert_eq!(have, expect);
+            // 送り先は受け口の gateway のアドレスだけ（リング上で近いリレーは使われない）
+            assert!(route.inlets.iter().all(|(a, _)| relay_addrs.contains(a)));
+        }
+        // 担当のリレーを K 最近接で決める旧方式とは無関係（旧方式の先頭 5 台は 1〜3 番に限られない）
+        let old = dir.shard_targets(&[3u8; 32], &[4u8; 32], 2, 5);
+        assert!(old.iter().any(|d| !relay_addrs.contains(&d.addr)) || old.len() < 5);
+    }
+
+    /// 記述子の無い受け口は試す対象に載らない。受け口の順はランダム
+    #[test]
+    fn holder_routes_skip_gateways_without_a_descriptor_and_shuffle_the_rest() {
+        use crate::net::lease_set::{solve_slots, LeaseGateway, LeaseSet};
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        dir.insert_unchecked(relay(1));
+        dir.insert_unchecked(relay(2));
+        let id = Identity::generate();
+        let gateways = vec![
+            LeaseGateway { gateway: NodeId([1; 32]), tunnel_id: [1; 32] },
+            LeaseGateway { gateway: NodeId([2; 32]), tunnel_id: [2; 32] },
+            LeaseGateway { gateway: NodeId([99; 32]), tunnel_id: [3; 32] }, // 一覧に無い
+        ];
+        let lease = LeaseSet::new_signed(
+            &id,
+            solve_slots(&id.public_id().0, 1, 0, 1).unwrap(),
+            gateways,
+            crate::protocol::hint::current_timestamp(),
+        )
+        .unwrap();
+        dir.insert_lease_set(lease).unwrap();
+
+        let position = ring::position_of_shard(&[0u8; 32], &[0u8; 32], 0);
+        let mut firsts = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let routes = holder_routes(&dir, position, 1, &mut rand::thread_rng());
+            assert_eq!(routes.len(), 1);
+            assert_eq!(routes[0].inlets.len(), 2, "記述子の無い受け口は載せない");
+            firsts.insert(routes[0].inlets[0].1);
+        }
+        assert_eq!(firsts.len(), 2, "先頭の受け口は偏らない");
     }
 }

@@ -80,16 +80,40 @@ impl Shard {
     }
 }
 
-/// シャード `i` の保存キー
+/// 保存キーのうち、最上位ビットで分ける「v2 のシャード用」の印
 ///
-/// 位置は `ring::position_of_shard` が決めるが、
-/// Mailbox 上のキーは別途必要（同じノードが複数シャードを持つことがある）。
-pub fn shard_key(mailbox_key: &[u8; 32], index: u8) -> [u8; 32] {
+/// 保持者は、この印が立ったキーの値が `v2_put_key(SHA-256(値)) == キー` を満たすかを確かめる。
+/// 中身のハッシュと板の鍵を知る人が、置かれる前にその置き場所へ別の値を書いておく（先書き）ことを
+/// 防ぐため（Part 25 の P10）。印の無いキーは確かめない（私信・小さなもの・索引以外の v1）。
+pub const V2_KEY_FLAG: u8 = 0x80;
+
+fn shard_key_hash(mailbox_key: &[u8; 32], index: u8) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"aether_shard_key_v1");
     hasher.update(mailbox_key);
     hasher.update([index]);
     hasher.finalize().into()
+}
+
+/// シャード `i` の保存キー（v1。私信・小さなもの用）
+///
+/// 位置は `ring::position_of_shard` が決めるが、
+/// Mailbox 上のキーは別途必要（同じノードが複数シャードを持つことがある）。
+/// **最上位ビットは 0 にする**（1 のキーは v2 のシャードとして中身を確かめられる。[`V2_KEY_FLAG`]）。
+pub fn shard_key(mailbox_key: &[u8; 32], index: u8) -> [u8; 32] {
+    let mut key = shard_key_hash(mailbox_key, index);
+    key[0] &= !V2_KEY_FLAG;
+    key
+}
+
+/// v2 のシャードの保存キー。`shard_hash` はシャードの SHA-256
+///
+/// **最上位ビットを 1 にする**。保持者は値のハッシュからこのキーを導けるかで、置かれるものが
+/// そのシャードかを確かめる。置く側も取る側も、必ずこの関数を使うこと。
+pub fn v2_put_key(shard_hash: &[u8; 32]) -> [u8; 32] {
+    let mut key = shard_key_hash(shard_hash, 0);
+    key[0] |= V2_KEY_FLAG;
+    key
 }
 
 /// シャードを封をして保存形式にする
@@ -354,6 +378,15 @@ mod tests {
 
         let unique: std::collections::HashSet<_> = keys.iter().collect();
         assert_eq!(unique.len(), TOTAL_SHARDS);
+    }
+
+    #[test]
+    fn v1_keys_clear_the_top_bit_and_v2_keys_set_it() {
+        for n in 0..=255u8 {
+            assert_eq!(shard_key(&[n; 32], n)[0] & V2_KEY_FLAG, 0, "v1 のキーの最上位ビットは 0");
+            assert_eq!(v2_put_key(&[n; 32])[0] & V2_KEY_FLAG, V2_KEY_FLAG, "v2 のキーの最上位ビットは 1");
+        }
+        assert_ne!(v2_put_key(&[1; 32]), v2_put_key(&[2; 32]));
     }
 
     #[test]
