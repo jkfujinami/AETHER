@@ -271,6 +271,7 @@ fn privacy_of(cli: &Cli) -> PrivacyOptions {
         delay_release: !cli.no_release_delay,
         // CLI は会話の平文を端末に残さない（受信は表示するだけ）
         save_talk_history: false,
+        pad_file_size: true,
     }
 }
 

@@ -192,8 +192,14 @@ fn route_reply(
 
 /// このストライプで今要求するシャードのハッシュ
 ///
-/// まずデータ k 個、`with_parity` ならパリティ m 個も。届いた位置、すでに要求したハッシュ
-/// （他のストライプや前の段で）は含めない ── 同じハッシュを二度要求しない。
+/// `with_parity` でなければ（ストライプの開始）、**データ k 個の位置すべてを 1 位置 1 要求**で出す。
+/// 同じハッシュでもまとめず、他のストライプの返信で埋まった位置も要求する ── ファイルの中に
+/// 同じ中身のチャンク（ディスクイメージのゼロ領域など）があっても、取る量が置いた量
+/// （切り上げた大きさ）より減らないようにするため（ガードに取った量から大きさを絞らせない）。
+/// 遅れて届く重複した返信は [`route_reply`] が捨てる。
+///
+/// `with_parity` なら（`HEDGE_1` 後）パリティ m 個のうち、まだ埋まっていない位置だけ。
+/// すでに要求したハッシュ（返信がもうすぐ来る）は含めない。
 fn stripe_requests(
     stripe: &StripeV2,
     state: &StripeState,
@@ -201,12 +207,13 @@ fn stripe_requests(
     with_parity: bool,
 ) -> Vec<[u8; 32]> {
     let k = stripe.data as usize;
-    let end = if with_parity { stripe.shard_hashes.len() } else { k };
-    let mut seen = HashSet::new();
-    (0..end)
+    if !with_parity {
+        return stripe.shard_hashes[..k].to_vec();
+    }
+    (k..stripe.shard_hashes.len())
         .filter(|&pos| state.got.get(pos).is_some_and(Option::is_none))
         .map(|pos| stripe.shard_hashes[pos])
-        .filter(|h| !requested.contains(h) && seen.insert(*h))
+        .filter(|h| !requested.contains(h))
         .collect()
 }
 
@@ -608,29 +615,32 @@ mod tests {
     }
 
     #[test]
-    fn requests_ask_data_first_then_parity_without_duplicates() {
-        let (a, b, p) = ([1u8; 32], [2u8; 32], [4u8; 32]);
-        // データ k=3（a が 2 か所で重複）、パリティ 1
-        let stripe = stripe_of(vec![a, b, a, p], 3);
+    fn requests_ask_every_data_position_then_only_unfilled_parity() {
+        let (a, b, p, q) = ([1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32]);
+        // データ k=3（a が 2 か所で同じ中身）、パリティ 2
+        let stripe = stripe_of(vec![a, b, a, p, q], 3);
         let mut state = state_for(&stripe);
         let mut requested = HashSet::new();
         let data = stripe_requests(&stripe, &state, &requested, false);
-        assert_eq!(data, vec![a, b], "データだけ・重複は 1 回");
-        requested.extend(data.iter().copied());
-        let parity = stripe_requests(&stripe, &state, &requested, true);
-        assert_eq!(parity, vec![p], "要求済みは除き、パリティを足す");
-        // 届いた位置は要求しない
+        assert_eq!(data, vec![a, b, a], "同じハッシュでも位置ごとに 1 要求（データ k 位置ぶん）");
+        // 他のストライプの返信で埋まった位置・要求済みでも、開始時はデータ k 位置すべてを要求する
         state.got[1] = Some(vec![]);
-        assert!(stripe_requests(&stripe, &state, &HashSet::new(), false).iter().all(|h| *h != b));
+        requested.extend(data.iter().copied());
+        assert_eq!(stripe_requests(&stripe, &state, &requested, false), vec![a, b, a]);
+        // パリティは、まだ埋まっていない位置だけ（要求済みのハッシュは除く）
+        assert_eq!(stripe_requests(&stripe, &state, &requested, true), vec![p, q]);
+        state.got[3] = Some(vec![]);
+        assert_eq!(stripe_requests(&stripe, &state, &requested, true), vec![q], "届いた位置は要求しない");
+        requested.insert(q);
+        assert!(stripe_requests(&stripe, &state, &requested, true).is_empty());
     }
 
     #[test]
     fn v2_pipeline_restores_a_file_from_partial_shards() {
         // 置く側の純粋な部分（レイアウトとストライプの組み立て）→ 取る側の振り分けと復元
-        let size = (2 * 16 + 3) as u64 * chunk::V2_CHUNK_PLAIN as u64 - 1234;
-        let shapes = chunk::v2_stripe_shapes(size).unwrap();
+        let chunks = 2 * 16 + 3;
+        let shapes = chunk::v2_stripe_shapes(chunks).unwrap();
         assert_eq!(shapes.len(), 3, "2 本 + 短い 3 本目");
-        let chunks = chunk::v2_chunk_count(size);
         let mut objects: Vec<Vec<u8>> = (0..chunks)
             .map(|i| {
                 let len = if i + 1 == chunks { 4321 } else { chunk::V2_SHARD_BYTES };

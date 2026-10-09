@@ -137,6 +137,7 @@ function readSettings() {
       delay_fetch: $("delay-fetch").checked,
       delay_release: $("delay-release").checked,
       save_talk_history: $("save-talk-history").checked,
+      pad_file_size: $("pad-file-size").checked,
     },
   };
 }
@@ -151,6 +152,7 @@ function fillSettings(s) {
   $("delay-fetch").checked = p.delay_fetch ?? true;
   $("delay-release").checked = p.delay_release ?? true;
   $("save-talk-history").checked = p.save_talk_history ?? true;
+  $("pad-file-size").checked = p.pad_file_size ?? true;
   updateModeRows();
 }
 
@@ -165,7 +167,7 @@ async function saveSettings() {
 }
 
 // 匿名性の切り替えは押したらすぐ保存する（接続中なら次の送受信から効く）
-for (const id of ["delay-fetch", "delay-release", "save-talk-history"]) {
+for (const id of ["delay-fetch", "delay-release", "save-talk-history", "pad-file-size"]) {
   $(id).addEventListener("change", async () => {
     if (await saveSettings()) toast(state.connected ? "変更しました（次の送受信から効きます）" : "保存しました");
   });

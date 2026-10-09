@@ -380,6 +380,11 @@ impl SchrodingerMailbox {
     /// （[`place_object`](Self::place_object)）で置く。同じ中身のチャンクは収束暗号で同じシャード・
     /// 同じハッシュになり、2 回目の put は保持者が同じ値として受ける。
     ///
+    /// `pad` なら、チャンク数を 2 倍刻みに切り上げ（[`chunk::padded_chunk_count`]）、足した分は
+    /// ファイルごとに別の中身の埋め草のチャンクにして**本物の後ろに**置く
+    /// （[`chunk::pad_chunk_plain`]）。`size` は本当の大きさのまま ── 取る側は復元後に `size` で
+    /// 切るので埋め草は落ちる。Manifest は暗号化されていて、ガードには見えない。
+    ///
     /// Manifest が 1 オブジェクトに収まらない大きさは、何も送らずにエラーにする。
     /// **互換は無い**（v1 の形では置かない）。公開コンテンツ専用。
     pub async fn place_file_v2(
@@ -387,11 +392,15 @@ impl SchrodingerMailbox {
         secret: &SharedSecret,
         name: &str,
         data: &[u8],
+        pad: bool,
     ) -> Result<([u8; 32], UploadProfile)> {
+        use sha2::Digest;
         let started = Instant::now();
         let size = data.len() as u64;
-        // 送る前に確かめる（途中まで置いて断ることのないように）
-        let sealed_len = chunk::manifest_v2_sealed_len(name.len(), size)?;
+        // 送る前に確かめる（途中まで置いて断ることのないように）。切り上げた後のチャンク数で数える
+        let total_chunks = chunk::v2_layout_chunks(name.len(), size, pad)?;
+        let shapes = chunk::v2_stripe_shapes(total_chunks)?;
+        let sealed_len = chunk::manifest_v2_sealed_len(name.len(), total_chunks)?;
         if sealed_len > chunk::SINGLE_BODY_LIMIT {
             return Err(AetherError::Config(format!(
                 "File too large for a single v2 manifest ({} bytes sealed, max {})",
@@ -399,15 +408,17 @@ impl SchrodingerMailbox {
                 chunk::SINGLE_BODY_LIMIT
             )));
         }
-        let shapes = chunk::v2_stripe_shapes(size)?;
+        let file_hash: [u8; 32] = Sha256::digest(data).into();
 
         let mut sent_bytes: u64 = 0;
         let mut stripes = Vec::with_capacity(shapes.len());
-        let mut pieces = data.chunks(chunk::V2_CHUNK_PLAIN);
+        let mut next_index: usize = 0;
         for (k, m) in shapes {
             let mut objects = Vec::with_capacity(k);
-            for piece in pieces.by_ref().take(k) {
-                objects.push(self.seal_chunk(secret, piece)?.1);
+            for _ in 0..k {
+                let plain = v2_chunk_plain(secret, data, &file_hash, next_index, pad);
+                objects.push(self.seal_chunk(secret, &plain)?.1);
+                next_index += 1;
             }
             let built = sharding_v2::build_stripe(&objects, m)?;
             drop(objects);
@@ -1039,6 +1050,28 @@ impl SchrodingerMailbox {
     }
 }
 
+/// v2 の `index` 番目のチャンクの平文（本物、または埋め草）
+///
+/// 本物の後ろに埋め草を続けるので、`pad` のときは短い最後の本物のチャンクもゼロで満杯にする
+/// （ストライプの途中に短いオブジェクトを置けない）。取る側は復元後に `size` で切るので落ちる。
+fn v2_chunk_plain(
+    secret: &SharedSecret,
+    data: &[u8],
+    file_hash: &[u8; 32],
+    index: usize,
+    pad: bool,
+) -> Vec<u8> {
+    let start = index * chunk::V2_CHUNK_PLAIN;
+    if start >= data.len() {
+        return chunk::pad_chunk_plain(secret, file_hash, index as u32);
+    }
+    let mut plain = data[start..(start + chunk::V2_CHUNK_PLAIN).min(data.len())].to_vec();
+    if pad {
+        plain.resize(chunk::V2_CHUNK_PLAIN, 0);
+    }
+    plain
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1100,7 +1133,7 @@ mod tests {
 
         let mut restored = Vec::new();
         let mut pieces = data.chunks(chunk::V2_CHUNK_PLAIN);
-        for (k, m) in chunk::v2_stripe_shapes(size as u64).unwrap() {
+        for (k, m) in chunk::v2_stripe_shapes(chunk::v2_chunk_count(size as u64)).unwrap() {
             let objects: Vec<Vec<u8>> = pieces
                 .by_ref()
                 .take(k)
@@ -1120,5 +1153,42 @@ mod tests {
             }
         }
         assert_eq!(restored, data);
+    }
+
+    /// 切り上げて置いた形（本物 + 埋め草）が、ストライプに組めて、元のファイルに戻る
+    #[tokio::test]
+    async fn v2_padded_layout_builds_stripes_and_restores_the_file() {
+        use sha2::Digest;
+        let mailbox = create_dummy_mailbox();
+        let secret = [9u8; 32];
+        let size = 4 * chunk::V2_CHUNK_PLAIN + 777; // 5 チャンク → 8 に切り上げ
+        let data: Vec<u8> = (0..size).map(|i| (i * 13 % 247) as u8).collect();
+        let hash: [u8; 32] = Sha256::digest(&data).into();
+        let total = chunk::v2_layout_chunks(5, size as u64, true).unwrap();
+        assert_eq!(total, 8);
+
+        let mut restored = Vec::new();
+        let mut index = 0;
+        let mut all_hashes = Vec::new();
+        for (k, m) in chunk::v2_stripe_shapes(total).unwrap() {
+            let objects: Vec<Vec<u8>> = (0..k)
+                .map(|_| {
+                    let plain = v2_chunk_plain(&secret, &data, &hash, index, true);
+                    index += 1;
+                    mailbox.seal_chunk(&secret, &plain).unwrap().1
+                })
+                .collect();
+            let built = sharding_v2::build_stripe(&objects, m).unwrap();
+            all_hashes.extend(built.stripe.shard_hashes[..k].iter().copied());
+            let got: Vec<Option<Vec<u8>>> = built.shards.iter().cloned().map(Some).collect();
+            for object in sharding_v2::restore_stripe(&built.stripe, &got).unwrap() {
+                restored.extend(mailbox.decrypt_mailbox_value(&object, &secret).unwrap());
+            }
+        }
+        assert_eq!(restored.len(), 8 * chunk::V2_CHUNK_PLAIN);
+        restored.truncate(size);
+        assert_eq!(restored, data, "size で切ると元のファイル");
+        let distinct: std::collections::HashSet<_> = all_hashes.iter().collect();
+        assert_eq!(distinct.len(), 8, "埋め草も含めて、データシャードのハッシュはすべて別");
     }
 }

@@ -200,8 +200,11 @@ impl AetherClient {
         let target = board_target(&k_pub);
 
         // 大きなファイルは、Manifest が 1 オブジェクトに収まる大きさまで。回路を組む前に、何も送らず断る
+        // （切り上げた後のチャンク数で数える。頭打ちは上限なので、切り上げで断る範囲は変わらない）
+        let pad = self.privacy().pad_file_size;
         if chunk::needs_chunking(post.content.len()) {
-            let fits = chunk::manifest_v2_sealed_len(post.name.len(), post.content.len() as u64)
+            let fits = chunk::v2_layout_chunks(post.name.len(), post.content.len() as u64, pad)
+                .and_then(|chunks| chunk::manifest_v2_sealed_len(post.name.len(), chunks))
                 .is_ok_and(|n| n <= chunk::SINGLE_BODY_LIMIT);
             if !fits {
                 let max = chunk::max_file_size_v2(post.name.len());
@@ -218,7 +221,8 @@ impl AetherClient {
         let mailbox = self.sending_mailbox(body_c, hint_c, target, k_pub);
 
         let report = if chunk::needs_chunking(post.content.len()) {
-            let (content_ref, profile) = mailbox.place_file_v2(&k_pub, &post.name, &post.content).await?;
+            let (content_ref, profile) = mailbox.place_file_v2(&k_pub, &post.name, &post.content, pad).await?;
+            // 利用者に見せるのは本当のチャンク数（埋め草は含めない）
             let chunks = chunk::v2_chunk_count(post.content.len() as u64);
             events::progress(
                 &self.events,

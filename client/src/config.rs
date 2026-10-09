@@ -48,6 +48,15 @@ pub struct PrivacyOptions {
     /// 書かれた位置に並ぶ（[`crate::talks`]）。代わりに会話の平文が端末に残る
     /// （パスフレーズがあれば暗号化される）。切ると親を付けずに送る。
     pub save_talk_history: bool,
+    /// 自分が上げるファイルの大きさを 2 倍刻みに切り上げて置く（既定: 有効）
+    ///
+    /// ガードは自分のクライアントが置いた量・取った量を見ている。大きさがそのまま出ると、
+    /// 公開ファイルが多い網では 1 回の取得から候補がごく少数に絞られる（Part 24 の L5）。
+    /// チャンク数を `max(4, 2 の冪)` に増やし、足した分はファイルごとに別の中身の埋め草にする。
+    /// **効くのは置く側だけ**: 取る人は置かれた形（埋め草込み）をそのまま全部取るので、
+    /// 上げた人がこれを切っていれば、取る人の量からも大きさが出る。
+    /// 代わりに、上り・保存と、取る人の下りが最大 2 倍（平均 1.4 倍）になる。切ると切り上げも埋め草もしない。
+    pub pad_file_size: bool,
 }
 
 impl Default for PrivacyOptions {
@@ -56,6 +65,7 @@ impl Default for PrivacyOptions {
             delay_fetch: true,
             delay_release: true,
             save_talk_history: true,
+            pad_file_size: true,
         }
     }
 }
@@ -116,5 +126,24 @@ impl Default for RelayOptions {
             pow_difficulty: aether_core::crypto::pow::node_id::DEFAULT_DIFFICULTY,
             epoch_beacon: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_privacy_json_without_pad_file_size_still_loads_with_default_on() {
+        // 切り替えを足す前に保存された設定（pad_file_size が無い）でも読め、既定の有効になる
+        let old = r#"{"delay_fetch":false,"delay_release":true,"save_talk_history":false}"#;
+        let p: PrivacyOptions = serde_json::from_str(old).unwrap();
+        assert!(p.pad_file_size, "無い項目は既定（有効）");
+        assert!(!p.delay_fetch && !p.save_talk_history, "あった項目はそのまま");
+        // 空の設定でも読める
+        assert_eq!(serde_json::from_str::<PrivacyOptions>("{}").unwrap(), PrivacyOptions::default());
+        // 明示的に切った値は保たれる
+        let off: PrivacyOptions = serde_json::from_str(r#"{"pad_file_size":false}"#).unwrap();
+        assert!(!off.pad_file_size);
     }
 }
