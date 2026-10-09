@@ -39,6 +39,8 @@ pub struct AetherClient {
     pub(crate) suspects: crate::circuit::Suspects,
     /// 自分の送受信の量（試験と診断用。網には出さない）
     pub(crate) traffic: Arc<aether_core::net::relay::TrafficCounter>,
+    /// 一周確認済みの回路の待機場所（クライアントごと。1 本は 1 回の操作で使い捨てる）
+    pub(crate) circuit_pool: tokio::sync::Mutex<Vec<crate::pull::PooledCircuit>>,
 }
 
 impl AetherClient {
@@ -219,7 +221,7 @@ impl AetherClient {
 
         let guards = GuardSet::load(&keys.guard_path())?;
 
-        Ok(Arc::new(Self {
+        let client = Arc::new(Self {
             keys,
             node,
             guards: tokio::sync::Mutex::new(guards),
@@ -232,7 +234,11 @@ impl AetherClient {
             receiver: std::sync::Mutex::new(None),
             suspects: Default::default(),
             traffic: Default::default(),
-        }))
+            circuit_pool: Default::default(),
+        });
+        // 一回限りでも動かす（CLI の send/get も待たずに済む）
+        client.spawn_circuit_pool_refill();
+        Ok(client)
     }
 
     /// イベントを購読する

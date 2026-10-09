@@ -264,15 +264,15 @@ impl AetherClient {
     /// **どちらも一周の疎通確認を通したものを使う。** 入口へ書けた時点で送信は成功扱いに
     /// なるので、中間や出口が落ちていると本体や Hint が黙って消える（送り手には見えない）。
     async fn body_and_hint_circuits(&self) -> Result<(Circuit, Circuit)> {
-        let body = self.open_probed_circuit(&[]).await?.circuit;
-        let hint = match self.open_probed_circuit(&[body.exit.node_id]).await {
+        let body = self.take_probed_circuit(&[]).await?.circuit;
+        let hint = match self.take_probed_circuit(&[body.exit.node_id]).await {
             Ok(c) => c.circuit,
             Err(_) => {
                 events::warning(
                     &self.events,
                     "他に使える出口が無いため、本体と Hint が同じ出口を通ります（相関リスク）",
                 );
-                self.open_probed_circuit(&[]).await?.circuit
+                self.take_probed_circuit(&[]).await?.circuit
             }
         };
         events::progress(
