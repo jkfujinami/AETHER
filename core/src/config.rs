@@ -74,7 +74,8 @@ impl Default for Config {
                 "stun1.l.google.com:19302".into(),
             ],
 
-            mailbox_capacity_mb: 100,
+            // 1GiB。小物の枠 20%・大物の枠 80% に分けて使う（Part 23 の 11・12 章）
+            mailbox_capacity_mb: 1024,
             message_ttl_hours: 168, // 1 week
             pow_difficulty: 10,
             node_id_pow_difficulty: crate::crypto::pow::node_id::DEFAULT_DIFFICULTY,
