@@ -76,8 +76,12 @@ impl Tier {
     }
 
     /// 見知らぬ相手からの inbound を受けられるか
+    ///
+    /// **Tier 0 だけ。** 穴あけの開始側が未配線で、Punchable のノードは
+    /// 回路・保持者に選ばれても届かず、送ったものが黙って消える。
+    /// 穴あけの開始側を配線したら Punchable を戻す（Part 25 の N1）。
     pub fn accepts_strangers(&self) -> bool {
-        matches!(self, Tier::Open | Tier::Punchable)
+        matches!(self, Tier::Open)
     }
 }
 
@@ -340,9 +344,12 @@ mod tests {
     }
 
     #[test]
-    fn reversed_tier_does_not_accept_strangers() {
+    fn only_open_tier_accepts_strangers() {
         assert!(Tier::Open.accepts_strangers());
-        assert!(Tier::Punchable.accepts_strangers());
+        assert!(
+            !Tier::Punchable.accepts_strangers(),
+            "穴あけの開始側が未配線の間、届かない Tier 1 を選ばない"
+        );
         assert!(
             !Tier::Reversed.accepts_strangers(),
             "到達不能ノードを見知らぬ相手の受け口にすると届かない"
