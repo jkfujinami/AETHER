@@ -106,7 +106,21 @@ pub struct Res {
     pub body: Vec<Segment>,
     /// 本文を取れなかった（保持者が居ない）
     pub missing: bool,
+    /// 添付ファイル（あれば本文は空。中身は保存するときに取る）
+    pub file: Option<FileRef>,
 }
+
+/// 書き込みに添えられたファイル（索引の記述子から分かる範囲）
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FileRef {
+    /// 投稿者が付けた名前。**網から来た値なので信用しない**（保存名は [`safe_file_name`] を通す）
+    pub name: String,
+    /// 元の大きさ（バイト）
+    pub size: u64,
+}
+
+/// 添付ファイル名の上限（バイト）。Manifest に入り、保存名の上限にも揃える
+pub const MAX_FILE_NAME_BYTES: usize = 255;
 
 /// 本文の断片
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -402,35 +416,16 @@ impl AetherClient {
         }
 
         let refs: Vec<String> = members.iter().map(|d| hex::encode(d.content_ref)).collect();
-        let content_refs: Vec<[u8; 32]> = members.iter().map(|d| d.content_ref).collect();
-        let bodies = self.get_bodies(board, &content_refs).await?;
+        // ファイル（チャンク化された記述子）の本体は取りに行かない。保存するときに取る
+        let text_idx: Vec<usize> = (0..members.len()).filter(|&i| !members[i].chunked).collect();
+        let content_refs: Vec<[u8; 32]> = text_idx.iter().map(|&i| members[i].content_ref).collect();
+        let fetched = self.get_bodies(board, &content_refs).await?;
+        let mut bodies: Vec<Option<Vec<u8>>> = vec![None; members.len()];
+        for (&i, b) in text_idx.iter().zip(fetched) {
+            bodies[i] = b;
+        }
 
-        let mut thread_id: Option<[u8; 32]> = None;
-        let posts = members
-            .iter()
-            .zip(bodies)
-            .enumerate()
-            .map(|(i, (d, body))| {
-                let (thread, text, id) = match &body {
-                    Some(b) => open(b),
-                    None => (None, String::new(), None),
-                };
-                if i == 0 {
-                    thread_id = thread;
-                }
-                // 別スレの識別子で署名された書き込みの ID は見せない（ID の持ち込み防止）
-                let id = if thread.is_some() && thread == thread_id { id } else { None };
-                Res {
-                    no: i + 1,
-                    content_ref: refs[i].clone(),
-                    name: ANONYMOUS_NAME.to_string(),
-                    id,
-                    timestamp: d.timestamp,
-                    body: render_body(&text, &refs),
-                    missing: body.is_none(),
-                }
-            })
-            .collect();
+        let (posts, thread_id) = build_posts(&members, bodies, &refs);
 
         // 素の本文で立ったスレは根の ref をスレ識別子にする
         let thread = thread_id.unwrap_or(root);
@@ -518,6 +513,163 @@ impl AetherClient {
         refs.push(content_ref.clone());
         Ok(own_res(refs.len(), &content_ref, &secret, &stored, &refs))
     }
+
+    /// スレにファイルを添付する（スレの根を親にして、常に v2 で置く）
+    ///
+    /// `ticket` を付けると、進み具合が `SendStatus` で流れる（書き込みの吹き出しと対応させる）。
+    /// 返り値は自分のレス。呼び出し側は `ctx.refs` にその ref を足してから次の書き込みに使う。
+    pub async fn bbs_attach_file(
+        &self,
+        board: &BoardId,
+        ctx: &ReplyContext,
+        name: &str,
+        content: Vec<u8>,
+        ticket: u64,
+    ) -> Result<Res> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ClientError::invalid("ファイル名を入れてください"));
+        }
+        if name.len() > MAX_FILE_NAME_BYTES {
+            return Err(ClientError::invalid(format!(
+                "ファイル名が長すぎます（{} バイトまで）",
+                MAX_FILE_NAME_BYTES
+            )));
+        }
+        let size = content.len() as u64;
+        let root = crate::parse_hex32(&ctx.root_ref, "スレの ref")?;
+        let report = self
+            .publish_file(board, name, content, vec![root], Some(ticket))
+            .await?;
+        let content_ref = report
+            .content_ref
+            .ok_or_else(|| ClientError::invalid("ファイルの ref を得られませんでした"))?;
+        Ok(Res {
+            no: ctx.refs.len() + 1,
+            content_ref,
+            name: ANONYMOUS_NAME.to_string(),
+            id: None,
+            timestamp: aether_core::protocol::hint::current_timestamp(),
+            body: Vec::new(),
+            missing: false,
+            file: Some(FileRef {
+                name: name.to_string(),
+                size,
+            }),
+        })
+    }
+}
+
+/// 記述子と取れた本文から、レスの並びを組み立てる（網に触らない部分）
+///
+/// `bodies[i]` は `members[i]` の本文。ファイル（`chunked`）の本体は取らないので `None` でよく、
+/// その場合 `missing` にはしない。返すのはレスと、根の書き込みが持っていたスレの識別子。
+fn build_posts(
+    members: &[&IndexDescriptor],
+    bodies: Vec<Option<Vec<u8>>>,
+    refs: &[String],
+) -> (Vec<Res>, Option<[u8; 32]>) {
+    let mut thread_id: Option<[u8; 32]> = None;
+    let posts = members
+        .iter()
+        .zip(bodies)
+        .enumerate()
+        .map(|(i, (d, body))| {
+            if d.chunked {
+                return Res {
+                    no: i + 1,
+                    content_ref: refs[i].clone(),
+                    name: ANONYMOUS_NAME.to_string(),
+                    id: None,
+                    timestamp: d.timestamp,
+                    body: Vec::new(),
+                    missing: false,
+                    file: Some(FileRef {
+                        name: visible_name(&d.name),
+                        size: d.size,
+                    }),
+                };
+            }
+            let (thread, text, id) = match &body {
+                Some(b) => open(b),
+                None => (None, String::new(), None),
+            };
+            if i == 0 {
+                thread_id = thread;
+            }
+            // 別スレの識別子で署名された書き込みの ID は見せない（ID の持ち込み防止）
+            let id = if thread.is_some() && thread == thread_id { id } else { None };
+            Res {
+                no: i + 1,
+                content_ref: refs[i].clone(),
+                name: ANONYMOUS_NAME.to_string(),
+                id,
+                timestamp: d.timestamp,
+                body: render_body(&text, refs),
+                missing: body.is_none(),
+                file: None,
+            }
+        })
+        .collect();
+    (posts, thread_id)
+}
+
+/// 保存するファイル名を無害にする（網から来た名前は信用しない）
+///
+/// パス区切り・制御文字・`..`・先頭の `.` を除き、Windows の予約名を避け、
+/// 255 バイトに切り詰める（UTF-8 の境界は壊さない）。空になれば `aether-file`。
+/// 書字方向の制御文字とゼロ幅の文字を除く（表示と保存名の両方に使う）
+///
+/// `photo\u{202E}gpj.exe` は `photoexe.jpg` に見える。網から来た名前で実行ファイルを画像に
+/// 見せかけられないよう、見えない文字は落とす。
+pub fn visible_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| {
+            !matches!(c,
+                '\u{200B}'..='\u{200F}' // ゼロ幅・LRM/RLM
+                | '\u{202A}'..='\u{202E}' // 埋め込み・上書き
+                | '\u{2060}'..='\u{2069}' // 単語結合子・分離子
+                | '\u{FEFF}')
+        })
+        .collect()
+}
+
+pub fn safe_file_name(name: &str) -> String {
+    const FALLBACK: &str = "aether-file";
+    let cleaned: String = visible_name(name)
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .collect();
+    let cleaned = cleaned.replace("..", "");
+    // 先頭の `.`（隠しファイル）と、Windows が嫌う末尾の `.`・空白を落とす
+    let cleaned = cleaned.trim_start_matches('.').trim_end_matches(['.', ' ']).trim_start();
+    let mut out = String::new();
+    for c in cleaned.chars() {
+        if out.len() + c.len_utf8() > MAX_FILE_NAME_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    let out = out.trim_end_matches(['.', ' ']).to_string();
+    if out.is_empty() {
+        return FALLBACK.to_string();
+    }
+    // 予約名は拡張子を除いた部分で判定する（`CON.txt` も不可）
+    let stem = out.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|p| {
+            stem.strip_prefix(p)
+                .is_some_and(|d| d.len() == 1 && matches!(d.as_bytes()[0], b'1'..=b'9'))
+        });
+    if reserved {
+        // 切り詰めた上限を超えないよう、先頭に足す前に収める
+        let mut prefixed = format!("_{}", out);
+        while prefixed.len() > MAX_FILE_NAME_BYTES {
+            prefixed.pop();
+        }
+        return prefixed;
+    }
+    out
 }
 
 /// 自分の書き込みを、網から読み直さずにレスとして組み立てる
@@ -536,6 +688,7 @@ fn own_res(
         timestamp: aether_core::protocol::hint::current_timestamp(),
         body: render_body(stored_body, refs),
         missing: false,
+        file: None,
     }
 }
 
@@ -682,5 +835,80 @@ mod tests {
         keys.thread_secret(&[1u8; 32]).unwrap();
 
         assert!(!keys.legacy_bbs_key_path().exists(), "廃止した端末単位の秘密を消していない");
+    }
+
+    fn desc(r: u8, name: &str, size: u64, ts: u64, chunked: bool) -> IndexDescriptor {
+        IndexDescriptor {
+            content_ref: [r; 32],
+            name: name.to_string(),
+            size,
+            timestamp: ts,
+            chunked,
+            parents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn chunked_descriptor_becomes_a_file_without_a_body() {
+        let sealed = seal(&[1u8; 32], [10u8; 32], "本文".into());
+        let root = desc(1, "スレタイ", 0, 10, false);
+        let file = desc(2, "写真.jpg", 123_456, 20, true);
+        let reply = desc(3, "", 0, 30, false);
+        let members = [&root, &file, &reply];
+        let refs: Vec<String> = members.iter().map(|d| hex::encode(d.content_ref)).collect();
+        let bodies = vec![Some(sealed.clone()), None, Some(sealed)];
+        let (posts, thread) = build_posts(&members, bodies, &refs);
+        assert!(thread.is_some());
+        assert_eq!(posts.iter().map(|p| p.no).collect::<Vec<_>>(), vec![1, 2, 3]);
+        let f = &posts[1];
+        assert_eq!(f.file, Some(FileRef { name: "写真.jpg".into(), size: 123_456 }));
+        assert!(!f.missing && f.body.is_empty() && f.id.is_none());
+        assert!(posts[0].file.is_none() && posts[2].file.is_none());
+        assert!(posts[2].id.is_some(), "ファイルを挟んでも後のレスの ID は付く");
+    }
+
+    #[test]
+    fn missing_text_body_is_still_marked_missing() {
+        let d = desc(1, "t", 0, 1, false);
+        let (posts, _) = build_posts(&[&d], vec![None], &[hex::encode(d.content_ref)]);
+        assert!(posts[0].missing && posts[0].file.is_none());
+    }
+
+    #[test]
+    fn bidi_overrides_cannot_disguise_a_file_name() {
+        assert_eq!(visible_name("photo\u{202E}gpj.exe"), "photogpj.exe");
+        assert_eq!(safe_file_name("a\u{200B}b\u{2066}c\u{FEFF}.txt"), "abc.txt");
+    }
+
+    #[test]
+    fn safe_file_name_removes_path_tricks() {
+        assert_eq!(safe_file_name("../../etc/passwd"), "etcpasswd");
+        assert_eq!(safe_file_name("a\\b/c.txt"), "abc.txt");
+        assert_eq!(safe_file_name(".bashrc"), "bashrc");
+        assert_eq!(safe_file_name("..."), "aether-file");
+        assert_eq!(safe_file_name("a\u{0}b\n\u{7}.txt"), "ab.txt");
+        assert_eq!(safe_file_name(""), "aether-file");
+        assert_eq!(safe_file_name("写真 1.jpg"), "写真 1.jpg");
+    }
+
+    #[test]
+    fn safe_file_name_avoids_windows_reserved_names() {
+        assert_eq!(safe_file_name("CON"), "_CON");
+        assert_eq!(safe_file_name("nul.txt"), "_nul.txt");
+        assert_eq!(safe_file_name("COM1.log"), "_COM1.log");
+        assert_eq!(safe_file_name("lpt9"), "_lpt9");
+        assert_eq!(safe_file_name("COM0"), "COM0");
+        assert_eq!(safe_file_name("console.txt"), "console.txt");
+        assert_eq!(safe_file_name("name."), "name");
+    }
+
+    #[test]
+    fn safe_file_name_truncates_on_a_char_boundary() {
+        let long = "あ".repeat(200);
+        let out = safe_file_name(&long);
+        assert!(out.len() <= MAX_FILE_NAME_BYTES);
+        assert!(out.chars().all(|c| c == 'あ') && out.len() == 255 / 3 * 3);
+        let reserved_long = format!("CON{}", "x".repeat(300));
+        assert!(safe_file_name(&reserved_long).len() <= MAX_FILE_NAME_BYTES);
     }
 }

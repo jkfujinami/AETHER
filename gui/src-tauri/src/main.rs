@@ -12,6 +12,7 @@ use tauri::Manager;
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // 鍵・Mailbox・ガードの置き場所。OS のアプリ用データ領域に置く
             let data_dir = app.path().app_data_dir()?.join("aether-data");
@@ -33,6 +34,8 @@ fn main() {
             commands::bbs_open_thread,
             commands::bbs_new_thread,
             commands::bbs_reply,
+            commands::bbs_attach_file,
+            commands::bbs_save_file,
             commands::friends,
             commands::add_friend,
             commands::remove_friend,

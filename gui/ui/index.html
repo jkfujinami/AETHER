@@ -175,8 +175,21 @@
               <form class="write" id="write-form">
                 <div class="bbs-note">名前：名無しさん　（レス番号を押すと &gt;&gt;n を挿入します）</div>
                 <textarea id="write-body" rows="5" required></textarea>
-                <button type="submit">書き込む</button>
+                <div class="write-buttons">
+                  <button type="submit">書き込む</button>
+                  <button type="button" id="btn-attach">ファイルを添付</button>
+                </div>
               </form>
+              <form class="write attach" id="attach-form" hidden>
+                <label for="attach-name">ファイル名（空なら元のファイル名）</label>
+                <input type="text" id="attach-name" maxlength="200" autocomplete="off">
+                <div class="bbs-note">ファイル名は板の読者全員に見えます。写真の位置情報などのメタデータは消えません</div>
+                <div class="write-buttons">
+                  <button type="submit">ファイルを選んで添付</button>
+                  <button type="button" id="btn-attach-cancel">やめる</button>
+                </div>
+              </form>
+              <div class="bbs-note" id="attach-status" hidden></div>
             </div>
           </div>
         </div>

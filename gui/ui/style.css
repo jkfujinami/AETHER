@@ -180,6 +180,11 @@ button:disabled { opacity: .5; cursor: default; }
 .new-thread label { font-weight: 400; margin: 0; }
 .new-thread textarea, .write textarea { width: 100%; }
 .write button { align-self: flex-start; }
+.write-buttons { display: flex; gap: 8px; }
+.write.attach { border-top: 0; padding-top: 0; }
+#attach-status { max-width: 640px; margin-top: 8px; }
+.posts dd.file { white-space: normal; }
+.posts dd .file-save { margin-left: 8px; }
 .back { display: inline-block; margin-bottom: 4px; }
 .posts { margin: 0 0 24px; }
 .posts dt { margin-top: 14px; }
