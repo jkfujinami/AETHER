@@ -276,6 +276,7 @@ impl AetherClient {
             known_relays: self.node.directory_size().await,
             stored_entries: self.node.mailbox().len(),
             relay_mode: self.relay_mode,
+            newer_protocol: self.node.newer_protocol_seen(),
         }
     }
 
@@ -377,6 +378,8 @@ pub struct Status {
     pub known_relays: usize,
     pub stored_entries: usize,
     pub relay_mode: bool,
+    /// 自分より新しいプロトコルの版のノードを見かけたら、その版（更新の案内に使う）
+    pub newer_protocol: Option<u8>,
 }
 
 /// 板の鍵から contacts マップ用の合成 NodeId を作る

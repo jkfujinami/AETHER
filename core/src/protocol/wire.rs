@@ -4,8 +4,13 @@ use crate::error::{Result, AetherError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use std::net::SocketAddr;
 use crate::net::tunnel::TunnelEndpoint;
+use crate::protocol::PROTOCOL_VERSION;
 
 pub const MAGIC: u32 = 0xAE74E201;
+
+/// 枠の印。長さの次の 1 バイトがこれでなければ、版の無い旧形式とみなす。
+/// 旧形式ではここが種別で、`PacketType` のどの番号とも重ならない（最大でも 0xF0）。
+pub const FRAME_MARK: u8 = 0xAE;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[repr(u8)]
@@ -223,13 +228,28 @@ pub fn parse_inner_packet(data: &[u8]) -> Result<(InnerPacketType, &[u8])> {
 }
 
 /// パケット受信ヘルパー
-/// u32 (Length) + u8 (Type) + Payload を読み込む
+/// u32 (Length) + u8 (印 0xAE) + u8 (版) + u8 (Type) + Payload を読み込む
+///
+/// 印・版が合わなければ `AetherError::ProtocolVersion`（中身は読まずに返る。
+/// 呼び出し側はそのストリームを捨てる）。
 pub async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(PacketType, Vec<u8>)> {
     // Length: u32 big-endian
     let len = reader.read_u32().await.map_err(AetherError::Network)? as usize;
 
     if len > 10 * 1024 * 1024 { // 10MB limit
          return Err(AetherError::Protocol("Packet too large".into()));
+    }
+
+    // 印: 0xAE でなければ版の無い旧形式（旧形式ではここが種別）
+    let mark = reader.read_u8().await.map_err(AetherError::Network)?;
+    if mark != FRAME_MARK {
+        return Err(AetherError::ProtocolVersion { theirs: None });
+    }
+
+    // 版
+    let version = reader.read_u8().await.map_err(AetherError::Network)?;
+    if version != PROTOCOL_VERSION {
+        return Err(AetherError::ProtocolVersion { theirs: Some(version) });
     }
 
     // Type: u8
@@ -286,6 +306,10 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(writer: &mut W, packet_type: Pa
     let len = payload.len() as u32;
     writer.write_u32(len).await.map_err(AetherError::Network)?;
 
+    // 印と版（合わない相手はここで見分けて捨てる）
+    writer.write_u8(FRAME_MARK).await.map_err(AetherError::Network)?;
+    writer.write_u8(PROTOCOL_VERSION).await.map_err(AetherError::Network)?;
+
     // Type
     let type_byte = packet_type as u8;
     writer.write_u8(type_byte).await.map_err(AetherError::Network)?;
@@ -320,10 +344,58 @@ mod tests {
     async fn read_packet_rejects_short_body() {
         let (mut client, mut server) = tokio::io::duplex(64);
         client.write_u32(1000).await.unwrap();
+        client.write_u8(FRAME_MARK).await.unwrap();
+        client.write_u8(PROTOCOL_VERSION).await.unwrap();
         client.write_u8(PacketType::MailboxPut as u8).await.unwrap();
         client.write_all(b"abc").await.unwrap();
         drop(client); // EOF: これ以上は届かない
 
         assert!(read_packet(&mut server).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn packets_carry_the_protocol_version() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        write_packet(&mut client, PacketType::GossipHint, b"abc").await.unwrap();
+        drop(client);
+
+        let mut head = [0u8; 6];
+        server.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head[..4], &3u32.to_be_bytes(), "長さは中身だけ");
+        assert_eq!(head[4], 0xAE, "印");
+        assert_eq!(head[5], PROTOCOL_VERSION, "版");
+    }
+
+    #[tokio::test]
+    async fn read_packet_rejects_a_legacy_unversioned_packet() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        // 版の無い旧形式: [長さ][種別][中身]
+        client.write_u32(3).await.unwrap();
+        client.write_u8(PacketType::GossipHint as u8).await.unwrap();
+        client.write_all(b"abc").await.unwrap();
+        drop(client);
+
+        match read_packet(&mut server).await {
+            Err(AetherError::ProtocolVersion { theirs: None }) => {}
+            other => panic!("旧形式は ProtocolVersion {{ theirs: None }} になるはず: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_packet_reports_a_newer_version() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client.write_u32(3).await.unwrap();
+        client.write_u8(FRAME_MARK).await.unwrap();
+        client.write_u8(PROTOCOL_VERSION + 1).await.unwrap();
+        client.write_u8(PacketType::GossipHint as u8).await.unwrap();
+        client.write_all(b"abc").await.unwrap();
+        drop(client);
+
+        match read_packet(&mut server).await {
+            Err(AetherError::ProtocolVersion { theirs: Some(v) }) => {
+                assert_eq!(v, PROTOCOL_VERSION + 1)
+            }
+            other => panic!("新しい版は theirs: Some になるはず: {:?}", other),
+        }
     }
 }

@@ -581,10 +581,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
                 ticker.tick().await;
+                let mut told_update = false;
                 loop {
                     ticker.tick().await;
                     let s = status.status().await;
                     println!("既知リレー: {} 台 / 保持エントリ: {} 件", s.known_relays, s.stored_entries);
+                    if let (Some(v), false) = (s.newer_protocol, told_update) {
+                        told_update = true;
+                        println!("新しい版（v{}）のノードが見つかりました。公式の配布元で確かめてから AETHER を更新してください（この案内は誰でも出させられます）", v);
+                    }
                 }
             });
 

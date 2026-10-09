@@ -25,6 +25,8 @@ function el(tag, props = {}, children = []) {
 }
 
 const state = {
+  // 「新しい版が出ています」の案内を出したか（1 回だけ）
+  toldUpdate: false,
   connected: false,
   receiving: false,
   // 保存データが暗号化されていて、接続前にパスフレーズを尋ねる必要がある
@@ -250,6 +252,10 @@ async function refreshStatus() {
   try {
     const s = await invoke("status");
     if (s) $("relay-count").textContent = `既知リレー ${s.known_relays} 台`;
+    if (s && s.newer_protocol && !state.toldUpdate) {
+      state.toldUpdate = true;
+      toast(`新しい版（v${s.newer_protocol}）のノードが見つかりました。公式の配布元で確かめてから AETHER を更新してください（この案内は誰でも出させられます）`, "error");
+    }
   } catch (_) {
     /* 状態が取れなくても表示だけ諦める */
   }

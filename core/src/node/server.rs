@@ -13,7 +13,7 @@ use crate::net::relay_list::{RelayDescriptor, RelayDirectory};
 use crate::net::reachability::{self, Reachability, Tier};
 use crate::net::punch::{self, FilterProbeOrder, NatFiltering, PunchNotify, PunchRequest, PunchSession};
 use crate::net::shared_socket::SharedSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use crate::crypto::pow;
 use crate::protocol::hint::HintPacket;
 use crate::net::tunnel::TunnelRelay;
@@ -272,6 +272,8 @@ pub struct NodeServer {
     epoch_beacon: bool,
     /// 中継した量の実測（長さの合計だけ）
     relay_meter: Arc<RelayMeter>,
+    /// 見かけた最も新しいプロトコルの版（0 = 見ていない）。更新の案内に使う
+    newer_protocol_seen: Arc<AtomicU8>,
 }
 
 
@@ -303,6 +305,8 @@ pub struct PacketContext {
     pub stem_acks: Arc<Mutex<HashMap<[u8; 32], Arc<Notify>>>>,
     /// 中継した量の実測
     pub relay_meter: Arc<RelayMeter>,
+    /// 見かけた最も新しいプロトコルの版（0 = 見ていない）
+    pub newer_protocol_seen: Arc<AtomicU8>,
 }
 
 impl PacketContext {
@@ -470,6 +474,7 @@ impl NodeServer {
             dandelion: Arc::new(Mutex::new(DandelionRouter::new())),
             stem_acks: Arc::new(Mutex::new(HashMap::new())),
             relay_meter: Arc::new(RelayMeter::default()),
+            newer_protocol_seen: Arc::new(AtomicU8::new(0)),
             epoch_beacon: config.epoch_beacon,
         })
     }
@@ -650,6 +655,16 @@ impl NodeServer {
         self.relay_meter.reading()
     }
 
+    /// 自分より新しいプロトコルの版のパケットを見かけていれば、その最大の版
+    ///
+    /// 利用者に「更新してください」と知らせるために使う。手元で見たことだけで、網には出さない。
+    pub fn newer_protocol_seen(&self) -> Option<u8> {
+        match self.newer_protocol_seen.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
     /// 既知のリレー数
     pub async fn directory_size(&self) -> usize {
         self.directory.read().await.len()
@@ -695,6 +710,7 @@ impl NodeServer {
                 dandelion: self.dandelion.clone(),
                 stem_acks: self.stem_acks.clone(),
                 relay_meter: self.relay_meter.clone(),
+                newer_protocol_seen: self.newer_protocol_seen.clone(),
             };
 
             tokio::spawn(async move {
@@ -723,6 +739,7 @@ impl NodeServer {
             dandelion: self.dandelion.clone(),
             stem_acks: self.stem_acks.clone(),
             relay_meter: self.relay_meter.clone(),
+            newer_protocol_seen: self.newer_protocol_seen.clone(),
         };
 
         while let Some(conn) = self.server.accept().await {
@@ -753,6 +770,15 @@ impl NodeServer {
                         debug!("Received packet: {:?} ({} bytes)", packet_type, payload.len());
                         if let Err(e) = Self::process_packet(packet_type, payload, ctx).await {
                             error!("Error processing packet: {}", e);
+                        }
+                    }
+                    // 版の合わないストリームは捨てて次へ進む。相手のアドレスは出さない
+                    Err(crate::AetherError::ProtocolVersion { theirs }) => {
+                        debug!("版の合わないパケットを捨てた（相手の版: {:?}）", theirs);
+                        if let Some(v) = theirs
+                            && v > crate::protocol::PROTOCOL_VERSION
+                        {
+                            ctx.newer_protocol_seen.fetch_max(v, Ordering::Relaxed);
                         }
                     }
                     Err(e) => debug!("Failed to read packet: {}", e),

@@ -22,6 +22,10 @@ pub enum AetherError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    /// パケットの版が合わない。`theirs` が `None` なら版の無い旧形式
+    #[error("Protocol version mismatch (theirs: {theirs:?})")]
+    ProtocolVersion { theirs: Option<u8> },
+
     #[error("Configuration error: {0}")]
     Config(String),
 
