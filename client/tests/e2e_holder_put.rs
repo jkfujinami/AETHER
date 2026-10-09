@@ -5,7 +5,9 @@
 //! - v2 の大きなファイルのシャードも保持者に入る
 //! - 置く間、保持者の IP 宛てに受け口のトンネルでパケットを送ったのは、その保持者のガード（G_h）だけ
 //!
-//! を確かめる。今の試験網では常駐はリレーでもある。保持者がリレーとして受けるパケット（PEX・
+//! を確かめる。さらに、別の一回限りのクライアントが同じものを取れること（バイト単位で一致）、
+//! 取る間も保持者の IP 宛てに送ったのはそのガードだけであること、保持者の返事が保持者の IP から
+//! 返信トンネルの入口へ直接送られないことを確かめる。今の試験網では常駐はリレーでもある。保持者がリレーとして受けるパケット（PEX・
 //! 索引・他人の回路など）と区別するため、保持者の受け口の `tunnel_id` が先頭に付いた `TunnelData` と、
 //! `MailboxPut`・`MailboxGet`（リレーの保存の旧い経路）だけを数える。
 
@@ -116,6 +118,7 @@ async fn shards_go_to_holders_through_their_inlets_and_only_the_guard_sends_to_a
     let big: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
     let chunks = chunk::v2_layout_chunks("big".len(), big.len() as u64, false).unwrap();
     let v2_shards: usize = chunk::v2_stripe_shapes(chunks).unwrap().iter().map(|(k, m)| k + m).sum();
+    let big_copy = big.clone();
     publisher
         .publish(PublicPost { board, content: big, name: "big".into(), parents: Vec::new() })
         .await
@@ -133,39 +136,79 @@ async fn shards_go_to_holders_through_their_inlets_and_only_the_guard_sends_to_a
         assert_eq!(relay.mailbox.shard_entries_len(), 0, "リレー {} が v2 のシャードを預かっている", i);
     }
 
-    // --- R5: 保持者の IP 宛ての、受け口のトンネルのパケットを送ったのは、その保持者のガードだけ ---
+    // --- 取る: 別の一回限りのクライアントが、同じものをバイト単位で取れる ---
+    let reader_dir = tempfile::tempdir().unwrap();
+    let reader = AetherClient::start(ephemeral(reader_dir.path(), seed), event_channel()).await.unwrap();
+    observe(&seen, reader.node().descriptor.addr, &reader.node().router);
+    wait_for_leases(std::slice::from_ref(&reader), &holders).await;
+    let found: Arc<Mutex<Vec<(String, String)>>> = Default::default();
+    wait_until("the index shows both posts", Duration::from_secs(90), || {
+        let reader = reader.clone();
+        let found = found.clone();
+        async move {
+            let Ok(b) = reader.search(&board).await else { return false };
+            let posts: Vec<(String, String)> = b
+                .threads
+                .iter()
+                .flat_map(|t| &t.posts)
+                .map(|p| (p.name.clone(), p.content_ref.clone()))
+                .collect();
+            let both = ["small", "big"].iter().all(|n| posts.iter().any(|(name, _)| name == n));
+            *found.lock().unwrap() = posts;
+            both
+        }
+    })
+    .await;
+    let ref_of = |name: &str| {
+        let hex = found.lock().unwrap().iter().find(|(n, _)| n == name).map(|(_, r)| r.clone()).unwrap();
+        aether_client::parse_hex32(&hex, "ref").unwrap()
+    };
+    let small_ref = ref_of("small");
+    let got_small = reader.get(&board, small_ref).await.expect("get small").expect("小さな投稿を取れない");
+    assert_eq!(got_small.bytes, b"hidden holders keep the shards".to_vec(), "小さな投稿が一致しない");
+    let got_big = reader.get(&board, ref_of("big")).await.expect("get big").expect("大きなファイルを取れない");
+    assert!(got_big.bytes == big_copy, "大きなファイルがバイト単位で一致しない");
+
+    // --- 保持者の返事: 保持者の IP から返信トンネルの入口へ直接送られない ---
+    // 保持者 0 の受け口へ、自分で張った返信トンネルを付けて要求する。答えるのは保持者 0 だけ
+    let lease0 = holders[0].holder_status().lease_set.unwrap();
+    let mailbox_key = aether_core::mailbox::schrodinger::SchrodingerMailbox::body_mailbox_key(&small_ref);
+    let shard_key = aether_core::mailbox::sharding::shard_key(&mailbox_key, 0);
+    let stored = holders[0].node().mailbox().handle_get(&shard_key).await.unwrap().expect("保持者 0 にシャードが無い");
+    let (value, reply_to) = reader.get_through_lease(&lease0.gateways[0], &shard_key).await.expect("返事が届かない");
+    assert_eq!(value, stored, "返事の中身が保持者の持つシャードと違う");
+    let holder0_addr = holders[0].node().descriptor.addr;
     let seen = seen.lock().unwrap().clone();
+    let reply_packets: Vec<_> = seen
+        .iter()
+        .filter(|(_, dest, ty, head)| *dest == reply_to.gateway && *ty == PacketType::TunnelData && *head == reply_to.tunnel_id)
+        .collect();
+    assert!(!reply_packets.is_empty(), "返事が返信トンネルの入口に届いていない（観測が壊れている）");
+    assert!(
+        reply_packets.iter().all(|(sender, ..)| *sender != holder0_addr),
+        "保持者の IP から返信トンネルの入口へ直接返事が送られた"
+    );
+    eprintln!("reply: {} packets reached the reply gateway, none from the holder's address", reply_packets.len());
+
+    // --- R5（置く・取る・返事を含む全体）: 保持者の IP 宛ての、受け口のトンネルのパケットを送ったのは、そのガードだけ ---
     for (i, holder) in holders.iter().enumerate() {
         let status = holder.holder_status();
         let addr = holder.node().descriptor.addr;
         let ids: HashSet<[u8; 32]> = status.receive_tunnel_ids.iter().copied().collect();
         let guard = status.guard_addr.expect("保持者のガードが分からない");
-
-        let to_holder: Vec<_> = seen.iter().filter(|(_, dest, _, _)| *dest == addr).collect();
-        let inlet_packets: Vec<_> = to_holder
+        let inlet_packets: Vec<_> = seen
             .iter()
-            .filter(|(_, _, ty, head)| *ty == PacketType::TunnelData && ids.contains(head))
+            .filter(|(_, dest, ty, head)| *dest == addr && *ty == PacketType::TunnelData && ids.contains(head))
             .collect();
         assert!(!inlet_packets.is_empty(), "保持者 {} の受け口に何も届いていない（観測が壊れている）", i);
         let strangers: Vec<_> = inlet_packets.iter().filter(|(sender, ..)| *sender != guard).collect();
-        assert!(
-            strangers.is_empty(),
-            "保持者 {} の受け口へ、ガード以外が {} 件送った",
-            i,
-            strangers.len()
-        );
-        // リレーの保存の旧い経路（出口 → 保持者の IP へ直接 MailboxPut / MailboxGet）が使われていない
-        let direct: Vec<_> = to_holder
+        assert!(strangers.is_empty(), "保持者 {} の受け口へ、ガード以外が {} 件送った", i, strangers.len());
+        let direct = seen
             .iter()
-            .filter(|(_, _, ty, _)| matches!(ty, PacketType::MailboxPut | PacketType::MailboxGet))
-            .collect();
-        assert!(direct.is_empty(), "保持者 {} の IP へ MailboxPut/Get を直接送った者がいる", i);
-        eprintln!(
-            "holder {}: inlet packets {} (all from its guard), other packets to its address {}",
-            i,
-            inlet_packets.len(),
-            to_holder.len() - inlet_packets.len()
-        );
+            .filter(|(_, dest, ty, _)| *dest == addr && matches!(ty, PacketType::MailboxPut | PacketType::MailboxGet))
+            .count();
+        assert_eq!(direct, 0, "保持者 {} の IP へ MailboxPut/Get を直接送った者がいる", i);
+        eprintln!("holder {}: inlet packets {} (all from its guard)", i, inlet_packets.len());
     }
 
     publisher.flush().await;

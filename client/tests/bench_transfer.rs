@@ -23,6 +23,8 @@ async fn bench_put_and_get() {
 
     let (relays, _dirs) = spawn_relays(6).await;
     let seed = relays[0].descriptor.addr;
+    // 本体は隠れた保持者に置く。段 A の測定とは網の形が違う（保持者の分だけ片道が長い）
+    let (holders, _holder_dirs) = spawn_holders(&relays, 2).await;
     let board = aether_client::BoardId::random();
 
     // --- 置く ---
@@ -35,6 +37,7 @@ async fn bench_put_and_get() {
         async move { putter.status().await.known_relays >= 7 }
     })
     .await;
+    wait_for_leases(std::slice::from_ref(&putter), &holders).await;
     let before = putter.traffic();
     let started = Instant::now();
     putter
@@ -60,6 +63,7 @@ async fn bench_put_and_get() {
         async move { getter.status().await.known_relays >= 7 }
     })
     .await;
+    wait_for_leases(std::slice::from_ref(&getter), &holders).await;
     let content_ref_hex: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
     wait_until("index shows the post", Duration::from_secs(60), || {
         let getter = getter.clone();

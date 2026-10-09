@@ -84,6 +84,16 @@ async fn private_messages_arrive_despite_a_dead_relay_in_the_directory() {
         .await;
     }
 
+    // 常駐どうしは互いに保持者。本体を置く・取るので、両方の leaseSet が両方に届くまで待つ
+    for c in [&alice, &bob] {
+        wait_until("a holder issues a lease set", Duration::from_secs(180), || {
+            let c = c.clone();
+            async move { c.holder_status().lease_set.is_some() }
+        })
+        .await;
+    }
+    wait_for_leases(&[alice.clone(), bob.clone()], &[alice.clone(), bob.clone()]).await;
+
     // GUI と同じく、友だちコードを交換し、受信を始めておく。
     // これで Bob のガードは、落ちたノードが現れる前に決まる（実際の状況と揃える）
     alice

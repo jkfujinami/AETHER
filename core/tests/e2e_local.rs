@@ -55,7 +55,10 @@ async fn test_local_e2e_mailbox_put() {
 
     let message = b"Hello from Alice via Onion!";
     // Prepare Mailbox Payload and Hint
-    let (payload, hint) = mailbox.prepare_packet(&bob_public_id, message).unwrap();
+    let (mut payload, hint) = mailbox.prepare_packet(&bob_public_id, message).unwrap();
+    // 生のキーで直接置く低い層の試験。キーの最上位ビットが 1 だと保持者は v2 のシャードとして
+    // 中身のハッシュと照合する（置き場所の先書き対策）ので、v1 のキーの決まりどおり 0 にする
+    payload[0] &= 0x7F;
 
     // 5. Send Onion Packet (Mailbox Put)
     // payload = [Key][Nonce][EncMsg]

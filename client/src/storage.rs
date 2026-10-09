@@ -29,9 +29,23 @@
 //! （ガードは元々こちらの IP を知っている）。構築・延長・leaseSet の配布・一周の確認は、
 //! すべて自分の回路の出口経由で送る。ログにも、受け口やリレーのアドレスは `debug!` までにしか出さない。
 //!
-//! 受け口で処理する中身は `HOLDER_PROBE`（一周の確認）と `HOLDER_PUT`（置く。自分の `MailboxServer` に
-//! 保存する）。`HOLDER_GET` は今は捨てる（取る経路は後の段で足す）。
-//! 置く人は保持者の IP を知らず、置かれる中身は G_h からだけ届く。
+//! 受け口で処理する中身は `HOLDER_PROBE`（一周の確認）、`HOLDER_PUT`（置く。自分の `MailboxServer` に
+//! 保存する）、`HOLDER_GET`（取る。引いて、返事を出す）。
+//! 置く人・取る人は保持者の IP を知らず、置かれる中身・要求は G_h からだけ届く。
+//!
+//! # 取る要求への返事（Part 23 の 5.3）
+//!
+//! 見つかった中身は、**自分の回路の出口経由で**取る人の返信トンネルの gateway（GW_r）へ
+//! `TunnelData` として渡す。保持者の IP から GW_r へは直接送らない（送ると GW_r に保持者の IP が見える）。
+//! 見つからなければ何も返さない（「無い」という返事自体が、要求されたキーの不在を晒す）。
+//!
+//! 返事の回路は、**同じ返信先（同じ `reply_to`）への返事のあいだ使い回し**、最後に使ってから
+//! [`REPLY_CIRCUIT_IDLE`] で捨てる。別の返信先には別の回路を使う。1 回ごとに使い捨てると、
+//! v2 のファイル 1 本（数百の要求）に回路を数百本組むことになり、遅すぎるため。
+//! 同じ `reply_to` への返事はもともと同じ取る人のものだと分かっているので、同じ出口で出しても
+//! 新しく結びつく情報は無い（別々の取る人を同じ出口で結びつけないために、返信先ごとに分ける）。
+//! `reply_to.gateway` は、既知のリレー（知らない相手を受ける Tier）でなければ捨てる
+//! （任意のアドレスへ返事を撃たせる踏み台にされないため）。
 
 use crate::circuit::Circuit;
 use crate::client::AetherClient;
@@ -50,9 +64,9 @@ use aether_core::net::lease_set::{
 };
 use aether_core::net::relay::RelayClient;
 use aether_core::net::relay_list::RelayDescriptor;
-use aether_core::net::tunnel::InboundTunnel;
+use aether_core::net::tunnel::{InboundTunnel, TunnelEndpoint};
 use aether_core::protocol::hint::current_timestamp;
-use aether_core::protocol::wire::PacketType;
+use aether_core::protocol::wire::{build_mailbox_get, parse_mailbox_get, PacketType};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -111,6 +125,14 @@ const PUBLISH_FANOUT: usize = 3;
 
 /// 自分宛てではない目印（試験と診断用）を覚えておく数
 const EXTERNAL_PROBES_KEPT: usize = 64;
+
+/// 返事用の回路を、最後に使ってから捨てるまでの間
+///
+/// 取得 1 回の要求は数秒〜数十秒で出尽くす。それより長く持つ理由は無い。
+const REPLY_CIRCUIT_IDLE: Duration = Duration::from_secs(30);
+
+/// 同時に返事を出す数の上限（受け口の取り込みが詰まるのを、溢れさせずに押し返す）
+const REPLY_CONCURRENCY: usize = 32;
 
 /// 診断用に覚えておく受け口の数（受け口は 3 本 × 作り直し数回分）
 const DIAG_TUNNELS_KEPT: usize = 16;
@@ -266,6 +288,17 @@ pub(crate) struct HolderShared {
     tunnel_ids: Mutex<VecDeque<[u8; 32]>>,
     /// 受け口を張るのに使ったガードのアドレス（試験と診断用。ガードは元々こちらの IP を知っている）
     guard_addr: Mutex<Option<SocketAddr>>,
+    /// 返事用の回路。返信先（tunnel_id と gateway）ごとに 1 本
+    replies: Mutex<HashMap<ReplyKey, ReplySlot>>,
+}
+
+/// 返事を出す相手（取る人の返信トンネル）
+type ReplyKey = ([u8; 32], SocketAddr);
+
+/// 返信先 1 つ分の回路の置き場。作るのは先に来た返事で、後の返事は待って同じ回路を使う
+struct ReplySlot {
+    circuit: Arc<tokio::sync::Mutex<Option<Arc<Circuit>>>>,
+    last_used: Instant,
 }
 
 /// 保持者の役割の状態（試験と診断用）
@@ -290,6 +323,28 @@ impl HolderShared {
         }
         ids.push_back(receive_tunnel_id);
         *self.guard_addr.lock().unwrap() = Some(guard_addr);
+    }
+
+    /// 返信先の回路の置き場を取る（使った時刻を更新し、古いものを捨てる）
+    fn reply_slot(&self, key: ReplyKey) -> Arc<tokio::sync::Mutex<Option<Arc<Circuit>>>> {
+        let mut replies = self.replies.lock().unwrap();
+        let now = Instant::now();
+        replies.retain(|_, s| now.saturating_duration_since(s.last_used) < REPLY_CIRCUIT_IDLE);
+        let slot = replies.entry(key).or_insert_with(|| ReplySlot {
+            circuit: Arc::new(tokio::sync::Mutex::new(None)),
+            last_used: now,
+        });
+        slot.last_used = now;
+        slot.circuit.clone()
+    }
+
+    /// 使われなくなった返事用の回路を捨てる（見回りから呼ぶ）
+    fn expire_reply_circuits(&self) {
+        let now = Instant::now();
+        self.replies
+            .lock()
+            .unwrap()
+            .retain(|_, s| now.saturating_duration_since(s.last_used) < REPLY_CIRCUIT_IDLE);
     }
 
     /// 受け口で開いた中身を種別で振り分ける
@@ -326,8 +381,9 @@ impl HolderShared {
                     debug!("holder: put refused: {}", e);
                 }
             }
-            // 取る処理は後の段で足す。今は捨てる
-            HOLDER_GET => debug!("holder: GET ({} bytes) is not handled yet; dropping", body.len()),
+            // 取る要求は返事の回路が要るので、受け口の取り込みの側（`serve_get`）で扱う。
+            // ここに来たものは返事を出せないので捨てる
+            HOLDER_GET => debug!("holder: GET ({} bytes) reached dispatch; dropping", body.len()),
             other => debug!("holder: unknown message kind {}; dropping", other),
         }
     }
@@ -385,6 +441,88 @@ async fn send_tunnel_data(client: &RelayClient, gateway: SocketAddr, tunnel_id: 
     Ok(())
 }
 
+/// `gateway` が一覧に載っている、知らない相手を受ける Tier のリレーか
+///
+/// 返事の宛先はここでしか検証されない。任意のアドレスへ返事を撃たせられると、第三者への
+/// 増幅攻撃の踏み台になる（リレーの `MailboxGet` と同じ規則）。
+fn is_trusted_reply_gateway(relays: &[RelayDescriptor], gateway: SocketAddr) -> bool {
+    let want = aether_core::net::addr::normalize(gateway);
+    relays
+        .iter()
+        .any(|d| aether_core::net::addr::normalize(d.addr) == want && d.tier.accepts_strangers())
+}
+
+impl AetherClient {
+    /// `HOLDER_GET` の本文（`MailboxGet` の中身）を受けて、引いて、返事を出す
+    ///
+    /// 見つからない・返信先が信用できない・本文が壊れているときは、何も返さず捨てる。
+    async fn serve_get(&self, mailbox: &MailboxServer, body: &[u8]) {
+        let Ok((key, reply_to)) = parse_mailbox_get(body) else {
+            debug!("holder: bad GET body");
+            return;
+        };
+        let trusted = {
+            let dir = self.node.directory();
+            let dir = dir.read().await;
+            let relays: Vec<RelayDescriptor> = dir.all().into_iter().cloned().collect();
+            is_trusted_reply_gateway(&relays, reply_to.gateway)
+        };
+        if !trusted {
+            debug!("holder: GET reply gateway is not a known relay accepting strangers; discarding");
+            return;
+        }
+        match mailbox.handle_get(&key).await {
+            Ok(Some(value)) => {
+                if let Err(e) = self.send_reply(&reply_to, &value).await {
+                    debug!("holder: reply failed: {}", e);
+                }
+            }
+            // 見つからなかったことは返さない
+            Ok(None) => debug!("holder: GET miss"),
+            Err(e) => debug!("holder: GET failed: {}", e),
+        }
+    }
+
+    /// 返信トンネルの gateway へ、自分の回路の出口経由で `[tunnel_id][値]` を `TunnelData` として渡す
+    ///
+    /// **保持者の IP から gateway へは直接送らない。** 回路は返信先ごとに使い回す
+    /// （モジュールの説明を参照）。送れなければ回路を捨てて、組み直して 1 回だけやり直す。
+    async fn send_reply(&self, reply_to: &TunnelEndpoint, value: &[u8]) -> Result<()> {
+        let slot = self.holder.reply_slot((reply_to.tunnel_id, reply_to.gateway));
+        let mut data = reply_to.tunnel_id.to_vec();
+        data.extend_from_slice(value);
+        let mut last_err = None;
+        for _ in 0..2 {
+            let circuit = {
+                let mut guard = slot.lock().await;
+                match &*guard {
+                    Some(c) => c.clone(),
+                    None => {
+                        let c = Arc::new(self.take_probed_circuit(&[]).await?.circuit);
+                        *guard = Some(c.clone());
+                        c
+                    }
+                }
+            };
+            match circuit
+                .client
+                .send_onion_message_typed(PacketType::TunnelData, &data, reply_to.gateway)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let mut guard = slot.lock().await;
+                    if guard.as_ref().is_some_and(|c| Arc::ptr_eq(c, &circuit)) {
+                        *guard = None;
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.map_or_else(|| ClientError::network("返事を送れませんでした"), ClientError::from))
+    }
+}
+
 impl AetherClient {
     /// 保持者の役割を起こす。常駐のときだけ呼ぶ
     ///
@@ -429,6 +567,26 @@ impl AetherClient {
         send_tunnel_data(&probed.circuit.client, addr, &gateway.tunnel_id, message).await?;
         tokio::time::sleep(SEND_FLUSH).await;
         Ok(())
+    }
+
+    /// leaseSet の受け口へ `HOLDER_GET` を送り、返事を受けて、返事の宛先（返信トンネルの入口）とともに返す（試験用）
+    ///
+    /// 返信トンネルを自分で張って要求を出す。保持者の返事の通り道（返信トンネルの gateway）を
+    /// 試験が知るために使う。通常の取得は [`crate::fetch`] が自分のセッションで行う。
+    #[doc(hidden)]
+    pub async fn get_through_lease(&self, gateway: &LeaseGateway, key: &[u8; 32]) -> Result<(Vec<u8>, TunnelEndpoint)> {
+        let session = self.open_pull_session(HashMap::new()).await?;
+        let request = build_mailbox_get(key, &session.reply_to)?;
+        self.send_to_lease_gateway(gateway, &build_holder_message(HOLDER_GET, &request))
+            .await?;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let raw = self.take_replies(&session.receive_tunnel_id).await?;
+            if let Some(value) = session.mailbox.decrypt_replies(&raw).into_iter().next() {
+                return Ok((value, session.reply_to));
+            }
+        }
+        Err(ClientError::network("保持者から返事が届きませんでした"))
     }
 
     /// 受け口 1 本の目印を、自分の回路から送って、戻るかを見る
@@ -583,6 +741,9 @@ impl Holder {
     async fn step(&mut self, client: &Arc<AetherClient>, shared: &Arc<HolderShared>) {
         let now = current_timestamp();
 
+        // 0. 使われなくなった返事用の回路を捨てる
+        client.holder.expire_reply_circuits();
+
         // 1. 延長をやめる受け口を捨てる
         let mut kept = Vec::new();
         for (t, keep_until) in std::mem::take(&mut self.retired) {
@@ -669,7 +830,7 @@ impl Holder {
     }
 
     /// 受け口 1 本を張って、一周の確認に通す。通らなければ片付けてエラー
-    async fn build_one(&mut self, client: &AetherClient, shared: &Arc<HolderShared>) -> Result<HolderTunnel> {
+    async fn build_one(&mut self, client: &Arc<AetherClient>, shared: &Arc<HolderShared>) -> Result<HolderTunnel> {
         let probed = client.take_probed_circuit(&[]).await?;
         let circuit = probed.circuit;
         let me = client.node.descriptor.node_id;
@@ -704,12 +865,32 @@ impl Holder {
         shared.note_tunnel(tunnel.receive_tunnel_id, guard.addr);
         {
             let (shared, tunnel, mailbox) = (shared.clone(), tunnel.clone(), client.node.mailbox());
+            let weak = Arc::downgrade(client);
+            let permits = Arc::new(tokio::sync::Semaphore::new(REPLY_CONCURRENCY));
             tokio::spawn(async move {
                 // 口が外されると rx が閉じて終わる
                 while let Some(raw) = rx.recv().await {
-                    match tunnel.decrypt(&raw) {
-                        Ok(plain) => shared.dispatch(&plain, &mailbox).await,
-                        Err(e) => debug!("holder: undecryptable tunnel data: {}", e),
+                    let plain = match tunnel.decrypt(&raw) {
+                        Ok(plain) => plain,
+                        Err(e) => {
+                            debug!("holder: undecryptable tunnel data: {}", e);
+                            continue;
+                        }
+                    };
+                    match parse_holder_message(&plain) {
+                        Ok((HOLDER_GET, body)) => {
+                            // 返事は回路を組むことがあり遅いので、取り込みを止めないよう別の仕事にする。
+                            // 同時に出す数には上限を置く（詰まれば口が溢れて捨てる）
+                            let Ok(permit) = permits.clone().acquire_owned().await else { return };
+                            let (weak, mailbox, body) = (weak.clone(), mailbox.clone(), body.to_vec());
+                            tokio::spawn(async move {
+                                if let Some(client) = weak.upgrade() {
+                                    client.serve_get(&mailbox, &body).await;
+                                }
+                                drop(permit);
+                            });
+                        }
+                        _ => shared.dispatch(&plain, &mailbox).await,
                     }
                 }
             });
@@ -1085,6 +1266,33 @@ mod tests {
         good.extend_from_slice(&shard);
         shared.dispatch(&build_holder_message(HOLDER_PUT, &good), &mailbox).await;
         assert_eq!(mailbox.handle_get(&key).await.unwrap().as_deref(), Some(&shard[..]));
+    }
+
+    /// 同じ返信先には同じ回路の置き場を返し、別の返信先には別の置き場を返す。古いものは捨てる
+    #[test]
+    fn reply_circuits_are_shared_per_reply_target_and_expire_when_idle() {
+        let shared = HolderShared::default();
+        let a: ReplyKey = ([1u8; 32], "10.1.0.1:9000".parse().unwrap());
+        let b: ReplyKey = ([2u8; 32], "10.1.0.1:9000".parse().unwrap());
+        let slot_a = shared.reply_slot(a);
+        assert!(Arc::ptr_eq(&slot_a, &shared.reply_slot(a)), "同じ返信先なのに別の置き場");
+        assert!(!Arc::ptr_eq(&slot_a, &shared.reply_slot(b)), "別の返信先が同じ置き場を使っている");
+
+        // a だけ使われなくなったことにする
+        shared.replies.lock().unwrap().get_mut(&a).unwrap().last_used =
+            Instant::now() - REPLY_CIRCUIT_IDLE - Duration::from_secs(1);
+        shared.expire_reply_circuits();
+        let remaining: Vec<ReplyKey> = shared.replies.lock().unwrap().keys().copied().collect();
+        assert_eq!(remaining, vec![b], "使われなくなった置き場が残っている");
+    }
+
+    /// 返事の宛先は、知らない相手を受ける既知のリレーだけ
+    #[test]
+    fn reply_gateway_must_be_a_known_relay_accepting_strangers() {
+        let known = vec![relay(1, Tier::Open), relay(2, Tier::Reversed)];
+        assert!(is_trusted_reply_gateway(&known, known[0].addr));
+        assert!(!is_trusted_reply_gateway(&known, known[1].addr), "知らない相手を受けない Tier");
+        assert!(!is_trusted_reply_gateway(&known, "10.9.0.1:9000".parse().unwrap()), "一覧に無いアドレス");
     }
 
     #[tokio::test]

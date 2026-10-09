@@ -20,19 +20,13 @@ async fn holder_publishes_its_lease_set_and_receives_probes_through_its_inlets()
     let (relays, _dirs) = spawn_relays(6).await;
     let seed = relays[0].descriptor.addr;
 
-    let holder_dir = tempfile::tempdir().unwrap();
-    let holder = resident(holder_dir.path(), seed, event_channel()).await;
-
-    // 受け口 3 本がそろい、一周の確認が通ると leaseSet を出す
-    wait_until("the holder issues a lease set", Duration::from_secs(90), || {
-        let holder = holder.clone();
-        async move { holder.holder_status().lease_set.is_some() }
-    })
-    .await;
+    // 受け口 3 本がそろい、一周の確認が通ると leaseSet を出し、リレー全員に届くまで待つ
+    let (holders, holder_dirs) = spawn_holders(&relays, 1).await;
+    let (holder, holder_dir) = (holders[0].clone(), holder_dirs[0].path().to_path_buf());
     let lease = holder.holder_status().lease_set.unwrap();
     assert_eq!(lease.gateways.len(), 3, "受け口が 3 本そろっていない");
     assert!(
-        holder_dir.path().join("storage_slots.bin").exists() && holder_dir.path().join("storage_vanguard.bin").exists(),
+        holder_dir.join("storage_slots.bin").exists() && holder_dir.join("storage_vanguard.bin").exists(),
         "枠の解と中間を保存していない"
     );
 

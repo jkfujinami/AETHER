@@ -75,6 +75,73 @@ pub async fn spawn_relays(n: usize) -> (Vec<Arc<NodeServer>>, Vec<tempfile::Temp
     (nodes, dirs)
 }
 
+/// 隠れた保持者を `n` 台立てる（常駐のクライアント。leaseSet が網に行き渡るまで待つ）
+///
+/// 今の試験網のリレー（`spawn_relays`）は `NodeServer` だけで保持者にならない。置く・取るには、
+/// leaseSet を出す常駐クライアントが要る。待つのは、各保持者が leaseSet を出し、
+/// `relays` の全員のディレクトリに載るまで。取る側・置く側のクライアントが知るまでは
+/// [`wait_for_leases`] で別に待つ。
+pub async fn spawn_holders(
+    relays: &[Arc<NodeServer>],
+    n: usize,
+) -> (Vec<Arc<AetherClient>>, Vec<tempfile::TempDir>) {
+    let seed = relays[0].descriptor.addr;
+    let mut holders = Vec::new();
+    let mut dirs = Vec::new();
+    for _ in 0..n {
+        let dir = tempfile::tempdir().unwrap();
+        holders.push(resident(dir.path(), seed, aether_client::event_channel()).await);
+        dirs.push(dir);
+    }
+    for (i, holder) in holders.iter().enumerate() {
+        wait_until(&format!("holder {} issues a lease set", i), Duration::from_secs(180), || {
+            let holder = holder.clone();
+            async move { holder.holder_status().lease_set.is_some() }
+        })
+        .await;
+    }
+    let sids: Vec<[u8; 32]> = holders.iter().map(|h| h.holder_status().lease_set.unwrap().sid).collect();
+    wait_until("every relay learns the lease sets", Duration::from_secs(120), || {
+        let relays = relays.to_vec();
+        let sids = sids.clone();
+        async move {
+            for node in &relays {
+                let dir = node.directory();
+                let dir = dir.read().await;
+                if !sids.iter().all(|sid| dir.lease_set(sid).is_some()) {
+                    return false;
+                }
+            }
+            true
+        }
+    })
+    .await;
+    (holders, dirs)
+}
+
+/// `observers` の全員が、`holders` の全員の leaseSet をディレクトリに持つまで待つ
+///
+/// 置き場所はディレクトリから手元で計算するので、持たない保持者は置く・取る相手から外れる
+/// （小さな試験網では、置く側と取る側の見え方が食い違うと取れない）。
+pub async fn wait_for_leases(observers: &[Arc<AetherClient>], holders: &[Arc<AetherClient>]) {
+    let sids: Vec<[u8; 32]> = holders
+        .iter()
+        .map(|h| h.holder_status().lease_set.expect("leaseSet を出していない保持者").sid)
+        .collect();
+    for observer in observers {
+        wait_until("an observer learns the lease sets", Duration::from_secs(120), || {
+            let observer = observer.clone();
+            let sids = sids.clone();
+            async move {
+                let dir = observer.node().directory();
+                let dir = dir.read().await;
+                sids.iter().all(|sid| dir.lease_set(sid).is_some())
+            }
+        })
+        .await;
+    }
+}
+
 pub async fn wait_until<F, Fut>(label: &str, timeout: Duration, mut cond: F)
 where
     F: FnMut() -> Fut,

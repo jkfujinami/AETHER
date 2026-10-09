@@ -19,12 +19,15 @@ use std::time::Duration;
 async fn publish_search_and_get_over_three_hops() {
     let (relays, _dirs) = spawn_relays(6).await;
     let seed = relays[0].descriptor.addr;
+    // 本体は隠れた保持者に置く（リレーは本体を預からない）
+    let (holders, _holder_dirs) = spawn_holders(&relays, 2).await;
 
     // --- 公開 ---
     let pub_dir = tempfile::tempdir().unwrap();
     let publisher = AetherClient::start(ephemeral(pub_dir.path(), seed), event_channel())
         .await
         .unwrap();
+    wait_for_leases(std::slice::from_ref(&publisher), &holders).await;
     let content = b"three hops or nothing".to_vec();
     let test_board = aether_client::BoardId::random();
     let report = publisher
@@ -56,6 +59,7 @@ async fn publish_search_and_get_over_three_hops() {
     let reader = AetherClient::start(ephemeral(reader_dir.path(), seed), event_channel())
         .await
         .unwrap();
+    wait_for_leases(std::slice::from_ref(&reader), &holders).await;
     let board = reader.search(&test_board).await.expect("search");
     let post = board
         .threads
@@ -147,6 +151,12 @@ async fn private_message_first_contact_over_three_hops() {
         async move { bob.status().await.known_relays >= 7 }
     })
     .await;
+    // Bob は常駐なので、本体を預かる保持者でもある。leaseSet を出し、網に広まるまで待つ
+    wait_until("bob issues a lease set", Duration::from_secs(180), || {
+        let bob = bob.clone();
+        async move { bob.holder_status().lease_set.is_some() }
+    })
+    .await;
     // Bob の友だちコード（招待入り）。網には何も置かず、Alice へ手渡す
     let bob_code = bob.create_friend_code().expect("Bob の友だちコード");
 
@@ -160,16 +170,21 @@ async fn private_message_first_contact_over_three_hops() {
         async move { alice.status().await.known_relays >= 8 }
     })
     .await;
+    wait_for_leases(&[alice.clone(), bob.clone()], std::slice::from_ref(&bob)).await;
     alice.accept_friend_code(&bob_code).expect("Bob のコードを受け取る");
     alice
         .send_private(bob_id, None, b"hi bob, over three hops")
         .await
         .expect("send_private");
 
-    let text = tokio::time::timeout(Duration::from_secs(40), async {
+    // 取りに行くまでの遅れは 0〜60 秒の一様乱数（受信者の特定を防ぐため）。それに取得の時間を足した上限
+    let text = tokio::time::timeout(Duration::from_secs(100), async {
         loop {
-            if let Ok(ClientEvent::Received { text, .. }) = bob_rx.recv().await {
-                return text;
+            match bob_rx.recv().await {
+                Ok(ClientEvent::Received { text, .. }) => return text,
+                Ok(ClientEvent::Warning { message }) => eprintln!("bob: 警告 {}", message),
+                Ok(ClientEvent::Progress { message }) => eprintln!("bob: {}", message),
+                _ => {}
             }
         }
     })
@@ -214,6 +229,16 @@ async fn private_conversation_round_trip_over_three_hops() {
         })
         .await;
     }
+
+    // 常駐どうしは互いに保持者。両方の leaseSet が両方に届いてから始める
+    for c in [&alice, &bob] {
+        wait_until("a holder issues a lease set", Duration::from_secs(180), || {
+            let c = c.clone();
+            async move { c.holder_status().lease_set.is_some() }
+        })
+        .await;
+    }
+    wait_for_leases(&[alice.clone(), bob.clone()], &[alice.clone(), bob.clone()]).await;
 
     alice
         .start_receiving(vec![Contact { node_id: bob_id, secret: None }], Vec::new())

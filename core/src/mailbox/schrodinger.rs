@@ -4,7 +4,7 @@ use crate::net::gossip::GossipClient;
 use crate::net::gossip_server;
 use crate::net::relay_list::RelayDirectory;
 use crate::net::ring::{self, RingPosition};
-use crate::net::holder::{build_gateway_data, HOLDER_PUT};
+use crate::net::holder::{build_gateway_data, HOLDER_GET, HOLDER_PUT};
 use crate::mailbox::sharding::{self, Shard};
 use crate::mailbox::index::{self, IndexDescriptor, IndexRecord};
 use crate::mailbox::chunk;
@@ -153,41 +153,42 @@ impl SchrodingerMailbox {
             .collect()
     }
 
-    /// シャード `i` の担当リレーをローカル計算で決める (18.5.4)
+    /// `position` の担当の保持者への届け方を、近い順に最大 `k` 人分決める
     ///
-    /// **取る経路用。** 置く経路は保持者（leaseSet の枠）の担当を使う（[`holder_routes`]）。
-    /// 取る経路を保持者へ切り替えるまでは、ここはリレーのままで、置いたものとは一致しない。
+    /// 置く経路・取る経路が同じ表を使う（置いた場所から取るため）。ネットワークへ問い合わせない。
+    async fn holders_at(&self, position: RingPosition, k: usize) -> Vec<HolderRoute> {
+        let directory = self.directory.read().await;
+        holder_routes(&directory, position, k, &mut rand::thread_rng())
+    }
+
+    /// 保持者 1 人の受け口へ `[tunnel_id 32][kind][body]` を、自分の回路の出口経由で渡す
     ///
-    /// シャードごとに独立した座標を使うのでリング全体に散る。
-    /// 攻撃者が1つの弧を支配しても取れるシャードは1個で、復元には届かない。
-    pub async fn shard_targets(
-        &self,
-        mailbox_key: &[u8; 32],
-        key: &SharedSecret,
-        shard_index: u8,
-    ) -> Vec<SocketAddr> {
-        self.directory
-            .read()
-            .await
-            .shard_targets(mailbox_key, key, shard_index, K_REPLICAS)
-            .into_iter()
-            .map(|r| r.addr)
-            .collect()
+    /// 受け口は先頭から試し、送れなければ次の受け口へ進む。1 つでも渡せたら `true`。
+    /// **保持者の IP へは、この経路のどこからも直接送らない**（H へ届くのは G_h からだけ）。
+    async fn send_to_holder(&self, route: &HolderRoute, kind: u8, body: &[u8]) -> bool {
+        for (gateway, tunnel_id) in &route.inlets {
+            let data = build_gateway_data(tunnel_id, kind, body);
+            match self
+                .relay
+                .send_onion_message_typed(wire::PacketType::TunnelData, &data, *gateway)
+                .await
+            {
+                Ok(()) => return true,
+                Err(e) => tracing::debug!("holder inlet unavailable; trying another: {}", e),
+            }
+        }
+        false
     }
 
     /// `[put_key 32][値]` を、`position` の担当の保持者（SID ごとに 1 人、最大 `k` 人）の受け口へ置く
     ///
     /// 送り方は、自分の回路の出口に、受け口の gateway（GW_h）へ `TunnelData` を渡させる
     /// （`[tunnel_id 32][HOLDER_PUT][put]`）。gateway から先は保持者のトンネル（M_h → G_h → H）が運ぶ。
-    /// **保持者の IP へは、この経路のどこからも直接送らない**（H へ届くのは G_h からだけ）。
     /// 受け口は保持者ごとにランダムな順で試し、記述子が無い・送れないときは次の受け口へ進む。
     /// 全部の受け口が駄目な保持者はその分だけ飛ばし、**誰にも届かなければエラー**。
     /// 送ったバイト数（届いた保持者の数 × `put` の長さ）を返す。
     async fn put_to_holders(&self, position: RingPosition, put: &[u8], k: usize) -> Result<u64> {
-        let routes = {
-            let directory = self.directory.read().await;
-            holder_routes(&directory, position, k, &mut rand::thread_rng())
-        };
+        let routes = self.holders_at(position, k).await;
         if routes.is_empty() {
             return Err(AetherError::Config(
                 "No storage holders known; cannot place shards".into(),
@@ -195,22 +196,7 @@ impl SchrodingerMailbox {
         }
         let mut sent_bytes = 0u64;
         for route in &routes {
-            let mut delivered = false;
-            for (gateway, tunnel_id) in &route.inlets {
-                let data = build_gateway_data(tunnel_id, HOLDER_PUT, put);
-                match self
-                    .relay
-                    .send_onion_message_typed(wire::PacketType::TunnelData, &data, *gateway)
-                    .await
-                {
-                    Ok(()) => {
-                        delivered = true;
-                        break;
-                    }
-                    Err(e) => tracing::debug!("holder inlet unavailable; trying another: {}", e),
-                }
-            }
-            if delivered {
+            if self.send_to_holder(route, HOLDER_PUT, put).await {
                 sent_bytes += put.len() as u64;
             }
         }
@@ -541,9 +527,11 @@ impl SchrodingerMailbox {
         self.put_to_holders(position, &put, 1).await
     }
 
-    /// v2 のシャードをハッシュで指定して、担当 1 台へ要求する（返信は Inbound Tunnel）
+    /// v2 のシャードをハッシュで指定して、担当の保持者 1 人の受け口へ要求する（返信は Inbound Tunnel）
     ///
-    /// 送った本数を返す。担当が居ないシャードは数えない（呼び出し側が 0 ならエラーにする）。
+    /// 置いた場所（[`put_shard_v2`](Self::put_shard_v2)）と同じ保持者へ、`HOLDER_GET` で頼む。
+    /// 送った本数を返す。担当が居ない・どの受け口にも送れないシャードは数えない
+    /// （呼び出し側が 0 ならエラーにする）。
     pub async fn request_shards_v2(
         &self,
         secret: &SharedSecret,
@@ -560,15 +548,15 @@ impl SchrodingerMailbox {
         };
         let mut sent = 0;
         for hash in hashes {
-            let targets = self.shard_targets(hash, secret, 0).await;
-            let Some(&target) = targets.first() else {
+            let position = ring::position_of_shard(hash, secret, 0);
+            let routes = self.holders_at(position, 1).await;
+            let Some(route) = routes.first() else {
                 continue;
             };
             let request = wire::build_mailbox_get(&sharding::v2_put_key(hash), &reply_to)?;
-            self.relay
-                .send_onion_message_typed(wire::PacketType::MailboxGet, &request, target)
-                .await?;
-            sent += 1;
+            if self.send_to_holder(route, HOLDER_GET, &request).await {
+                sent += 1;
+            }
         }
         Ok(sent)
     }
@@ -784,6 +772,8 @@ impl SchrodingerMailbox {
 
     /// 全シャードの取得要求を Inbound Tunnel 返信付きで送る
     ///
+    /// 要求は置いたときと同じ保持者の受け口へ `HOLDER_GET` で届ける。保持者は返事も自分の回路で出す。
+    /// 索引の問い合わせ（`IndexQuery`）は索引がリレーに残るので、今までどおりリレー宛て。
     /// 3個返れば復元できるので、遅い・落ちたノードを待たない。
     async fn request_body(&self, mailbox_key: &[u8; 32], secret: &SharedSecret) -> Result<()> {
         let reply_to = {
@@ -797,20 +787,27 @@ impl SchrodingerMailbox {
         };
 
         let mut requested = 0;
+        let mut holders_known = false;
         for index in 0..sharding::TOTAL_SHARDS as u8 {
             let shard_key = sharding::shard_key(mailbox_key, index);
             let request = wire::build_mailbox_get(&shard_key, &reply_to)?;
 
-            for target in self.shard_targets(mailbox_key, secret, index).await {
-                self.relay
-                    .send_onion_message_typed(wire::PacketType::MailboxGet, &request, target)
-                    .await?;
-                requested += 1;
+            let position = ring::position_of_shard(mailbox_key, secret, index);
+            for route in self.holders_at(position, K_REPLICAS).await {
+                holders_known = true;
+                if self.send_to_holder(&route, HOLDER_GET, &request).await {
+                    requested += 1;
+                }
             }
         }
 
+        if !holders_known {
+            return Err(AetherError::Config("No storage holders known; cannot request shards".into()));
+        }
         if requested == 0 {
-            return Err(AetherError::Config("Relay directory is empty".into()));
+            return Err(AetherError::Network(std::io::Error::other(
+                "no storage holder inlet accepted the request",
+            )));
         }
         Ok(())
     }
@@ -839,26 +836,26 @@ impl SchrodingerMailbox {
 
         let mut sent = 0;
         // 同じシャードの担当表は一度だけ計算する
-        let mut targets_by_index: HashMap<u8, Vec<SocketAddr>> = HashMap::new();
+        let mut routes_by_index: HashMap<u8, Vec<HolderRoute>> = HashMap::new();
         for &(index, rank) in wants {
             if index as usize >= sharding::TOTAL_SHARDS {
                 continue;
             }
-            let targets = match targets_by_index.entry(index) {
+            let routes = match routes_by_index.entry(index) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(self.shard_targets(mailbox_key, secret, index).await)
+                    let position = ring::position_of_shard(mailbox_key, secret, index);
+                    e.insert(self.holders_at(position, K_REPLICAS).await)
                 }
             };
-            let Some(&target) = targets.get(rank) else {
+            let Some(route) = routes.get(rank) else {
                 continue;
             };
             let shard_key = sharding::shard_key(mailbox_key, index);
             let request = wire::build_mailbox_get(&shard_key, &reply_to)?;
-            self.relay
-                .send_onion_message_typed(wire::PacketType::MailboxGet, &request, target)
-                .await?;
-            sent += 1;
+            if self.send_to_holder(route, HOLDER_GET, &request).await {
+                sent += 1;
+            }
         }
         Ok(sent)
     }
