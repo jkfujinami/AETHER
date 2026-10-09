@@ -127,6 +127,22 @@ pub async fn wait_for_listener(addr: SocketAddr) {
     .await;
 }
 
+/// 自分宛ての返信の受け箱（メモリ）に少なくとも `expected` 件たまるまで待つ
+///
+/// 受け箱は預かり物の保管（sled）とは別なので、[`wait_for_mailbox_entries`] では数えられない。
+pub async fn wait_for_tunnel_messages(server: &Arc<NodeServer>, expected: usize) {
+    let mailbox = server.mailbox();
+    wait_until(
+        &format!("tunnel inbox to hold {} message(s)", expected),
+        DEFAULT_TIMEOUT,
+        || {
+            let mailbox = mailbox.clone();
+            async move { mailbox.tunnel_inbox_len() >= expected }
+        },
+    )
+    .await;
+}
+
 /// Mailbox に少なくとも `expected` 件たまるまで待つ
 ///
 /// `handle_get` / `fetch_tunnel_messages` は取得時に削除する (Burn-on-Read) ため、

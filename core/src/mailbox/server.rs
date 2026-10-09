@@ -511,6 +511,13 @@ impl MailboxServer {
         self.db.is_empty()
     }
 
+    /// 自分宛ての返信の受け箱（メモリ）に溜まっている件数。取り出さずに数える（試験と診断用）
+    ///
+    /// [`len`](Self::len) は預かり物（sled）だけを数え、受け箱は含めない。
+    pub fn tunnel_inbox_len(&self) -> usize {
+        self.inbox().queues.values().map(VecDeque::len).sum()
+    }
+
     // ---- 内部 ----
 
     /// sled に置くキー

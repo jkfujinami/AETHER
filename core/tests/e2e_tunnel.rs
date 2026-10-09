@@ -73,7 +73,7 @@ async fn test_inbound_tunnel_e2e() {
 
     bob_client.send_direct_packet(gw_addr, PacketType::TunnelData, &packet_payload).await.expect("Failed to send data to GW");
 
-    common::wait_for_mailbox_entries(&alice_server, 1).await;
+    common::wait_for_tunnel_messages(&alice_server, 1).await;
 
     // 4. Alice checks mailbox
     println!("Alice: Checking Mailbox for Tunnel Message");
