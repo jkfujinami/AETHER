@@ -285,7 +285,10 @@ impl AetherClient {
                 chunked: true,
                 parents: post.parents.clone(),
             };
-            mailbox.publish_descriptor(&k_pub, &descriptor).await?;
+            let record = mailbox.publish_descriptor(&k_pub, &descriptor).await?;
+            if descriptor.parents.is_empty() {
+                self.remember_root(&k_pub, &content_ref, &record, aether_core::mailbox::index::page_day(descriptor.timestamp));
+            }
             events::progress(&self.events, "索引に記述子を公開しました");
             self.send_status(ticket, SendState::Sent);
             SendReport {
@@ -310,7 +313,10 @@ impl AetherClient {
                 chunked: false,
                 parents: post.parents.clone(),
             };
-            mailbox.publish_descriptor(&k_pub, &descriptor).await?;
+            let record = mailbox.publish_descriptor(&k_pub, &descriptor).await?;
+            if descriptor.parents.is_empty() {
+                self.remember_root(&k_pub, &content_ref, &record, aether_core::mailbox::index::page_day(descriptor.timestamp));
+            }
             events::progress(&self.events, "索引に記述子を公開しました");
             SendReport {
                 body_exit,
@@ -355,7 +361,7 @@ impl AetherClient {
     /// 回路を書き出し終えるまで裏で保ってから閉じる
     ///
     /// 呼び出し元は待たずに次へ進める。プロセスを終える前は [`flush`](Self::flush) を呼ぶこと。
-    fn flush_in_background(&self, mailbox: SchrodingerMailbox) {
+    pub(crate) fn flush_in_background(&self, mailbox: SchrodingerMailbox) {
         let handle = tokio::spawn(async move {
             tokio::time::sleep(FLUSH_WAIT).await;
             drop(mailbox);

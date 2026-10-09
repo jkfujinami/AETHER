@@ -48,6 +48,18 @@ const INDEX_RECORD_MIN_POW: u32 = 16;
 /// 上限は、偽シャードを大量に送りつけられても CPU を食い尽くされないため。
 const MAX_REASSEMBLY_ATTEMPTS: usize = 256;
 
+/// 索引の応答から取り出した 1 件
+#[derive(Debug, Clone)]
+pub struct DecodedIndexRecord {
+    /// 応答したページの配置キー（どのページに返事があったかを数えるのに使う）
+    pub page_key: [u8; 32],
+    pub descriptor: IndexDescriptor,
+    /// 記録の PoW が達成したビット数
+    pub pow_bits: u32,
+    /// 記録の元のバイト列（別の日のページへ置き直すのに使う）
+    pub record: Vec<u8>,
+}
+
 /// シュレーディンガーMailboxの実装
 pub struct SchrodingerMailbox {
     relay: Arc<RelayClient>,
@@ -545,13 +557,15 @@ impl SchrodingerMailbox {
 
     /// 索引に記述子を1件公開する (19.7 / Phase 2-3)
     ///
-    /// キーワードの索引位置 `H(index_key ‖ K_pub)` の担当保持者へ、
+    /// 記述子の時刻の日のページ（[`index::index_page_key`]）の担当保持者へ、
     /// **K_pub で封じた記述子**を Onion 経由で追記する。保持者は中身を読めない。
+    /// 作った索引の記録（元のバイト列）を返す。レスでスレを上げるとき、PoW を解き直さずに
+    /// 別の日のページへ置き直せる。
     pub async fn publish_descriptor(
         &self,
         k_pub: &SharedSecret,
         descriptor: &IndexDescriptor,
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>> {
         // 保持者は索引を PoW の強い順に返す（弱い記述子の洪水で一覧から追い出されないように）。
         // Hint より強めに解いておく。難易度 0（試験）はそのまま
         let difficulty = match self.hint_pow_difficulty {
@@ -559,16 +573,32 @@ impl SchrodingerMailbox {
             d => d.max(INDEX_RECORD_MIN_POW),
         };
         let record = IndexRecord::create(k_pub, descriptor, difficulty)?;
-        let idx_key = index::index_key(k_pub);
         let record_bytes = record.encode()?;
+        self.put_index_record(k_pub, index::page_day(descriptor.timestamp), &record_bytes)
+            .await?;
+        Ok(record_bytes)
+    }
 
-        // payload: [index_key(32)][record_id(32)][record]
+    /// 作り済みの索引の記録を、指定した日のページへ置く（PoW は解き直さない）
+    ///
+    /// 保持者は記録の ID と PoW を確かめるだけなので、元のバイト列のまま受ける。
+    /// レスが付いたスレの根を今日のページへ置き直す（age）のに使う。
+    pub async fn put_index_record(
+        &self,
+        k_pub: &SharedSecret,
+        day: u32,
+        record_bytes: &[u8],
+    ) -> Result<()> {
+        let record = IndexRecord::decode(record_bytes)?;
+        let page_key = index::index_page_key(k_pub, day);
+
+        // payload: [page_key(32)][record_id(32)][record]
         let mut payload = Vec::with_capacity(64 + record_bytes.len());
-        payload.extend_from_slice(&idx_key);
+        payload.extend_from_slice(&page_key);
         payload.extend_from_slice(&record.id());
-        payload.extend_from_slice(&record_bytes);
+        payload.extend_from_slice(record_bytes);
 
-        let targets = self.mailbox_targets(&idx_key, k_pub).await;
+        let targets = self.mailbox_targets(&page_key, k_pub).await;
         if targets.is_empty() {
             return Err(AetherError::Config("Relay directory is empty".into()));
         }
@@ -580,19 +610,28 @@ impl SchrodingerMailbox {
         Ok(())
     }
 
-    /// 索引を pull で引く（返信は Inbound Tunnel 経由で戻る）(19.7 / Phase 2-3)
-    ///
-    /// キーワードを知っていれば誰でも位置を計算でき、Onion 越しに引ける。
-    /// 保持者からは「その索引が引かれた」ことは見えるが、**誰が引いたかは割れない**。
-    pub async fn query_index(&self, k_pub: &SharedSecret, reply_to: &TunnelEndpoint) -> Result<()> {
-        let idx_key = index::index_key(k_pub);
-        let request = wire::build_mailbox_get(&idx_key, reply_to)?;
+    /// 索引のページの担当保持者（近い順）
+    pub async fn index_page_targets(&self, k_pub: &SharedSecret, day: u32) -> Vec<SocketAddr> {
+        let page_key = index::index_page_key(k_pub, day);
+        self.mailbox_targets(&page_key, k_pub).await
+    }
 
-        let targets = self.mailbox_targets(&idx_key, k_pub).await;
-        if targets.is_empty() {
-            return Err(AetherError::Config("Relay directory is empty".into()));
-        }
-        for target in targets {
+    /// 索引の 1 ページを pull で引く（返信は Inbound Tunnel 経由で戻る）(19.7 / Phase 2-3)
+    ///
+    /// `targets` は [`index_page_targets`](Self::index_page_targets) の並びのうち、今回聞く分。
+    /// 全員に一度に聞くと、全員が最大 512KiB を返して担当に負荷が集中するので、
+    /// 呼び出し側が段階的に聞く（Part 25 の P13）。
+    /// 保持者からは「そのページが引かれた」ことは見えるが、**誰が引いたかは割れない**。
+    pub async fn query_index_page(
+        &self,
+        k_pub: &SharedSecret,
+        day: u32,
+        reply_to: &TunnelEndpoint,
+        targets: &[SocketAddr],
+    ) -> Result<()> {
+        let page_key = index::index_page_key(k_pub, day);
+        let request = wire::build_mailbox_get(&page_key, reply_to)?;
+        for &target in targets {
             self.relay
                 .send_onion_message_typed(wire::PacketType::IndexQuery, &request, target)
                 .await?;
@@ -603,18 +642,19 @@ impl SchrodingerMailbox {
     /// トンネルで回収した索引応答を記述子へ復号する
     ///
     /// `decrypted` は [`decrypt_replies`](Self::decrypt_replies) を通したもの。
-    /// K 保持者ぶんの応答が来るので id で重複排除し、PoW を検証してから開く。
-    /// 各記述子に**達成 PoW ビット**（ランク付け用 / 2-7）を添えて返す。
+    /// 応答は `(ページのキー, 記録の列)`。保持者ぶんの応答が来るので id で重複排除し、
+    /// PoW を検証してから開く。各記述子に**達成 PoW ビット**（ランク付け用 / 2-7）と、
+    /// どのページの応答か、記録の元のバイト列を添えて返す。
     pub fn decode_index_replies(
         &self,
         decrypted: &[Vec<u8>],
         k_pub: &SharedSecret,
-    ) -> Vec<(IndexDescriptor, u32)> {
+    ) -> Vec<DecodedIndexRecord> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
 
         for data in decrypted {
-            let Ok(records) = bincode::deserialize::<Vec<Vec<u8>>>(data) else {
+            let Ok((page_key, records)) = bincode::deserialize::<([u8; 32], Vec<Vec<u8>>)>(data) else {
                 continue;
             };
             for rb in records {
@@ -622,12 +662,17 @@ impl SchrodingerMailbox {
                 if !rec.verify_pow(self.hint_pow_difficulty) {
                     continue;
                 }
-                if !seen.insert(rec.id()) {
+                if !seen.insert((page_key, rec.id())) {
                     continue;
                 }
                 let pow_bits = rec.pow_bits();
-                if let Some(d) = rec.open(k_pub) {
-                    out.push((d, pow_bits));
+                if let Some(descriptor) = rec.open(k_pub) {
+                    out.push(DecodedIndexRecord {
+                        page_key,
+                        descriptor,
+                        pow_bits,
+                        record: rb,
+                    });
                 }
             }
         }

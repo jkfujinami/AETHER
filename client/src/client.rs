@@ -41,6 +41,8 @@ pub struct AetherClient {
     pub(crate) traffic: Arc<aether_core::net::relay::TrafficCounter>,
     /// 一周確認済みの回路の待機場所（クライアントごと。1 本は 1 回の操作で使い捨てる）
     pub(crate) circuit_pool: tokio::sync::Mutex<Vec<crate::pull::PooledCircuit>>,
+    /// 見た根の索引の記録（レスでスレを今日のページへ上げるため。メモリだけ・上限つき）
+    pub(crate) index_memory: std::sync::Mutex<crate::index_pages::RecordMemory>,
 }
 
 impl AetherClient {
@@ -235,6 +237,7 @@ impl AetherClient {
             suspects: Default::default(),
             traffic: Default::default(),
             circuit_pool: Default::default(),
+            index_memory: Default::default(),
         });
         // 一回限りでも動かす（CLI の send/get も待たずに済む）
         client.spawn_circuit_pool_refill();

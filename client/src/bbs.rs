@@ -508,10 +508,18 @@ impl AetherClient {
         let content_ref = report
             .content_ref
             .ok_or_else(|| ClientError::invalid("書き込みの ref を得られませんでした"))?;
+        self.age_thread(board, &ctx.root_ref).await;
 
         let mut refs = ctx.refs.clone();
         refs.push(content_ref.clone());
         Ok(own_res(refs.len(), &content_ref, &secret, &stored, &refs))
+    }
+
+    /// レスが付いたスレを今日の索引のページへ上げる（失敗しても書き込みは成功のまま）
+    async fn age_thread(&self, board: &BoardId, root_ref: &str) {
+        if let Ok(root) = crate::parse_hex32(root_ref, "スレの ref") {
+            let _ = self.reage_root(board, &root).await;
+        }
     }
 
     /// スレにファイルを添付する（スレの根を親にして、常に v2 で置く）
@@ -544,6 +552,7 @@ impl AetherClient {
         let content_ref = report
             .content_ref
             .ok_or_else(|| ClientError::invalid("ファイルの ref を得られませんでした"))?;
+        self.age_thread(board, &ctx.root_ref).await;
         Ok(Res {
             no: ctx.refs.len() + 1,
             content_ref,

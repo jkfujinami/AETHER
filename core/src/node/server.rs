@@ -1260,8 +1260,10 @@ impl NodeServer {
 
                 let records = ctx.mailbox.handle_index_list(&index_key).await?;
                 if !records.is_empty() {
-                    // 1メッセージにまとめて返す: [TunnelID(32)][bincode(Vec<record>)]
-                    let body = bincode::serialize(&records)
+                    // 1メッセージにまとめて返す: [TunnelID(32)][bincode((ページのキー, Vec<record>))]
+                    // ページのキーを添えるのは、読者が日ごとのページのどれに返事があったかを
+                    // 知って、返事の無いページだけ残りの担当に聞くため（Part 25 の P13）
+                    let body = bincode::serialize(&(index_key, &records))
                         .map_err(|e| crate::AetherError::Serialization(e.to_string()))?;
                     let mut tunnel_payload = Vec::with_capacity(32 + body.len());
                     tunnel_payload.extend_from_slice(&reply_to.tunnel_id);

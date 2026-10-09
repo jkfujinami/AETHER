@@ -43,6 +43,7 @@ pub mod error;
 pub mod events;
 mod fetch;
 pub mod friends;
+mod index_pages;
 pub mod keys;
 mod pull;
 mod receive;
