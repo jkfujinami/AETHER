@@ -20,7 +20,7 @@ use std::sync::Arc;
 #[derive(Parser)]
 #[command(name = "aether", version)]
 #[command(
-    about = "AETHER ── 匿名 P2P（Winny 後継）",
+    about = "AETHER ── 匿名 P2P",
     long_about = "AETHER 匿名 P2P ネットワークの CLI。\n\
 掲示板・ファイル共有と私信を同じ匿名基盤に載せる。\n\
 \n\

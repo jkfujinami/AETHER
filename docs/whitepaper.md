@@ -13,8 +13,8 @@ rather than glossed over. File paths are given so every claim can be checked.
 
 ## Abstract
 
-AETHER is a successor in spirit to Winny: a network where people publish and
-fetch files and threaded board posts without revealing who they are. Content
+AETHER is a network where people publish and fetch files and threaded board
+posts without revealing who they are. Content
 encryption is not the hard part. The hard part is metadata: who uploaded,
 who downloaded, and — the lesson of Winny's prosecutions — **who is holding
 which piece of content**. AETHER hides all three from observers who
