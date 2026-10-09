@@ -78,6 +78,21 @@ pub fn position_of_node(node_id: &NodeId, pow_nonce: u64, epoch_seed: &[u8; 32])
     RingPosition::from_hash(&hasher.finalize().into())
 }
 
+/// 保持者の枠のリング座標を、枠ごとの `slot_id` と **枠の PoW の解**から導出する
+///
+/// `slot_id` は SID と枠の番号から作る 32 バイト（[`crate::net::lease_set::slot_id`]）。
+/// リレーの位置（[`position_of_node`]）と同じ理由で、解（`pow_nonce`）を混ぜる。
+/// 位置を 1 回試すごとに PoW を 1 回解く必要があるので、保持者の座の狙い撃ちに費用が掛かる。
+/// リレーの位置とはタグを変えてドメインを分ける（同じ入力が同じ位置に落ちないように）。
+pub fn position_of_slot(slot_id: &[u8; 32], pow_nonce: u64, epoch_seed: &[u8; 32]) -> RingPosition {
+    let mut hasher = Sha256::new();
+    hasher.update(b"aether_ring_storage_v1");
+    hasher.update(slot_id);
+    hasher.update(pow_nonce.to_be_bytes());
+    hasher.update(epoch_seed);
+    RingPosition::from_hash(&hasher.finalize().into())
+}
+
 /// Mailbox の配置座標
 ///
 /// `key` は Hint の復号鍵。これを混ぜないと保持者が誰にでも列挙される。

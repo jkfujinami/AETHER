@@ -1,9 +1,11 @@
 //! 鍵ファイルとローカル DB の置き場所
 //!
-//! # 鍵は 2 本
+//! # 鍵は 3 本
 //!
 //! - **identity.key** ── 私信の身元。NodeId が私信の宛先そのもの。網には出さない
 //! - **relay.key** ── 常駐リレーとして網に配る記述子の鍵
+//! - **storage.key** ── 保持者の身元（SID）。leaseSet の署名と枠の位置に使う。
+//!   リレーの鍵・私信の身元とは別（同じにすると、SID とリレーの IP が結びつく）
 //!
 //! リレーの記述子は NodeId と IP を網全体へ配る。そこに私信の宛先を載せると、
 //! 宛先を知る誰もがディレクトリを引くだけで受信者の IP を得られる。だから分ける。
@@ -54,6 +56,10 @@ impl KeyFiles {
 
     pub fn relay_key_path(&self) -> PathBuf {
         self.data_dir.join("relay.key")
+    }
+
+    pub fn storage_key_path(&self) -> PathBuf {
+        self.data_dir.join("storage.key")
     }
 
     pub fn mailbox_db_path(&self) -> PathBuf {
@@ -171,6 +177,20 @@ impl KeyFiles {
     /// 使い捨てにはしない。NodeId が変わるとガードに選ばれる実績も PoW もやり直しになる。
     pub fn load_or_create_relay_identity(&self) -> Result<Identity> {
         let path = self.relay_key_path();
+        if path.exists() {
+            return self.read_key(&path);
+        }
+        let identity = Identity::generate();
+        self.write_key(&path, &identity)?;
+        Ok(identity)
+    }
+
+    /// 保持者の身元（SID）の鍵を読む。無ければ作って保存する
+    ///
+    /// 使い捨てにはしない。SID が変わると枠の PoW（位置）をやり直しになる。
+    /// リレーの鍵と同じく、パスフレーズがあれば暗号化して保存する。
+    pub fn load_or_create_storage_identity(&self) -> Result<Identity> {
+        let path = self.storage_key_path();
         if path.exists() {
             return self.read_key(&path);
         }
@@ -346,6 +366,37 @@ mod tests {
         // 2 回目は同じ鍵を読む（ガードの実績・PoW をやり直さない）
         let again = keys.load_or_create_relay_identity().unwrap();
         assert_eq!(relay.public_id(), again.public_id());
+    }
+
+    #[test]
+    fn storage_key_is_distinct_and_stable() {
+        // SID がリレーの NodeId や私信の宛先と同じだと、SID から IP を引ける
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyFiles::new(dir.path(), None);
+        let id = keys.create_identity(false).unwrap();
+        let relay = keys.load_or_create_relay_identity().unwrap();
+        let sid = keys.load_or_create_storage_identity().unwrap();
+        assert_ne!(sid.public_id(), id.public_id());
+        assert_ne!(sid.public_id(), relay.public_id());
+
+        let again = keys.load_or_create_storage_identity().unwrap();
+        assert_eq!(sid.public_id(), again.public_id(), "2 回目は同じ鍵を読む");
+    }
+
+    #[test]
+    fn encrypted_storage_key_needs_the_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = KeyFiles::new(dir.path(), Some("pass".into()));
+        let sid = sealed.load_or_create_storage_identity().unwrap();
+        let raw = std::fs::read(sealed.storage_key_path()).unwrap();
+        assert!(Identity::is_encrypted_bytes(&raw), "パスフレーズがあれば暗号化して保存する");
+        assert!(!raw.windows(32).any(|w| w == sid.to_bytes()), "秘密鍵が平文で残っている");
+
+        let wrong = KeyFiles::new(dir.path(), Some("other".into()));
+        assert!(wrong.load_or_create_storage_identity().is_err());
+        let plain = KeyFiles::new(dir.path(), None);
+        assert!(plain.load_or_create_storage_identity().is_err());
+        assert_eq!(sealed.load_or_create_storage_identity().unwrap().public_id(), sid.public_id());
     }
 
     #[test]

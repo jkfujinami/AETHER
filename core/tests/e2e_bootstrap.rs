@@ -183,6 +183,6 @@ async fn pex_rejects_descriptors_with_bad_pow() {
         signature: Vec::new(),
     };
 
-    assert_eq!(absorb_response(&mut dir, PexResponse { relays: vec![forged] }), 0);
+    assert_eq!(absorb_response(&mut dir, PexResponse { relays: vec![forged], lease_sets: Vec::new() }), 0);
     assert!(dir.is_empty());
 }

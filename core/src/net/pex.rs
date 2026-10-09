@@ -22,6 +22,7 @@
 //! 狙った mailbox_key の隣に着地する NodeId を選べてしまう (18.5.3)。
 
 use crate::error::{AetherError, Result};
+use crate::net::lease_set::{LeaseSet, MAX_LEASE_SETS_PER_RESPONSE};
 use crate::net::relay_list::{RelayDescriptor, RelayDirectory, DESCRIPTOR_TTL_SECS};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -50,10 +51,12 @@ pub struct PexRequest {
     pub want: u16,
 }
 
-/// 既知のリレー一覧
+/// 既知のリレー一覧と、保持者の leaseSet の一覧
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PexResponse {
     pub relays: Vec<RelayDescriptor>,
+    /// 保持者の leaseSet（上限は [`MAX_LEASE_SETS_PER_RESPONSE`]）
+    pub lease_sets: Vec<LeaseSet>,
 }
 
 impl PexRequest {
@@ -99,6 +102,13 @@ impl PexResponse {
                 MAX_DESCRIPTORS_PER_RESPONSE
             )));
         }
+        if response.lease_sets.len() > MAX_LEASE_SETS_PER_RESPONSE {
+            return Err(AetherError::Protocol(format!(
+                "PexResponse carries too many lease sets: {} (max {})",
+                response.lease_sets.len(),
+                MAX_LEASE_SETS_PER_RESPONSE
+            )));
+        }
         Ok(response)
     }
 }
@@ -138,12 +148,20 @@ pub fn select_response(
     pool.shuffle(&mut rand::thread_rng());
     pool.truncate(want);
 
-    PexResponse { relays: pool }
+    // leaseSet もランダムに選ぶ（近い順に返すと一部の領域だけが濃く伝わる）
+    let mut lease_sets: Vec<LeaseSet> = directory.lease_sets().into_iter().cloned().collect();
+    lease_sets.shuffle(&mut rand::thread_rng());
+    lease_sets.truncate(MAX_LEASE_SETS_PER_RESPONSE);
+
+    PexResponse {
+        relays: pool,
+        lease_sets,
+    }
 }
 
 /// 応答を取り込む。戻り値は新規に追加できた件数
 ///
-/// PoW 検証に落ちた記述子は黙って捨てる。
+/// PoW 検証に落ちた記述子は黙って捨てる。leaseSet も同じ（検証に落ちたものだけを捨てる）。
 /// 1件の不正で応答全体を捨てると、攻撃者が1件混ぜるだけで
 /// PEX を妨害できてしまう。
 pub fn absorb_response(directory: &mut RelayDirectory, response: PexResponse) -> usize {
@@ -168,6 +186,12 @@ pub fn absorb_response_with_conflicts(
                 conflicts.push((descriptor, blockers));
             }
         }
+    }
+
+    // leaseSet は検証（署名・枠の PoW・丸め・期限）に通ったものだけが入る。
+    // 落ちたものは黙って捨てる（1 件の不正で応答全体を捨てない）。
+    for lease in response.lease_sets {
+        let _ = directory.insert_lease_set(lease);
     }
 
     (directory.len().saturating_sub(before), conflicts)
@@ -225,6 +249,7 @@ mod tests {
             relays: (0..=MAX_DESCRIPTORS_PER_RESPONSE)
                 .map(|n| descriptor(n as u8))
                 .collect(),
+            lease_sets: Vec::new(),
         };
         let bytes = oversized.encode().unwrap();
 
@@ -317,6 +342,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            lease_sets: Vec::new(),
         };
 
         assert_eq!(absorb_response(&mut dir, response.clone()), 5);
@@ -339,10 +365,96 @@ mod tests {
             &mut dir,
             PexResponse {
                 relays: vec![bad, good.clone()],
+                lease_sets: Vec::new(),
             },
         );
 
         assert_eq!(added, 1, "不正な1件だけを捨てて、正当な分は取り込むこと");
         assert!(dir.get(&good.node_id).is_some());
+    }
+
+    // ---- leaseSet ----
+
+    fn lease(id: &crate::crypto::identity::Identity) -> LeaseSet {
+        use crate::net::lease_set::{solve_slots, LeaseGateway};
+        LeaseSet::new_signed(
+            id,
+            solve_slots(&id.public_id().0, 2, 0, 1).unwrap(),
+            vec![LeaseGateway {
+                gateway: NodeId([1; 32]),
+                tunnel_id: [2; 32],
+            }],
+            crate::protocol::hint::current_timestamp(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn response_with_lease_sets_survives_wire_roundtrip() {
+        let id = crate::crypto::identity::Identity::generate();
+        let response = PexResponse {
+            relays: vec![descriptor(1)],
+            lease_sets: vec![lease(&id)],
+        };
+        let decoded = PexResponse::decode(&response.encode().unwrap()).unwrap();
+        assert_eq!(decoded.lease_sets, response.lease_sets);
+        assert_eq!(decoded.relays.len(), 1);
+    }
+
+    #[test]
+    fn lease_sets_are_capped_on_the_wire() {
+        let id = crate::crypto::identity::Identity::generate();
+        let oversized = PexResponse {
+            relays: Vec::new(),
+            lease_sets: vec![lease(&id); MAX_LEASE_SETS_PER_RESPONSE + 1],
+        };
+        assert!(PexResponse::decode(&oversized.encode().unwrap()).is_err());
+
+        let at_limit = PexResponse {
+            relays: Vec::new(),
+            lease_sets: vec![lease(&id); MAX_LEASE_SETS_PER_RESPONSE],
+        };
+        assert!(PexResponse::decode(&at_limit.encode().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn lease_sets_are_capped_on_send() {
+        let mut dir = directory(3);
+        for _ in 0..MAX_LEASE_SETS_PER_RESPONSE + 10 {
+            dir.insert_lease_set(lease(&crate::crypto::identity::Identity::generate())).unwrap();
+        }
+        let response = select_response(&dir, &PexRequest::new(descriptor(250)), None);
+        assert_eq!(response.lease_sets.len(), MAX_LEASE_SETS_PER_RESPONSE);
+    }
+
+    #[test]
+    fn absorb_takes_valid_lease_sets_and_drops_bad_ones() {
+        let good_id = crate::crypto::identity::Identity::generate();
+        let good = lease(&good_id);
+        let mut bad = lease(&crate::crypto::identity::Identity::generate());
+        bad.gateways[0].tunnel_id = [9; 32]; // 署名が合わない
+
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        absorb_response(
+            &mut dir,
+            PexResponse {
+                relays: Vec::new(),
+                lease_sets: vec![bad, good.clone()],
+            },
+        );
+        assert_eq!(dir.lease_set_count(), 1, "不正な 1 件だけを捨てる");
+        assert!(dir.lease_set(&good.sid).is_some());
+    }
+
+    #[test]
+    fn lease_sets_travel_between_directories() {
+        let mut a = directory(3);
+        let id = crate::crypto::identity::Identity::generate();
+        a.insert_lease_set(lease(&id)).unwrap();
+
+        let response = select_response(&a, &PexRequest::new(descriptor(250)), None);
+        let mut b = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0);
+        absorb_response(&mut b, PexResponse::decode(&response.encode().unwrap()).unwrap());
+        assert!(b.lease_set(&id.public_id().0).is_some());
     }
 }

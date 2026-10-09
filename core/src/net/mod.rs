@@ -10,6 +10,7 @@ pub mod hint_batcher;
 pub mod guard;
 pub mod ring;
 pub mod relay_list;
+pub mod lease_set;
 pub mod pex;
 pub mod addr;
 pub mod shared_socket;

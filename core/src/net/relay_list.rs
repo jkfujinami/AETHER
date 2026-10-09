@@ -10,6 +10,7 @@
 use crate::crypto::identity::NodeId;
 use crate::crypto::pow;
 use crate::error::{AetherError, Result};
+use crate::net::lease_set::{LeaseSet, MAX_LEASE_SETS};
 use crate::net::ring::{self, RingPosition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -205,6 +206,8 @@ pub struct RelayDirectory {
     /// 外しても、まだ持っている他のノードが PEX で同じ記述子を配ってくる。
     /// これより新しい（本人が署名し直した＝生きている）記述子だけを受け入れる。
     evicted: HashMap<NodeId, u64>,
+    /// 保持者の leaseSet（SID ごとに最新の 1 つ）。リレーの記述子とは別に持つ
+    lease_sets: HashMap<[u8; 32], LeaseSet>,
 }
 
 impl Default for RelayDirectory {
@@ -221,6 +224,7 @@ impl RelayDirectory {
             epoch_seed,
             pow_difficulty,
             evicted: HashMap::new(),
+            lease_sets: HashMap::new(),
         }
     }
 
@@ -387,7 +391,91 @@ impl RelayDirectory {
         }
         // 期限切れの記述子はどのみち受け入れないので、外した記録も要らない
         self.evicted.retain(|_, issued_at| *issued_at >= cutoff);
+        // leaseSet も同じ周期で掃除する（件数は戻り値に数えない）
+        self.prune_expired_lease_sets(now);
         removed
+    }
+
+    /// leaseSet を受け取って検証し、ディレクトリへ入れる
+    ///
+    /// 検証（署名・枠の PoW・丸め・期限）に通らなければ `Err`。同じ SID は `issued_at` の
+    /// 新しい方だけを採り、古いもの・同じものでは置き換えない（巻き戻し防止）。
+    /// 上限 [`MAX_LEASE_SETS`] に達していたら、期限の近いものから捨てる。
+    pub fn insert_lease_set(&mut self, lease: LeaseSet) -> Result<()> {
+        let now = crate::protocol::hint::current_timestamp();
+        // 持っているものより新しくなければ、検証（Argon2）の前に捨てる。PEX では同じ leaseSet が何度も届く
+        let known_slots = match self.lease_sets.get(&lease.sid) {
+            Some(existing) if existing.issued_at >= lease.issued_at => return Ok(()),
+            Some(existing) => existing.slots.clone(),
+            None => Vec::new(),
+        };
+        // 同じ SID が以前に示した枠は PoW を確かめ直さない（署名は確かめる）
+        lease.verify_with_known_slots(now, self.pow_difficulty, &known_slots)?;
+
+        if self.lease_sets.contains_key(&lease.sid) {
+            // 上で新しいことを確かめ済み。置き換える
+        } else if self.lease_sets.len() >= MAX_LEASE_SETS {
+            // 満杯。入れるものより期限の近い（古い）ものがあれば、一番近いものを捨てる。
+            // 入れるものが一番近いなら、入れない。
+            let soonest = self
+                .lease_sets
+                .values()
+                .min_by_key(|l| l.expires_at)
+                .map(|l| (l.sid, l.expires_at));
+            match soonest {
+                Some((sid, expires_at)) if expires_at < lease.expires_at => {
+                    self.lease_sets.remove(&sid);
+                }
+                _ => return Ok(()),
+            }
+        }
+        self.lease_sets.insert(lease.sid, lease);
+        Ok(())
+    }
+
+    /// 期限切れの leaseSet を消す。消した数を返す
+    pub fn prune_expired_lease_sets(&mut self, now: u64) -> usize {
+        let before = self.lease_sets.len();
+        self.lease_sets.retain(|_, l| !l.is_expired(now));
+        before - self.lease_sets.len()
+    }
+
+    pub fn lease_set(&self, sid: &[u8; 32]) -> Option<&LeaseSet> {
+        self.lease_sets.get(sid)
+    }
+
+    /// 期限内の leaseSet の一覧（PEX で配る元）
+    pub fn lease_sets(&self) -> Vec<&LeaseSet> {
+        let now = crate::protocol::hint::current_timestamp();
+        self.lease_sets.values().filter(|l| !l.is_expired(now)).collect()
+    }
+
+    pub fn lease_set_count(&self) -> usize {
+        self.lease_sets.len()
+    }
+
+    /// 指定座標に近い順に、保持者の枠を最大 `k` 個（期限内の leaseSet だけ）
+    ///
+    /// リレーの [`k_nearest`](Self::k_nearest) と同じく問い合わせを行わない。送り手と受け手が
+    /// 同じ leaseSet を持っていれば同じ集合に到達する。
+    /// 戻り値は `(その枠を持つ leaseSet, 枠の番号)`。
+    pub fn storage_targets(&self, target: RingPosition, k: usize) -> Vec<(LeaseSet, u32)> {
+        let now = crate::protocol::hint::current_timestamp();
+        let seed = self.epoch_seed;
+        let slots: Vec<(&LeaseSet, u32, RingPosition)> = self
+            .lease_sets
+            .values()
+            .filter(|l| !l.is_expired(now))
+            .flat_map(|l| {
+                l.slots
+                    .iter()
+                    .map(move |s| (l, s.index, s.position(&l.sid, &seed)))
+            })
+            .collect();
+        ring::k_nearest(&slots, target, k, |(_, _, p)| *p)
+            .into_iter()
+            .map(|(l, i, _)| ((*l).clone(), *i))
+            .collect()
     }
 
     /// 生死の確認で応答しなかったリレーを外す
@@ -1039,5 +1127,181 @@ mod tests {
             dir2.insert(signed_addr(&id, &format!("10.0.0.5:{}", port))).unwrap();
         }
         assert_eq!(dir2.len(), MAX_RELAYS_PER_IP + 3);
+    }
+
+    // ---- leaseSet ----
+
+    const LEASE_NOW: u64 = 1_700_000_000; // 今より十分過去（期限切れになる）
+
+    fn lease_dir() -> RelayDirectory {
+        RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, 0)
+    }
+
+    /// 今の時刻で作った leaseSet（`insert_lease_set` は現在時刻で検証する）
+    fn lease_at(
+        id: &crate::crypto::identity::Identity,
+        slots: u32,
+        now: u64,
+    ) -> LeaseSet {
+        use crate::net::lease_set::{solve_slots, LeaseGateway};
+        LeaseSet::new_signed(
+            id,
+            solve_slots(&id.public_id().0, slots, 0, 1).unwrap(),
+            vec![LeaseGateway {
+                gateway: NodeId([1; 32]),
+                tunnel_id: [2; 32],
+            }],
+            now,
+        )
+        .unwrap()
+    }
+
+    fn lease_now(id: &crate::crypto::identity::Identity, slots: u32) -> LeaseSet {
+        lease_at(id, slots, crate::protocol::hint::current_timestamp())
+    }
+
+    #[test]
+    fn newer_lease_set_replaces_and_older_does_not() {
+        let id = crate::crypto::identity::Identity::generate();
+        let now = crate::protocol::hint::current_timestamp();
+        let old = lease_at(&id, 1, now - 1800);
+        let new = lease_at(&id, 2, now);
+        let mut dir = lease_dir();
+
+        dir.insert_lease_set(old.clone()).unwrap();
+        dir.insert_lease_set(new.clone()).unwrap();
+        assert_eq!(dir.lease_set(&new.sid).unwrap().slots.len(), 2, "新しい方に置き換わる");
+
+        dir.insert_lease_set(old).unwrap();
+        assert_eq!(dir.lease_set(&new.sid).unwrap().issued_at, new.issued_at, "古い方では巻き戻らない");
+        assert_eq!(dir.lease_set_count(), 1);
+    }
+
+    #[test]
+    fn renewals_reuse_verified_slots_but_new_slots_are_checked() {
+        use crate::net::lease_set::{solve_slots, LeaseGateway, SlotProof};
+        let difficulty = 6;
+        let id = crate::crypto::identity::Identity::generate();
+        let now = crate::protocol::hint::current_timestamp();
+        let gw = vec![LeaseGateway { gateway: NodeId([1; 32]), tunnel_id: [2; 32] }];
+        let slots = solve_slots(&id.public_id().0, 2, difficulty, u64::MAX).unwrap();
+        let mut dir = RelayDirectory::new(ring::EPOCH_SEED_PLACEHOLDER, difficulty);
+
+        let first = LeaseSet::new_signed(&id, slots[..1].to_vec(), gw.clone(), now - 1800).unwrap();
+        dir.insert_lease_set(first).unwrap();
+
+        // 出し直しで、新しく足した枠の PoW が偽なら弾く（確かめ済みの枠だけが省ける）
+        let mut forged = slots.clone();
+        forged[1] = SlotProof { index: 1, pow_nonce: forged[1].pow_nonce.wrapping_add(1) };
+        let bad = LeaseSet::new_signed(&id, forged, gw.clone(), now).unwrap();
+        if !crate::crypto::pow::node_id::verify(&crate::net::lease_set::slot_id(&id.public_id().0, 1), bad.slots[1].pow_nonce, difficulty).unwrap() {
+            assert!(dir.insert_lease_set(bad).is_err(), "新しい枠の PoW は確かめる");
+        }
+
+        let good = LeaseSet::new_signed(&id, slots, gw.clone(), now).unwrap();
+        dir.insert_lease_set(good.clone()).unwrap();
+        assert_eq!(dir.lease_set(&good.sid).unwrap().slots.len(), 2);
+
+        // 持っているものより古い（同じ）leaseSet は検証せずに捨てる（署名が壊れていてもエラーにならない）
+        let mut stale = LeaseSet::new_signed(&id, good.slots.clone(), gw, now - 1200).unwrap();
+        stale.signature[0] ^= 1;
+        assert!(dir.insert_lease_set(stale).is_ok());
+        assert_eq!(dir.lease_set(&good.sid).unwrap().issued_at, good.issued_at);
+    }
+
+    #[test]
+    fn invalid_lease_sets_are_not_inserted() {
+        let id = crate::crypto::identity::Identity::generate();
+        let mut lease = lease_now(&id, 1);
+        lease.gateways[0].tunnel_id = [9; 32]; // 署名が合わなくなる
+        let mut dir = lease_dir();
+        assert!(dir.insert_lease_set(lease).is_err());
+        assert_eq!(dir.lease_set_count(), 0);
+
+        // 期限切れ
+        let stale = lease_at(&id, 1, crate::protocol::hint::current_timestamp() - 4 * 3600);
+        assert!(dir.insert_lease_set(stale).is_err());
+    }
+
+    #[test]
+    fn expired_lease_sets_are_pruned_and_hidden() {
+        let id = crate::crypto::identity::Identity::generate();
+        let lease = lease_now(&id, 1);
+        let expires_at = lease.expires_at;
+        let mut dir = lease_dir();
+        dir.insert_lease_set(lease).unwrap();
+        assert_eq!(dir.lease_sets().len(), 1);
+
+        assert_eq!(dir.prune_expired_lease_sets(expires_at - 1), 0);
+        assert_eq!(dir.prune_expired_lease_sets(expires_at), 1);
+        assert_eq!(dir.lease_set_count(), 0);
+
+        // prune_expired（定期の掃除）でも消える
+        let lease = lease_now(&id, 1);
+        let expires_at = lease.expires_at;
+        dir.insert_lease_set(lease).unwrap();
+        dir.prune_expired(expires_at, &NodeId([0; 32]));
+        assert_eq!(dir.lease_set_count(), 0);
+    }
+
+    #[test]
+    fn storage_targets_returns_the_nearest_slots_in_order() {
+        let mut dir = lease_dir();
+        for _ in 0..6 {
+            dir.insert_lease_set(lease_now(&crate::crypto::identity::Identity::generate(), 4)).unwrap();
+        }
+        let target = ring::position_of_hint(&[0x55; 32], &ring::EPOCH_SEED_PLACEHOLDER);
+        let got = dir.storage_targets(target, 5);
+        assert_eq!(got.len(), 5);
+
+        let dist = |(l, i): &(LeaseSet, u32)| {
+            let slot = l.slots.iter().find(|s| s.index == *i).unwrap();
+            RingPosition::distance(target, slot.position(&l.sid, &dir.epoch_seed()))
+        };
+        let dists: Vec<f64> = got.iter().map(dist).collect();
+        assert!(dists.windows(2).all(|w| w[0] <= w[1]), "近い順でない: {:?}", dists);
+
+        // 全 24 枠のうち、返した 5 枠より近いものが無いこと
+        let farthest = dists[4];
+        let nearer = dir
+            .lease_sets()
+            .iter()
+            .flat_map(|l| l.slots.iter().map(move |s| (l, s)))
+            .filter(|(l, s)| RingPosition::distance(target, s.position(&l.sid, &dir.epoch_seed())) < farthest)
+            .count();
+        assert_eq!(nearer, 4);
+    }
+
+    #[test]
+    fn storage_targets_skips_expired_lease_sets() {
+        let mut dir = lease_dir();
+        let id = crate::crypto::identity::Identity::generate();
+        // 検証を通さず、期限切れのものを直接入れる
+        dir.lease_sets.insert(id.public_id().0, lease_at(&id, 1, LEASE_NOW));
+        assert!(dir.storage_targets(ring::position_of_hint(&[0x11; 32], &ring::EPOCH_SEED_PLACEHOLDER), 3).is_empty());
+    }
+
+    #[test]
+    fn lease_set_directory_is_capped_and_drops_the_soonest_expiry_first() {
+        let mut dir = lease_dir();
+        let now = crate::protocol::hint::current_timestamp();
+        // 上限まで、期限が少しずつ違うものを直接詰める（署名の検証は別のテストで見る）
+        let base = lease_at(&crate::crypto::identity::Identity::generate(), 1, now);
+        for n in 0..MAX_LEASE_SETS as u64 {
+            let mut l = base.clone();
+            l.sid = [0; 32];
+            l.sid[..8].copy_from_slice(&n.to_be_bytes());
+            l.expires_at = now + 1000 + n;
+            dir.lease_sets.insert(l.sid, l);
+        }
+        assert_eq!(dir.lease_set_count(), MAX_LEASE_SETS);
+
+        // 一番期限の近い SID（n = 0）が捨てられ、新しいものが入る
+        let newcomer = lease_now(&crate::crypto::identity::Identity::generate(), 1);
+        let sid = newcomer.sid;
+        dir.insert_lease_set(newcomer).unwrap();
+        assert_eq!(dir.lease_set_count(), MAX_LEASE_SETS, "上限を超えない");
+        assert!(dir.lease_set(&sid).is_some());
+        assert!(dir.lease_set(&[0; 32]).is_none(), "期限の一番近いものが捨てられる");
     }
 }
