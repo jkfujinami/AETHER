@@ -56,6 +56,87 @@ const DANDELION_MAX_STEM_RETRIES: usize = 3;
 /// 期限切れデータの掃除間隔
 const GC_INTERVAL: Duration = Duration::from_secs(300);
 
+/// 中継量を移動平均に入れる間隔
+///
+/// 1 分ごとの合計だけを残す。パケット単位の時刻の列は持たない。
+const RELAY_METER_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 移動平均の重み（新しい 1 分の寄与）
+///
+/// 0.1 なら約 10 分で 6 割が入れ替わる。数分の山では動かず、1 時間以上の傾向を映す。
+const RELAY_METER_ALPHA: f64 = 0.1;
+
+/// 直近これだけの間（分）に 1 パケットも中継していなければ「中継していない」とみなす
+const RELAY_METER_IDLE_MINUTES: u64 = 10;
+
+/// 指数移動平均を 1 歩進める（純粋な関数）
+///
+/// 最初の標本はそのまま初期値にする（0 から立ち上げると、起動直後の実測が過小になる）。
+fn ewma_update(prev: Option<f64>, sample: f64, alpha: f64) -> f64 {
+    match prev {
+        None => sample,
+        Some(p) => p + alpha * (sample - p),
+    }
+}
+
+/// 移動平均から読み口の値を決める（純粋な関数）
+///
+/// 起動から 1 分未満、または直近 [`RELAY_METER_IDLE_MINUTES`] 分に中継が無ければ `None`。
+/// そのときは呼び出し側が仮定の帯域を使う（中継していない人に実測の「ゼロ」を当てると、
+/// 小さな送信まで目立つ扱いになる）。
+fn relay_reading(ewma: Option<f64>, minutes: u64, last_active_minute: Option<u64>) -> Option<f64> {
+    if minutes < 1 {
+        return None;
+    }
+    let last = last_active_minute?;
+    if minutes.saturating_sub(last) >= RELAY_METER_IDLE_MINUTES {
+        return None;
+    }
+    ewma
+}
+
+#[derive(Default)]
+struct RelayMeterState {
+    ewma: Option<f64>,
+    minutes: u64,
+    last_active_minute: Option<u64>,
+}
+
+/// 自分が中継した量の実測
+///
+/// **数えるのは転送したパケットの長さの合計だけ。** 中身・宛先・パケットごとの時刻は
+/// 記録しない（押収されても、誰のものを中継したかは残らない）。残るのは 1 分ごとの
+/// 合計を畳み込んだ移動平均 1 つ。
+#[derive(Default)]
+pub struct RelayMeter {
+    pending: std::sync::atomic::AtomicU64,
+    state: Mutex<RelayMeterState>,
+}
+
+impl RelayMeter {
+    /// 転送したパケットの長さを足す
+    pub fn add(&self, bytes: usize) {
+        self.pending.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// 1 分ごとに呼ぶ。溜まった合計を移動平均に入れる
+    fn tick(&self) {
+        let bytes = self.pending.swap(0, Ordering::Relaxed);
+        let sample = bytes as f64 / RELAY_METER_INTERVAL.as_secs_f64();
+        let mut st = self.state.lock().unwrap();
+        st.minutes += 1;
+        if bytes > 0 {
+            st.last_active_minute = Some(st.minutes);
+        }
+        st.ewma = Some(ewma_update(st.ewma, sample, RELAY_METER_ALPHA));
+    }
+
+    fn reading(&self) -> Option<f64> {
+        let st = self.state.lock().unwrap();
+        relay_reading(st.ewma, st.minutes, st.last_active_minute)
+    }
+}
+
 /// 自分の記述子を署名し直す間隔（[`RelayDescriptor::issued_at`] の延命）
 ///
 /// [`crate::net::relay_list::DESCRIPTOR_TTL_SECS`] の 1/3。この余裕が無いと、
@@ -189,6 +270,8 @@ pub struct NodeServer {
     stem_acks: Arc<Mutex<HashMap<[u8; 32], Arc<Notify>>>>,
     /// エポックビーコン（drand 由来の日次シード）を回すか (3-4)
     epoch_beacon: bool,
+    /// 中継した量の実測（長さの合計だけ）
+    relay_meter: Arc<RelayMeter>,
 }
 
 
@@ -218,6 +301,8 @@ pub struct PacketContext {
     pub dandelion: Arc<Mutex<DandelionRouter>>,
     /// stem 中の Hint ごとの ACK 待ち通知（3-2 echo 再送）
     pub stem_acks: Arc<Mutex<HashMap<[u8; 32], Arc<Notify>>>>,
+    /// 中継した量の実測
+    pub relay_meter: Arc<RelayMeter>,
 }
 
 impl PacketContext {
@@ -384,6 +469,7 @@ impl NodeServer {
             hint_log: Arc::new(Mutex::new(HintLog::default())),
             dandelion: Arc::new(Mutex::new(DandelionRouter::new())),
             stem_acks: Arc::new(Mutex::new(HashMap::new())),
+            relay_meter: Arc::new(RelayMeter::default()),
             epoch_beacon: config.epoch_beacon,
         })
     }
@@ -555,6 +641,15 @@ impl NodeServer {
         self.router.send_packet(addr, packet_type, payload).await
     }
 
+    /// 自分が実際に中継している量の移動平均（バイト/秒）
+    ///
+    /// 放流の遅延で「自分の送信が中継の雑音に埋もれるか」を測るのに使う
+    /// （Part 23 の 13 章）。手元で測って手元で使うだけで、網には出さない。
+    /// 中継していない（直近 10 分に 1 パケットも無い、または起動から 1 分未満）なら `None`。
+    pub fn observed_relay_throughput(&self) -> Option<f64> {
+        self.relay_meter.reading()
+    }
+
     /// 既知のリレー数
     pub async fn directory_size(&self) -> usize {
         self.directory.read().await.len()
@@ -565,6 +660,7 @@ impl NodeServer {
         info!("AETHER Node running on {}", local_addr);
 
         self.spawn_gc();
+        self.spawn_relay_meter();
         self.spawn_batch_flusher();
         self.spawn_pex();
         self.spawn_side_channel();
@@ -598,6 +694,7 @@ impl NodeServer {
                 hint_log: self.hint_log.clone(),
                 dandelion: self.dandelion.clone(),
                 stem_acks: self.stem_acks.clone(),
+                relay_meter: self.relay_meter.clone(),
             };
 
             tokio::spawn(async move {
@@ -625,6 +722,7 @@ impl NodeServer {
             hint_log: self.hint_log.clone(),
             dandelion: self.dandelion.clone(),
             stem_acks: self.stem_acks.clone(),
+            relay_meter: self.relay_meter.clone(),
         };
 
         while let Some(conn) = self.server.accept().await {
@@ -730,6 +828,7 @@ impl NodeServer {
                 match action {
                     RoutingAction::Forwarded => {
                         // 転送完了
+                        ctx.relay_meter.add(payload.len());
                         debug!("Onion packet forwarded");
                     },
                     RoutingAction::LocalProcessing(inner_payload) => {
@@ -760,6 +859,7 @@ impl NodeServer {
                                         ctx.suspect_unreachable(dest);
                                         return Err(e);
                                     }
+                                    ctx.relay_meter.add(payload.len());
                                 } else {
                                     // **転送先は既知リレーに限る。** そうでないと、出口リレーが
                                     // 踏み台や内部アドレスへの任意ダイヤルに使われる。
@@ -778,6 +878,7 @@ impl NodeServer {
                                         ctx.suspect_unreachable(dest);
                                         return Err(e);
                                     }
+                                    ctx.relay_meter.add(inner.len());
                                 } else {
                                     // **転送先は既知リレーに限る**（MailboxForward と同じ理由）。
                                     debug!("TypedForward dest {} is not a known relay; discarding", dest);
@@ -1242,6 +1343,8 @@ impl NodeServer {
                              if let Err(e) = ctx.router.send_packet(next_hop, PacketType::TunnelData, &next_payload).await {
                                   error!("Tunnel forwarding failed: {}", e);
                                   ctx.suspect_unreachable(next_hop);
+                             } else {
+                                  ctx.relay_meter.add(next_payload.len());
                              }
                              return Ok(()); // Lock already dropped or not needed
                         }
@@ -1813,6 +1916,20 @@ impl NodeServer {
     ///
     /// これが回っていないと Mailbox と SeenCache が無制限に膨らみ、
     /// 任意の相手からのメモリ／ディスク枯渇 DoS が成立する。
+    /// 中継量の移動平均を 1 分ごとに進める
+    fn spawn_relay_meter(&self) {
+        let meter = self.relay_meter.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RELAY_METER_INTERVAL);
+            // 起動直後の即時発火を捨てる（起動から 1 分は読み口が None）
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                meter.tick();
+            }
+        });
+    }
+
     fn spawn_gc(&self) {
         let mailbox = self.mailbox.clone();
         let gossip = self.gossip.clone();
@@ -2187,5 +2304,54 @@ mod reply_guard_tests {
             .map(|p| format!("203.0.113.5:{}", p).parse().unwrap())
             .collect();
         assert_eq!(sanitize_punch_candidates(&candidates, false).len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod relay_meter_tests {
+    use super::*;
+
+    #[test]
+    fn ewma_converges_to_a_constant_input() {
+        // 一定の量を流し続けると、値がそこへ近づく
+        let mut v = None;
+        for _ in 0..100 {
+            v = Some(ewma_update(v, 1000.0, RELAY_METER_ALPHA));
+        }
+        assert!((v.unwrap() - 1000.0).abs() < 1.0, "一定の入力へ収束していない: {:?}", v);
+    }
+
+    #[test]
+    fn ewma_moves_gradually_and_decays() {
+        // 1 分の山では大きく動かず、止めれば下がる
+        let up = ewma_update(Some(100.0), 1100.0, RELAY_METER_ALPHA);
+        assert!(up > 100.0 && up < 300.0, "1 回で動きすぎ: {}", up);
+        let down = ewma_update(Some(100.0), 0.0, RELAY_METER_ALPHA);
+        assert!(down < 100.0 && down > 0.0);
+        // 最初の標本はそのまま初期値
+        assert_eq!(ewma_update(None, 42.0, RELAY_METER_ALPHA), 42.0);
+    }
+
+    #[test]
+    fn reading_is_none_before_one_minute_or_when_idle() {
+        assert_eq!(relay_reading(Some(500.0), 0, None), None, "起動から 1 分未満");
+        assert_eq!(relay_reading(Some(0.0), 5, None), None, "一度も中継していない");
+        assert_eq!(relay_reading(Some(500.0), 20, Some(10)), None, "10 分以上中継が無い");
+        assert_eq!(relay_reading(Some(500.0), 19, Some(10)), Some(500.0));
+    }
+
+    #[test]
+    fn meter_counts_lengths_only_and_reports_after_a_minute() {
+        let m = RelayMeter::default();
+        m.add(6_000);
+        assert_eq!(m.reading(), None, "1 分たつまでは None");
+        m.tick();
+        let v = m.reading().expect("1 分後は Some");
+        assert!((v - 100.0).abs() < 1e-9, "6000 バイト/60 秒 = 100 B/s のはず: {}", v);
+        // 中継が止まれば 10 分後に None へ戻る
+        for _ in 0..RELAY_METER_IDLE_MINUTES {
+            m.tick();
+        }
+        assert_eq!(m.reading(), None);
     }
 }

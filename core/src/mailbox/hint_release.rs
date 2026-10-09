@@ -77,6 +77,18 @@ pub const DEFAULT_TARGET_ANONYMITY_SET: f64 = 100.0;
 /// 上限に張り付いている場合、その網は匿名集合が不足している。
 pub const DEFAULT_MAX_DELAY: Duration = Duration::from_secs(6 * 3600);
 
+/// 大容量とみなす送出量（これ以上なら窓に下限を付ける）
+///
+/// 8MiB は約 1Mbps の中継雑音（`NOISE_WINDOW_SECS` ぶん）を十分に超え、
+/// 上げている間のガードの目撃が「ファイル 1 本分」と分かる大きさ（Part 23 の 13 章）。
+pub const LARGE_UPLOAD_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 大容量の窓の下限
+///
+/// 上げ終わった時刻と記述子が出る時刻を、最低 1 時間の窓に散らす
+/// （Part 23: 匿名集合 約 830 を保証）。**隠れる相手がいるときだけ**効かせる。
+pub const LARGE_MIN_WINDOW: Duration = Duration::from_secs(3600);
+
 /// Gossip 中継に使う既定の帯域 (bytes/sec)
 ///
 /// 設計書 18.3-E の 1 Mbps 予算に対応。
@@ -235,6 +247,16 @@ impl ReleasePolicy {
 
         let window = required.min(cap).max(0.0);
 
+        // 大容量には下限を付ける（上限 max_delay は超えない。Strict でも下限だけ上げる）。
+        // 下の「待つ価値があるか」より**先に**掛ける: 速く上げた大きなファイルは送信規模に
+        // 比例した窓が短く、その窓では価値なしと判定されて下限が効かなくなるため。
+        // 網が空なら下限を掛けても隠れる相手は 0 なので、下の判定で待たない約束は保たれる
+        let window = if upload.bytes >= LARGE_UPLOAD_BYTES {
+            window.max(LARGE_MIN_WINDOW.as_secs_f64().min(self.max_delay.as_secs_f64()))
+        } else {
+            window
+        };
+
         // 待って得られる匿名集合が測定可能な水準に達しないなら、
         // 待つのは利益ゼロのコストでしかない (Strict は明示的な選択なので例外)
         if self.mode == ReleaseMode::Adaptive
@@ -363,8 +385,8 @@ mod tests {
     #[test]
     fn window_scales_inversely_with_network_activity() {
         // 閑散な網ほど長く待つ必要がある
-        let busy = policy(100.0).delay_window(&upload(10_000_000, 1.0));
-        let quiet = policy(1.0).delay_window(&upload(10_000_000, 1.0));
+        let busy = policy(100.0).delay_window(&upload(5_000_000, 1.0));
+        let quiet = policy(1.0).delay_window(&upload(5_000_000, 1.0));
 
         assert!(quiet > busy, "投稿が少ない網ほど窓を広げる必要がある");
     }
@@ -373,7 +395,7 @@ mod tests {
     fn window_reaches_the_anonymity_target() {
         // 目標匿名集合 100件 / 観測 10件/秒 → 10秒あれば足りる
         let p = policy(10.0);
-        let big = upload(10_000_000, 1.0);
+        let big = upload(5_000_000, 1.0);
 
         let window = p.delay_window(&big);
         assert!(
@@ -566,5 +588,49 @@ mod tests {
             p.effective_anonymity_set(&big) < p.target_anonymity_set,
             "目標未達を検出できていない"
         );
+    }
+
+    // ---- 大容量の窓の下限 ----
+
+    #[test]
+    fn large_uploads_get_at_least_an_hour_when_there_is_someone_to_hide_among() {
+        // 速く上げても（窓が短く計算されても）、1 時間は散らす
+        let p = policy(1.0);
+        let quick = upload(LARGE_UPLOAD_BYTES, 10.0);
+        let w = p.delay_window(&quick);
+        assert!(w >= LARGE_MIN_WINDOW, "下限が効いていない: {:?}", w);
+        assert!(w <= p.max_delay, "上限を超えている: {:?}", w);
+    }
+
+    #[test]
+    fn large_floor_applies_even_when_the_proportional_window_alone_is_too_short() {
+        // 閑散な網: 送信規模に比例した窓だけでは匿名集合が足りないが、1 時間なら足りる
+        let rate = MIN_USEFUL_ANONYMITY_SET / LARGE_MIN_WINDOW.as_secs_f64() * 2.0;
+        let p = policy(rate);
+        let quick = upload(LARGE_UPLOAD_BYTES, 1.0);
+        assert!(p.delay_window(&quick) >= LARGE_MIN_WINDOW, "下限が判定の前に掛かっていない");
+    }
+
+    #[test]
+    fn below_the_large_threshold_is_unchanged() {
+        let p = policy(1.0);
+        let w = p.delay_window(&upload(LARGE_UPLOAD_BYTES - 1, 10.0));
+        assert!(w < LARGE_MIN_WINDOW, "8MiB 未満に下限が掛かっている: {:?}", w);
+        assert!(w > Duration::ZERO);
+    }
+
+    #[test]
+    fn large_uploads_still_never_wait_on_an_empty_network() {
+        // 下限は隠れる相手がいるときだけ
+        let p = policy(0.0);
+        assert_eq!(p.delay_window(&upload(LARGE_UPLOAD_BYTES * 100, 5.0)), Duration::ZERO);
+        let boot = ReleasePolicy::bootstrap();
+        assert_eq!(boot.delay_window(&upload(LARGE_UPLOAD_BYTES * 100, 5.0)), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_floor_never_exceeds_max_delay() {
+        let p = ReleasePolicy { max_delay: Duration::from_secs(600), ..policy(1.0) };
+        assert!(p.delay_window(&upload(LARGE_UPLOAD_BYTES, 10.0)) <= Duration::from_secs(600));
     }
 }

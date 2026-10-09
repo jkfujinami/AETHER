@@ -9,7 +9,7 @@
 
 use aether_client::{
     AetherClient, Board, ClientConfig, PrivacyOptions, ClientEvent, Contact, KeyFiles, MessageSource, NodeMode,
-    PublicPost, RelayOptions, event_channel, parse_hex32,
+    PublicPost, RelayOptions, SendState, event_channel, parse_hex32,
 };
 use clap::{Parser, Subcommand};
 use std::error::Error;
@@ -304,6 +304,17 @@ async fn join_ephemeral(
     Ok(client)
 }
 
+/// 秒数を人に読める形にする（例「1 時間 12 分」）
+fn human_duration(secs: u64) -> String {
+    let (h, m) = (secs / 3600, secs % 3600 / 60);
+    match (h, m) {
+        (0, 0) => format!("{} 秒", secs.max(1)),
+        (0, m) => format!("{} 分", m),
+        (h, 0) => format!("{} 時間", h),
+        (h, m) => format!("{} 時間 {} 分", h, m),
+    }
+}
+
 /// クライアントのイベントを端末へ流す
 fn spawn_event_printer(mut rx: tokio::sync::broadcast::Receiver<ClientEvent>) {
     tokio::spawn(async move {
@@ -311,6 +322,11 @@ fn spawn_event_printer(mut rx: tokio::sync::broadcast::Receiver<ClientEvent>) {
             match rx.recv().await {
                 Ok(ClientEvent::Progress { message }) => println!("{}", message),
                 Ok(ClientEvent::Warning { message }) => eprintln!("警告: {}", message),
+                // 大きなファイルの記述子を出す前の待ち（publish_tracked だけが流す）
+                Ok(ClientEvent::SendStatus { status: SendState::Delayed { seconds }, .. }) => println!(
+                    "記述子を出すまで {} 待ちます（--no-release-delay で待たずに出せます。上げた時刻と結びつきやすくなります）",
+                    human_duration(seconds)
+                ),
                 Ok(ClientEvent::SendStatus { .. }) => {}
                 Ok(ClientEvent::Received { source, text, .. }) => {
                     let from = match source {
@@ -447,12 +463,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("板 #{} に書き込みます", board_id.fingerprint());
                     let client = join_ephemeral(privacy_of(&cli), cli.data_dir.clone(), *port, connect, *min_relays).await?;
                     let r = client
-                        .publish(PublicPost {
-                            board: board_id,
-                            content,
-                            name: name.clone().unwrap_or(default_name),
-                            parents,
-                        })
+                        .publish_tracked(
+                            PublicPost {
+                                board: board_id,
+                                content,
+                                name: name.clone().unwrap_or(default_name),
+                                parents,
+                            },
+                            0,
+                        )
                         .await?;
                     client.flush().await;
                     r

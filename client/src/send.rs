@@ -194,6 +194,18 @@ impl AetherClient {
     /// 大きな内容はチャンク化して content-address で置き、Hint は流さない（pull 専用）。
     /// どちらも索引に記述子を載せるので、キーワードで検索できる。
     pub async fn publish(&self, post: PublicPost) -> Result<SendReport> {
+        self.publish_inner(post, None).await
+    }
+
+    /// 大きなファイルの記述子を出すまでの進み具合を
+    /// [`ClientEvent::SendStatus`](crate::ClientEvent::SendStatus) で流す版
+    ///
+    /// 小さな投稿の流れ（Hint の放流）は [`publish`](Self::publish) と変わらず、`ticket` は使わない。
+    pub async fn publish_tracked(&self, post: PublicPost, ticket: u64) -> Result<SendReport> {
+        self.publish_inner(post, Some(ticket)).await
+    }
+
+    async fn publish_inner(&self, post: PublicPost, ticket: Option<u64>) -> Result<SendReport> {
         use aether_core::mailbox::chunk;
 
         let k_pub = post.board.key();
@@ -233,6 +245,11 @@ impl AetherClient {
                     profile.bytes
                 ),
             );
+            self.send_status(ticket, SendState::Placed);
+            // 上げ終わった時刻と記述子が出る時刻を結びつけさせないため、窓の中でばらけて待つ。
+            // Hint は出さない（大きなファイルは pull 専用）。待つのは索引に出すことだけ
+            self.wait_before_descriptor(&mailbox, &profile, ticket).await;
+            // 待った分だけ時刻が進むので、記述子の時刻は出す直前に取る
             let descriptor = IndexDescriptor {
                 content_ref,
                 name: post.name.clone(),
@@ -243,6 +260,7 @@ impl AetherClient {
             };
             mailbox.publish_descriptor(&k_pub, &descriptor).await?;
             events::progress(&self.events, "索引に記述子を公開しました");
+            self.send_status(ticket, SendState::Sent);
             SendReport {
                 body_exit,
                 hint_exit: None,
@@ -344,6 +362,19 @@ impl AetherClient {
         .with_pow_difficulty(self.node.gossip().pow_difficulty())
     }
 
+    /// 放流方針。中継の量は、自分で測った値が仮定より**少ないときだけ**それを使う
+    ///
+    /// 実測は遅延を長くする向きにしか効かせない。誰でも自分の回路を自分のリレーに通して
+    /// 実測を膨らませられ、膨らめば「中継の雑音に埋もれる」と判定されて遅延が縮む。
+    /// その雑音は流した本人には差し引けるので、隠れ蓑にならない。
+    /// 手元で測って手元で使うだけで、網には出さない。
+    async fn current_release_policy(&self, mailbox: &SchrodingerMailbox) -> hint_release::ReleasePolicy {
+        mailbox.release_policy(
+            self.node.gossip().observed_hint_rate().await,
+            relay_noise_estimate(self.node.observed_relay_throughput()),
+        )
+    }
+
     /// 網の活動量から決まる遅延を置いてから Hint を放流する（時間分離 / 18.4.5）
     async fn release_hint(
         &self,
@@ -352,10 +383,7 @@ impl AetherClient {
         profile: &UploadProfile,
         ticket: Option<u64>,
     ) -> Result<()> {
-        let policy = mailbox.release_policy(
-            self.node.gossip().observed_hint_rate().await,
-            hint_release::DEFAULT_RELAY_THROUGHPUT_BPS,
-        );
+        let policy = self.current_release_policy(mailbox).await;
         match policy.status(profile) {
             ReleaseStatus::BuriedInNoise { .. } => {
                 events::progress(&self.events, "Hint を即時放流します（中継トラフィックに埋もれる大きさ）")
@@ -364,11 +392,7 @@ impl AetherClient {
         }
 
         // 切り替えで無効なら待たない（PrivacyOptions::delay_release）
-        let delay = if self.privacy().delay_release {
-            policy.delay_for(profile)
-        } else {
-            Duration::ZERO
-        };
+        let delay = release_wait(&policy, profile, self.privacy().delay_release);
         if !delay.is_zero() {
             events::progress(&self.events, format!("{:?} 待機してから放流します", delay));
             self.send_status(ticket, SendState::Delayed { seconds: delay.as_secs().max(1) });
@@ -380,6 +404,26 @@ impl AetherClient {
         Ok(())
     }
 
+    /// 大きなファイルの記述子を索引に出す前に、放流の窓の中で待つ
+    ///
+    /// 小さな投稿と同じ方針（網が空なら待たない、`delay_release` が偽なら待たない）。
+    /// 8MiB 以上は窓に下限が付く（`hint_release::LARGE_MIN_WINDOW`）。
+    async fn wait_before_descriptor(
+        &self,
+        mailbox: &SchrodingerMailbox,
+        profile: &UploadProfile,
+        ticket: Option<u64>,
+    ) {
+        let policy = self.current_release_policy(mailbox).await;
+        let delay = release_wait(&policy, profile, self.privacy().delay_release);
+        if delay.is_zero() {
+            return;
+        }
+        events::progress(&self.events, format!("{:?} 待機してから記述子を公開します", delay));
+        self.send_status(ticket, SendState::Delayed { seconds: delay.as_secs().max(1) });
+        tokio::time::sleep(delay).await;
+    }
+
     fn send_status(&self, ticket: Option<u64>, status: SendState) {
         if let Some(ticket) = ticket {
             let _ = self.events.send(ClientEvent::SendStatus { ticket, status });
@@ -389,4 +433,93 @@ impl AetherClient {
 
 pub(crate) fn hex_id(id: &NodeId) -> String {
     hex::encode(id.as_bytes())
+}
+
+/// 放流の判定に使う中継の雑音の量（バイト/秒）。実測は仮定より少ないときだけ使う
+///
+/// [`AetherClient::current_release_policy`] の理由のとおり、実測で遅延が縮むことはない。
+pub(crate) fn relay_noise_estimate(measured: Option<f64>) -> f64 {
+    let assumed = hint_release::DEFAULT_RELAY_THROUGHPUT_BPS;
+    measured.map_or(assumed, |m| m.min(assumed))
+}
+
+/// 放流の窓の幅。`delay_release` が偽なら 0（純粋な関数）
+pub(crate) fn release_window(
+    policy: &hint_release::ReleasePolicy,
+    profile: &UploadProfile,
+    delay_release: bool,
+) -> Duration {
+    if delay_release {
+        policy.delay_window(profile)
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// 実際に待つ時間。窓の中の一様乱数
+pub(crate) fn release_wait(
+    policy: &hint_release::ReleasePolicy,
+    profile: &UploadProfile,
+    delay_release: bool,
+) -> Duration {
+    if release_window(policy, profile, delay_release).is_zero() {
+        Duration::ZERO
+    } else {
+        policy.delay_for(profile)
+    }
+}
+
+#[cfg(test)]
+mod release_wait_tests {
+    use super::*;
+    use aether_core::mailbox::hint_release::{LARGE_MIN_WINDOW, LARGE_UPLOAD_BYTES, ReleasePolicy};
+
+    fn policy(rate: f64) -> ReleasePolicy {
+        ReleasePolicy { observed_hint_rate: rate, ..ReleasePolicy::default() }
+    }
+
+    fn upload(bytes: u64) -> UploadProfile {
+        UploadProfile { bytes, duration: Duration::from_secs(10) }
+    }
+
+    #[test]
+    fn measured_relay_noise_can_only_lengthen_delays() {
+        let assumed = hint_release::DEFAULT_RELAY_THROUGHPUT_BPS;
+        assert_eq!(relay_noise_estimate(None), assumed);
+        assert_eq!(relay_noise_estimate(Some(assumed / 4.0)), assumed / 4.0, "静かなリレーは実測を使う");
+        assert_eq!(relay_noise_estimate(Some(assumed * 100.0)), assumed, "膨らませた実測は仮定で頭打ち");
+    }
+
+    #[test]
+    fn large_boundary_decides_the_one_hour_floor() {
+        let p = policy(1.0);
+        assert!(release_window(&p, &upload(LARGE_UPLOAD_BYTES), true) >= LARGE_MIN_WINDOW);
+        assert!(release_window(&p, &upload(LARGE_UPLOAD_BYTES - 1), true) < LARGE_MIN_WINDOW);
+    }
+
+    #[test]
+    fn empty_network_does_not_wait() {
+        let p = policy(0.0);
+        let big = upload(LARGE_UPLOAD_BYTES * 10);
+        assert_eq!(release_window(&p, &big, true), Duration::ZERO);
+        assert_eq!(release_wait(&p, &big, true), Duration::ZERO);
+    }
+
+    #[test]
+    fn disabled_delay_does_not_wait() {
+        let p = policy(10.0);
+        let big = upload(LARGE_UPLOAD_BYTES * 10);
+        assert_eq!(release_window(&p, &big, false), Duration::ZERO);
+        assert_eq!(release_wait(&p, &big, false), Duration::ZERO);
+    }
+
+    #[test]
+    fn wait_stays_inside_the_window() {
+        let p = policy(1.0);
+        let big = upload(LARGE_UPLOAD_BYTES);
+        let w = release_window(&p, &big, true);
+        for _ in 0..100 {
+            assert!(release_wait(&p, &big, true) <= w);
+        }
+    }
 }
