@@ -119,16 +119,22 @@ pub fn v2_chunk_count(size: u64) -> usize {
     size.div_ceil(V2_CHUNK_PLAIN as u64) as usize
 }
 
-/// 切り上げ後のチャンク数（データのチャンク数 `n` を `max(4, 2 の冪)` に上げ、`max` で頭打ちにする）
+/// 切り上げの最小の刻み（バイト）。小さなファイルを細かく区別させないため（約 4 チャンク分）
+pub const V2_MIN_BUCKET_BYTES: u64 = 1 << 20;
+
+/// 切り上げ後のチャンク数。ファイルの大きさを**バイトの 2 の冪**（最小 [`V2_MIN_BUCKET_BYTES`]）に
+/// 切り上げ、その大きさを収めるチャンク数にして、`max` で頭打ちにする
 ///
 /// ガードは自分のクライアントが置いた量・取った量を見ているので、大きさを 2 倍刻みに丸めて
-/// 候補を増やす（Part 24 の L5）。最小の 4 チャンクは小さなファイルを細かく区別させないため。
+/// 候補を増やす（Part 24 の L5）。刻みをチャンク数の 2 の冪にすると、チャンクの平文が 256KiB より
+/// わずかに小さいため、ちょうど 4MiB のファイルが 17 チャンクになって次の刻みへ跳ねていた。
+/// バイトで決めれば 4MiB は 17、4MiB + 1 は 33 チャンクで、利用者が見る大きさと刻みが揃う。
 /// `max` は [`max_chunks_v2`]（Manifest に収まる最大）。**一番上の刻みは `max` になる**ので、
-/// 2048 チャンク（約 537MB）を超えるファイルは全部 `max` まで切り上がる。
-/// `n > max` は呼び出し側が先に断っている前提。
-pub fn padded_chunk_count(n: usize, max: usize) -> usize {
-    debug_assert!(n <= max, "上限を超えたファイルは先に断る");
-    n.next_power_of_two().max(4).min(max)
+/// `max`（名前 100 バイトで約 3,000 チャンク ≒ 800MB）に届く刻み（2^30 バイト）以上は全部 `max` になる。
+/// `size` が `max` チャンクを超えるものは呼び出し側が先に断っている前提。
+pub fn padded_chunks_for_size(size: u64, max: usize) -> usize {
+    let bucket = size.max(1).next_power_of_two().max(V2_MIN_BUCKET_BYTES);
+    bucket.div_ceil(V2_CHUNK_PLAIN as u64).min(max as u64) as usize
 }
 
 /// 置くチャンク数（`pad` なら切り上げ込み）。上限を超えるファイルと空のファイルはエラー
@@ -146,7 +152,7 @@ pub fn v2_layout_chunks(name_len: usize, size: u64, pad: bool) -> Result<usize> 
             n, max
         )));
     }
-    Ok(if pad { padded_chunk_count(n, max) } else { n })
+    Ok(if pad { padded_chunks_for_size(size, max) } else { n })
 }
 
 /// 埋め草のチャンク `index` の平文（長さ [`V2_CHUNK_PLAIN`]）
@@ -208,7 +214,7 @@ pub fn manifest_v2_sealed_len(name_len: usize, chunks: usize) -> Result<usize> {
 /// 暗号化後の Manifest が [`SINGLE_BODY_LIMIT`] に収まる最大のチャンク数
 ///
 /// Manifest を木にするのは将来で、今はこれを超えるファイルを断る。名前が長いほど少し減る。
-/// 切り上げ後のチャンク数もこれで頭打ちになる（[`padded_chunk_count`]）。
+/// 切り上げ後のチャンク数もこれで頭打ちになる（[`padded_chunks_for_size`]）。
 pub fn max_chunks_v2(name_len: usize) -> usize {
     let fits = |chunks: usize| {
         manifest_v2_sealed_len(name_len, chunks).is_ok_and(|n| n <= SINGLE_BODY_LIMIT)
@@ -605,31 +611,48 @@ mod tests {
     }
 
     #[test]
-    fn padded_chunk_count_rounds_up_to_powers_of_two() {
-        for (n, want) in [(1usize, 4usize), (2, 4), (4, 4), (5, 8), (16, 16), (17, 32), (2048, 2048), (2049, 4096)] {
-            assert_eq!(padded_chunk_count(n, 10_000), want, "n = {}", n);
+    fn padded_chunks_round_up_by_bytes_not_by_chunk_count() {
+        let mib = 1u64 << 20;
+        for (size, want) in [
+            (1u64, 5usize),
+            (mib, 5),
+            (mib + 1, 9),
+            (4 * mib, 17),
+            (4 * mib + 1, 33),
+            (32 * mib, 129),
+            (32 * mib + 1, 257),
+            (100_000_000, 513), // 2^27 バイトの刻み
+        ] {
+            assert_eq!(padded_chunks_for_size(size, 10_000), want, "size = {}", size);
         }
         // 頭打ち: 上限を超える刻みは上限になる
-        assert_eq!(padded_chunk_count(2049, 3000), 3000);
-        assert_eq!(padded_chunk_count(3000, 3000), 3000);
-        assert_eq!(padded_chunk_count(2, 3), 3, "最小の 4 より上限が小さいときも上限");
+        assert_eq!(padded_chunks_for_size(4 * mib + 1, 20), 20);
+        assert_eq!(padded_chunks_for_size(1, 3), 3, "最小の刻みより上限が小さいときも上限");
+        // 本物のチャンク数以上になる（上限に収まるファイルについて）
+        for size in [1u64, 262_056, 262_057, mib, 4 * mib, 4 * mib + 1, 100_000_000] {
+            assert!(padded_chunks_for_size(size, 10_000) >= v2_chunk_count(size), "size = {}", size);
+        }
     }
 
     #[test]
     fn layout_pads_but_never_exceeds_the_manifest_limit() {
         let plain = V2_CHUNK_PLAIN as u64;
-        // 5 チャンク強（5MB 程度）→ 8、pad=false なら切り上げない
-        assert_eq!(v2_layout_chunks(10, 4 * plain + 1, true).unwrap(), 8);
+        // 1MiB 以下は 5 チャンク、1MiB を 1 バイト超えると 2MiB の刻みで 9 チャンク。pad=false なら切り上げない
+        assert_eq!(v2_layout_chunks(10, 4 * plain + 1, true).unwrap(), 5);
         assert_eq!(v2_layout_chunks(10, 4 * plain + 1, false).unwrap(), 5);
-        assert_eq!(v2_layout_chunks(10, 1, true).unwrap(), 4, "小さいファイルも 4 チャンク");
+        assert_eq!(v2_layout_chunks(10, V2_MIN_BUCKET_BYTES + 1, true).unwrap(), 9);
+        assert_eq!(v2_layout_chunks(10, V2_MIN_BUCKET_BYTES + 1, false).unwrap(), 5);
+        assert_eq!(v2_layout_chunks(10, 4 << 20, true).unwrap(), 17, "ちょうど 4MiB は 17 チャンク");
+        assert_eq!(v2_layout_chunks(10, (4 << 20) + 1, true).unwrap(), 33);
+        assert_eq!(v2_layout_chunks(10, 1, true).unwrap(), 5, "小さいファイルも 1MiB の刻み");
         assert_eq!(v2_layout_chunks(10, 1, false).unwrap(), 1);
         // 上限ちょうどは通り、頭打ちが効いて切り上げでも上限を超えない
         let max = max_chunks_v2(100);
         assert!(max > 2048 && !max.is_power_of_two());
         let at_max = max as u64 * plain;
         assert_eq!(v2_layout_chunks(100, at_max, true).unwrap(), max);
-        assert_eq!(v2_layout_chunks(100, 2049 * plain, true).unwrap(), max, "2049 チャンクは上限まで切り上がる");
-        assert_eq!(v2_layout_chunks(100, 2048 * plain, true).unwrap(), 2048);
+        assert_eq!(v2_layout_chunks(100, 2049 * plain, true).unwrap(), max, "2^29 バイトを超えると上限まで切り上がる");
+        assert_eq!(v2_layout_chunks(100, 1 << 29, true).unwrap(), 2049, "ちょうど 2^29 バイトの刻み");
         assert!(manifest_v2_sealed_len(100, v2_layout_chunks(100, at_max, true).unwrap()).unwrap() <= SINGLE_BODY_LIMIT);
         // 上限を超えれば pad の有無にかかわらず断る
         assert!(v2_layout_chunks(100, at_max + 1, true).is_err());

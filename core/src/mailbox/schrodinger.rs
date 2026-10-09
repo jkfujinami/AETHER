@@ -380,7 +380,7 @@ impl SchrodingerMailbox {
     /// （[`place_object`](Self::place_object)）で置く。同じ中身のチャンクは収束暗号で同じシャード・
     /// 同じハッシュになり、2 回目の put は保持者が同じ値として受ける。
     ///
-    /// `pad` なら、チャンク数を 2 倍刻みに切り上げ（[`chunk::padded_chunk_count`]）、足した分は
+    /// `pad` なら、大きさをバイトの 2 の冪に切り上げ（[`chunk::padded_chunks_for_size`]）、足した分は
     /// ファイルごとに別の中身の埋め草のチャンクにして**本物の後ろに**置く
     /// （[`chunk::pad_chunk_plain`]）。`size` は本当の大きさのまま ── 取る側は復元後に `size` で
     /// 切るので埋め草は落ちる。Manifest は暗号化されていて、ガードには見えない。
@@ -1161,11 +1161,11 @@ mod tests {
         use sha2::Digest;
         let mailbox = create_dummy_mailbox();
         let secret = [9u8; 32];
-        let size = 4 * chunk::V2_CHUNK_PLAIN + 777; // 5 チャンク → 8 に切り上げ
+        let size = 4 * chunk::V2_CHUNK_PLAIN + 777; // 1MiB 強 → 2MiB の刻みで 9 チャンク
         let data: Vec<u8> = (0..size).map(|i| (i * 13 % 247) as u8).collect();
         let hash: [u8; 32] = Sha256::digest(&data).into();
         let total = chunk::v2_layout_chunks(5, size as u64, true).unwrap();
-        assert_eq!(total, 8);
+        assert_eq!(total, 9);
 
         let mut restored = Vec::new();
         let mut index = 0;
@@ -1185,10 +1185,10 @@ mod tests {
                 restored.extend(mailbox.decrypt_mailbox_value(&object, &secret).unwrap());
             }
         }
-        assert_eq!(restored.len(), 8 * chunk::V2_CHUNK_PLAIN);
+        assert_eq!(restored.len(), 9 * chunk::V2_CHUNK_PLAIN);
         restored.truncate(size);
         assert_eq!(restored, data, "size で切ると元のファイル");
         let distinct: std::collections::HashSet<_> = all_hashes.iter().collect();
-        assert_eq!(distinct.len(), 8, "埋め草も含めて、データシャードのハッシュはすべて別");
+        assert_eq!(distinct.len(), 9, "埋め草も含めて、データシャードのハッシュはすべて別");
     }
 }
