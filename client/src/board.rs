@@ -90,8 +90,11 @@ pub fn build_board(found: &[IndexDescriptor], pow: &[u32], now: u64) -> Board {
             .then(found[a].content_ref.cmp(&found[b].content_ref))
     });
 
+    // 根が見つからないスレ（根のページを引いていない・保持者から消えた）は出さない。
+    // 先頭の投稿に親があるのは、親をたどれず先頭に回されたレス
     let threads = roots
         .into_iter()
+        .filter(|&r| found[r].parents.is_empty())
         .map(|r| Thread {
             heat: heat(r),
             posts: members[&r]
@@ -144,6 +147,15 @@ mod tests {
             .unwrap();
         let names: Vec<_> = t1.posts.iter().map(|p| (p.name.as_str(), p.depth)).collect();
         assert_eq!(names, vec![("p1", 0), ("p2", 1), ("p4", 2)]);
+    }
+
+    #[test]
+    fn replies_without_their_root_are_not_shown_as_a_thread() {
+        // 根（1）のページを引いていない。2 は 1 の子、3 は別のスレの根
+        let found = vec![post(2, &[1], 110), post(3, &[], 105)];
+        let board = build_board(&found, &[0, 0], 200);
+        assert_eq!(board.threads.len(), 1);
+        assert_eq!(board.threads[0].posts[0].name, "p3");
     }
 
     #[test]

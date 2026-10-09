@@ -15,6 +15,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_dialog::DialogExt;
 use tokio::sync::RwLock;
 
 /// 画面へ流すイベント名（中身は [`aether_client::ClientEvent`]）
@@ -337,6 +338,85 @@ pub async fn bbs_reply(
         .bbs_reply(&BoardId::parse(&board).map_err(err)?, &ctx, &body)
         .await
         .map_err(err)
+}
+
+/// ファイルを選んで、スレに添付する。キャンセルなら `None`
+///
+/// ダイアログはこちら（Rust 側）から出す。`name` が空なら元のファイル名を使う。
+/// 上限を超えるファイルは、読む前に大きさで断る。進み具合は `ticket` 付きの SendStatus で流れる。
+#[tauri::command]
+pub async fn bbs_attach_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    board: String,
+    ctx: ReplyContext,
+    name: Option<String>,
+    ticket: u64,
+) -> CmdResult<Option<Res>> {
+    let client = state.client().await?;
+    let board = BoardId::parse(&board).map_err(err)?;
+
+    let picked = tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_file())
+        .await
+        .map_err(err)?;
+    let Some(picked) = picked else { return Ok(None) };
+    let path = picked.into_path().map_err(err)?;
+
+    let name = match name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
+        Some(n) => n,
+        None => path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| "ファイル名を入れてください".to_string())?,
+    };
+    // 読む前に大きさで断る（巨大なファイルをメモリに載せない）
+    let len = std::fs::metadata(&path).map_err(err)?.len();
+    let max = aether_core::mailbox::chunk::max_file_size_v2(name.len());
+    if len > max {
+        return Err(format!("ファイルが大きすぎます（上限 約 {} MB）", max / 1_000_000));
+    }
+    let content = std::fs::read(&path).map_err(err)?;
+    client
+        .bbs_attach_file(&board, &ctx, &name, content, ticket)
+        .await
+        .map(Some)
+        .map_err(err)
+}
+
+/// スレのファイルを取って、選んだ場所に保存する。キャンセルなら `false`
+///
+/// 保存名の初期値は網から来た名前を無害にしたもの。**取ったファイルを開かない。**
+#[tauri::command]
+pub async fn bbs_save_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    board: String,
+    content_ref: String,
+    suggested_name: String,
+) -> CmdResult<bool> {
+    let client = state.client().await?;
+    let board = BoardId::parse(&board).map_err(err)?;
+    let content_ref = hex::decode(&content_ref)
+        .ok()
+        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+        .ok_or_else(|| "ファイルの参照が正しくありません".to_string())?;
+
+    let initial = aether_client::bbs::safe_file_name(&suggested_name);
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog().file().set_file_name(initial).blocking_save_file()
+    })
+    .await
+    .map_err(err)?;
+    let Some(picked) = picked else { return Ok(false) };
+    let path = picked.into_path().map_err(err)?;
+
+    let fetched = client
+        .get(&board, content_ref)
+        .await
+        .map_err(err)?
+        .ok_or_else(|| "ファイルを取得できませんでした（保持者に届いていないか、期限切れです）".to_string())?;
+    std::fs::write(&path, &fetched.bytes).map_err(err)?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------- 友だち・トーク

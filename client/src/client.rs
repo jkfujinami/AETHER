@@ -43,6 +43,8 @@ pub struct AetherClient {
     pub(crate) circuit_pool: tokio::sync::Mutex<Vec<crate::pull::PooledCircuit>>,
     /// 保持者の役割と外（試験・診断）の共有部分。常駐のときだけ中身が動く
     pub(crate) holder: Arc<crate::storage::HolderShared>,
+    /// 見た根の索引の記録（レスでスレを今日のページへ上げるため。メモリだけ・上限つき）
+    pub(crate) index_memory: std::sync::Mutex<crate::index_pages::RecordMemory>,
 }
 
 impl AetherClient {
@@ -76,6 +78,8 @@ impl AetherClient {
                         advertise_self: false,
                         directory_pow_difficulty: config.network.directory_pow_difficulty,
                         pow_difficulty: config.network.hint_pow_difficulty,
+                        guest_upload_rate: config.network.guest_upload_rate,
+                        relay_upload_rate: config.network.relay_upload_rate,
                         ..Default::default()
                     },
                 ),
@@ -88,6 +92,8 @@ impl AetherClient {
                         node_id_pow_nonce: keys.load_relay_pow(),
                         directory_pow_difficulty: config.network.directory_pow_difficulty,
                         pow_difficulty: config.network.hint_pow_difficulty,
+                        guest_upload_rate: config.network.guest_upload_rate,
+                        relay_upload_rate: config.network.relay_upload_rate,
                         ..Default::default()
                     };
                     if opts.pow_difficulty < core_config.directory_pow_difficulty {
@@ -238,6 +244,7 @@ impl AetherClient {
             traffic: Default::default(),
             circuit_pool: Default::default(),
             holder: Default::default(),
+            index_memory: Default::default(),
         });
         // 一回限りでも動かす（CLI の send/get も待たずに済む）
         client.spawn_circuit_pool_refill();

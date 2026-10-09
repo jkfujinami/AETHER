@@ -43,9 +43,9 @@ pub enum PacketType {
     MailboxResponse = 0x22,
 
     // 索引層 (19.7 / Phase 2-3)
-    /// 索引に記述子を1件追加: `[index_key(32)][record_id(32)][record...]`
+    /// 索引のページに記述子を1件追加: `[page_key(32)][record_id(32)][record...]`
     IndexPut = 0x23,
-    /// 索引の列挙要求: `[index_key(32)][bincode(TunnelEndpoint)]`（返信は tunnel 経由）
+    /// 索引のページの列挙要求: `[page_key(32)][bincode(TunnelEndpoint)]`（返信は tunnel 経由）
     IndexQuery = 0x24,
 
     // Peer Exchange (0x4x)

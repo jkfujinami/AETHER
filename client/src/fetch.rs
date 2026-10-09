@@ -16,7 +16,8 @@ use crate::events;
 use crate::pull::PullSession;
 use crate::boards::BoardId;
 use aether_core::mailbox::chunk::{self, Manifest, ManifestV2, StripeV2};
-use aether_core::mailbox::index::IndexDescriptor;
+use crate::index_pages::{INDEX_HEDGE, fill_known_roots, index_ask_count, search_days};
+use aether_core::mailbox::index::{self, IndexDescriptor};
 use aether_core::mailbox::schrodinger::{K_REPLICAS, SchrodingerMailbox};
 use aether_core::mailbox::sharding::{DATA_SHARDS, TOTAL_SHARDS};
 use aether_core::mailbox::sharding_v2;
@@ -387,35 +388,81 @@ impl AetherClient {
     }
 
     /// 索引の記述子をそのまま返す（掲示板の表示を呼び出し側で組む用）
+    ///
+    /// 今日から [`SEARCH_DAYS`] 日分のページを並行に引いて合わせる。各ページはまず近い担当
+    /// 2 台に聞き、[`INDEX_HEDGE`] 経っても返事が無いページだけ残りの担当にも聞く
+    /// （Part 25 の P13）。
     pub async fn search_raw(&self, board: &BoardId) -> Result<(Vec<IndexDescriptor>, Vec<u32>)> {
         let k_pub = board.key();
         let session = self.open_pull_session(HashMap::new()).await?;
         events::progress(&self.events, format!("板 #{} の索引を引いています...", board.fingerprint()));
 
-        session.mailbox.query_index(&k_pub, &session.reply_to).await?;
+        // ページごとの担当（近い順）、すでに聞いた台数、返事があったか
+        struct Page {
+            day: u32,
+            targets: Vec<std::net::SocketAddr>,
+            asked: usize,
+            replied: bool,
+        }
+        let mut pages: HashMap<[u8; 32], Page> = HashMap::new();
+        for day in search_days(aether_core::protocol::hint::current_timestamp()) {
+            let targets = session.mailbox.index_page_targets(&k_pub, day).await;
+            pages.insert(index::index_page_key(&k_pub, day), Page { day, targets, asked: 0, replied: false });
+        }
 
         let mut seen = HashSet::new();
         let mut found = Vec::new();
         let mut pow = Vec::new();
-        let until = tokio::time::Instant::now() + SEARCH_WAIT;
-        let mut last_new: Option<tokio::time::Instant> = None;
+        let start = tokio::time::Instant::now();
+        let until = start + SEARCH_WAIT;
+        // 静けさは、最後の新着か、残りの担当へ広げた時点の遅い方から測る
+        // （広げた先の返事を待たずに打ち切らないため）
+        let mut last_event: Option<tokio::time::Instant> = None;
+        let mut hedged = false;
         while tokio::time::Instant::now() < until {
+            let elapsed = start.elapsed();
+            for page in pages.values_mut() {
+                let want = index_ask_count(elapsed, page.replied, page.targets.len());
+                if want > page.asked {
+                    session
+                        .mailbox
+                        .query_index_page(&k_pub, page.day, &session.reply_to, &page.targets[page.asked..want])
+                        .await?;
+                    if page.asked > 0 {
+                        hedged = true;
+                    }
+                    page.asked = want;
+                }
+            }
+            if hedged && last_event.is_none_or(|t| t < start + INDEX_HEDGE) {
+                last_event = Some(start + INDEX_HEDGE);
+            }
+
             let raw = self.take_replies(&session.receive_tunnel_id).await?;
             if !raw.is_empty() {
                 let decrypted = session.mailbox.decrypt_replies(&raw);
-                for (d, bits) in session.mailbox.decode_index_replies(&decrypted, &k_pub) {
-                    if seen.insert(d.content_ref) {
-                        found.push(d);
-                        pow.push(bits);
-                        last_new = Some(tokio::time::Instant::now());
+                for r in session.mailbox.decode_index_replies(&decrypted, &k_pub) {
+                    let Some(page) = pages.get_mut(&r.page_key) else { continue };
+                    page.replied = true;
+                    // 根の記録は、レスで上げ直すために元のバイト列を覚えておく
+                    if r.descriptor.parents.is_empty() {
+                        self.remember_root(&k_pub, &r.descriptor.content_ref, &r.record, page.day);
+                    }
+                    if seen.insert(r.descriptor.content_ref) {
+                        found.push(r.descriptor);
+                        pow.push(r.pow_bits);
+                        last_event = Some(tokio::time::Instant::now());
                     }
                 }
             }
-            if last_new.is_some_and(|t| t.elapsed() >= SEARCH_QUIET) {
+            if last_event.is_some_and(|t| t.elapsed() >= SEARCH_QUIET) {
                 break;
             }
             tokio::time::sleep(POLL).await;
         }
+
+        // 根のページを引いていないスレ（7 日より前に立ったもの）は、覚えている根で補う
+        fill_known_roots(&mut found, &mut pow, &self.index_memory.lock().unwrap(), &k_pub);
         Ok((found, pow))
     }
 

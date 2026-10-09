@@ -19,6 +19,7 @@ pub mod port_mapping;
 pub mod punch;
 pub mod reachability;
 pub mod shaper;
+pub mod rate_limit; // ガードでの IP ごとの上り制限
 pub mod tunnel;
 pub mod connection_pool;
 pub mod dandelion; // Dandelion++ 放流元秘匿（3-2）

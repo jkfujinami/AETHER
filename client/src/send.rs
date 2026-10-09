@@ -194,7 +194,7 @@ impl AetherClient {
     /// 大きな内容はチャンク化して content-address で置き、Hint は流さない（pull 専用）。
     /// どちらも索引に記述子を載せるので、キーワードで検索できる。
     pub async fn publish(&self, post: PublicPost) -> Result<SendReport> {
-        self.publish_inner(post, None).await
+        self.publish_inner(post, None, false).await
     }
 
     /// 大きなファイルの記述子を出すまでの進み具合を
@@ -202,10 +202,36 @@ impl AetherClient {
     ///
     /// 小さな投稿の流れ（Hint の放流）は [`publish`](Self::publish) と変わらず、`ticket` は使わない。
     pub async fn publish_tracked(&self, post: PublicPost, ticket: u64) -> Result<SendReport> {
-        self.publish_inner(post, Some(ticket)).await
+        self.publish_inner(post, Some(ticket), false).await
     }
 
-    async fn publish_inner(&self, post: PublicPost, ticket: Option<u64>) -> Result<SendReport> {
+    /// 添付ファイルを置く。**大きさによらず常に v2（チャンク化）で置く**
+    ///
+    /// 記述子の `chunked = true` がファイルの印になる（掲示板は本文を取りに行かず、
+    /// 名前と大きさだけを見せる）。小さなファイルも最小 1MiB への切り上げが効く。
+    /// `ticket` があれば [`ClientEvent::SendStatus`](crate::ClientEvent::SendStatus) を流す。
+    pub async fn publish_file(
+        &self,
+        board: &BoardId,
+        name: &str,
+        content: Vec<u8>,
+        parents: Vec<[u8; 32]>,
+        ticket: Option<u64>,
+    ) -> Result<SendReport> {
+        if content.is_empty() {
+            return Err(ClientError::invalid("空のファイルは添付できません"));
+        }
+        let post = PublicPost {
+            board: *board,
+            content,
+            name: name.to_string(),
+            parents,
+        };
+        self.publish_inner(post, ticket, true).await
+    }
+
+    /// `as_file` なら、小さくても v2 のファイルとして置く
+    async fn publish_inner(&self, post: PublicPost, ticket: Option<u64>, as_file: bool) -> Result<SendReport> {
         use aether_core::mailbox::chunk;
 
         let k_pub = post.board.key();
@@ -214,7 +240,8 @@ impl AetherClient {
         // 大きなファイルは、Manifest が 1 オブジェクトに収まる大きさまで。回路を組む前に、何も送らず断る
         // （切り上げた後のチャンク数で数える。頭打ちは上限なので、切り上げで断る範囲は変わらない）
         let pad = self.privacy().pad_file_size;
-        if chunk::needs_chunking(post.content.len()) {
+        let as_v2 = as_file || chunk::needs_chunking(post.content.len());
+        if as_v2 {
             let fits = chunk::v2_layout_chunks(post.name.len(), post.content.len() as u64, pad)
                 .and_then(|chunks| chunk::manifest_v2_sealed_len(post.name.len(), chunks))
                 .is_ok_and(|n| n <= chunk::SINGLE_BODY_LIMIT);
@@ -232,7 +259,7 @@ impl AetherClient {
         let hint_exit = hex_id(&hint_c.exit.node_id);
         let mailbox = self.sending_mailbox(body_c, hint_c, target, k_pub);
 
-        let report = if chunk::needs_chunking(post.content.len()) {
+        let report = if as_v2 {
             let (content_ref, profile) = mailbox.place_file_v2(&k_pub, &post.name, &post.content, pad).await?;
             // 利用者に見せるのは本当のチャンク数（埋め草は含めない）
             let chunks = chunk::v2_chunk_count(post.content.len() as u64);
@@ -258,7 +285,10 @@ impl AetherClient {
                 chunked: true,
                 parents: post.parents.clone(),
             };
-            mailbox.publish_descriptor(&k_pub, &descriptor).await?;
+            let record = mailbox.publish_descriptor(&k_pub, &descriptor).await?;
+            if descriptor.parents.is_empty() {
+                self.remember_root(&k_pub, &content_ref, &record, aether_core::mailbox::index::page_day(descriptor.timestamp));
+            }
             events::progress(&self.events, "索引に記述子を公開しました");
             self.send_status(ticket, SendState::Sent);
             SendReport {
@@ -283,7 +313,10 @@ impl AetherClient {
                 chunked: false,
                 parents: post.parents.clone(),
             };
-            mailbox.publish_descriptor(&k_pub, &descriptor).await?;
+            let record = mailbox.publish_descriptor(&k_pub, &descriptor).await?;
+            if descriptor.parents.is_empty() {
+                self.remember_root(&k_pub, &content_ref, &record, aether_core::mailbox::index::page_day(descriptor.timestamp));
+            }
             events::progress(&self.events, "索引に記述子を公開しました");
             SendReport {
                 body_exit,
@@ -328,7 +361,7 @@ impl AetherClient {
     /// 回路を書き出し終えるまで裏で保ってから閉じる
     ///
     /// 呼び出し元は待たずに次へ進める。プロセスを終える前は [`flush`](Self::flush) を呼ぶこと。
-    fn flush_in_background(&self, mailbox: SchrodingerMailbox) {
+    pub(crate) fn flush_in_background(&self, mailbox: SchrodingerMailbox) {
         let handle = tokio::spawn(async move {
             tokio::time::sleep(FLUSH_WAIT).await;
             drop(mailbox);

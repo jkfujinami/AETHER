@@ -46,6 +46,8 @@ const state = {
   active: null, // 開いているトークの node_id
   unread: new Map(), // node_id -> 件数
   nextTicket: 1,
+  // 添付中のファイル {ticket, status, delay}（同時に 1 つだけ）
+  attach: null,
 };
 
 // ================================================================ 共通
@@ -480,7 +482,30 @@ function postHeader(p) {
   ];
 }
 
+/** バイト数を KB / MB で読める形にする */
+function formatSize(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+/** スレの中のファイル。名前は網から来た値なので textContent で入れる */
+function fileBody(p) {
+  const save = el("button", { type: "button", class: "file-save", text: "保存" });
+  save.addEventListener("click", () => saveFile(p));
+  return [el("span", { text: `📎 ${p.file.name}（${formatSize(p.file.size)}）` }), save];
+}
+
+async function saveFile(p) {
+  const saved = await busy("ファイルを取得しています…", () =>
+    invoke("bbs_save_file", { board: state.board.uri, contentRef: p.content_ref, suggestedName: p.file.name }),
+  );
+  if (saved) toast("保存しました");
+}
+
 function postBody(p) {
+  if (p.file) return fileBody(p);
   if (p.missing) return [document.createTextNode("（このレスは取得できませんでした）")];
   return p.body.map((seg) => {
     if (seg.t === "text") return document.createTextNode(seg.text);
@@ -499,7 +524,7 @@ function renderPosts(posts) {
   dl.replaceChildren();
   for (const p of posts) {
     dl.append(el("dt", { id: `res-${p.no}` }, postHeader(p)));
-    dl.append(el("dd", { class: p.missing ? "missing" : "" }, postBody(p)));
+    dl.append(el("dd", { class: p.file ? "file" : p.missing ? "missing" : "" }, postBody(p)));
   }
 }
 
@@ -536,6 +561,58 @@ $("write-form").addEventListener("submit", async (ev) => {
   renderPosts(state.thread.posts);
   document.getElementById(`res-${res.no}`)?.scrollIntoView({ behavior: "smooth" });
   toast("書き込みました");
+});
+
+// 添付：名前と注意を見せてから、Rust 側がファイル選択のダイアログを出す
+$("btn-attach").addEventListener("click", () => {
+  if (!state.thread || state.attach) return;
+  $("attach-form").hidden = false;
+  $("attach-name").focus();
+});
+$("btn-attach-cancel").addEventListener("click", () => {
+  $("attach-form").hidden = true;
+  $("attach-name").value = "";
+});
+
+function renderAttachStatus() {
+  const box = $("attach-status");
+  const a = state.attach;
+  box.hidden = !a;
+  if (a) box.textContent = `ファイル：${statusText(a)}`;
+}
+
+$("attach-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const thread = state.thread;
+  if (!thread || state.attach) return;
+  const name = $("attach-name").value.trim() || null;
+  const ticket = state.nextTicket++;
+  state.attach = { ticket, status: "sending" };
+  $("attach-form").hidden = true;
+  renderAttachStatus();
+  let res;
+  try {
+    // 放流待ちで数分かかることがある。状態は SendStatus で更新される
+    res = await invoke("bbs_attach_file", { board: state.board.uri, ctx: thread.reply, name, ticket });
+  } catch (e) {
+    state.attach = null;
+    renderAttachStatus();
+    toast(String(e), "error");
+    log(String(e), "warn");
+    return;
+  }
+  state.attach = null;
+  renderAttachStatus();
+  if (!res) return; // ファイル選択をやめた
+  $("attach-name").value = "";
+  toast("添付しました");
+  // 自分のレスを末尾に足す（別のスレに移っていたら足さない）
+  if (state.thread === thread) {
+    thread.posts.push(res);
+    thread.reply.refs.push(res.content_ref);
+    renderPosts(thread.posts);
+    document.getElementById(`res-${res.no}`)?.scrollIntoView({ behavior: "smooth" });
+  }
 });
 
 // ================================================================ トーク（LINE 風）
@@ -706,6 +783,12 @@ function findByTicket(ticket) {
 }
 
 function updateSendStatus(ticket, status) {
+  if (state.attach?.ticket === ticket) {
+    state.attach.status = status.state;
+    if (status.state === "delayed") state.attach.delay = status.seconds;
+    renderAttachStatus();
+    return;
+  }
   const m = findByTicket(ticket);
   if (!m || m.status === "failed") return;
   m.status = status.state;

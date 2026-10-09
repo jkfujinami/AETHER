@@ -294,6 +294,8 @@ pub struct NodeServer {
     newer_protocol_seen: Arc<AtomicU8>,
     /// 自分宛てのトンネルの終端で、受け箱を通さず直接受け取る口
     tunnel_sinks: TunnelSinks,
+    /// 送り手の IP ごとの上り制限（記録は手元のメモリだけ）
+    upload_limiter: Arc<crate::net::rate_limit::UploadLimiter>,
 }
 
 
@@ -329,6 +331,8 @@ pub struct PacketContext {
     pub newer_protocol_seen: Arc<AtomicU8>,
     /// 自分宛てのトンネルの終端で、受け箱を通さず直接受け取る口
     tunnel_sinks: TunnelSinks,
+    /// 送り手の IP ごとの上り制限
+    pub upload_limiter: Arc<crate::net::rate_limit::UploadLimiter>,
 }
 
 impl PacketContext {
@@ -498,6 +502,7 @@ impl NodeServer {
             relay_meter: Arc::new(RelayMeter::default()),
             newer_protocol_seen: Arc::new(AtomicU8::new(0)),
             tunnel_sinks: Arc::new(Mutex::new(HashMap::new())),
+            upload_limiter: Arc::new(crate::net::rate_limit::UploadLimiter::from_config(&config)),
             epoch_beacon: config.epoch_beacon,
         })
     }
@@ -735,6 +740,7 @@ impl NodeServer {
                 relay_meter: self.relay_meter.clone(),
                 newer_protocol_seen: self.newer_protocol_seen.clone(),
                 tunnel_sinks: self.tunnel_sinks.clone(),
+                upload_limiter: self.upload_limiter.clone(),
             };
 
             tokio::spawn(async move {
@@ -765,6 +771,7 @@ impl NodeServer {
             relay_meter: self.relay_meter.clone(),
             newer_protocol_seen: self.newer_protocol_seen.clone(),
             tunnel_sinks: self.tunnel_sinks.clone(),
+            upload_limiter: self.upload_limiter.clone(),
         };
 
         while let Some(conn) = self.server.accept().await {
@@ -790,6 +797,10 @@ impl NodeServer {
             ctx.remote_addr = Some(remote);
 
             tokio::spawn(async move {
+                // 一覧に載っていない送り手は IP ごとに絞る。借りがある間は読まずに待つので、
+                // 送り手の側が止まる（捨てない）。待つのはこのストリームだけで、受け付けは止まらない
+                let class = ctx.upload_limiter.classify(&ctx.directory, remote).await;
+                let mut recv_stream = ctx.upload_limiter.wrap(&mut recv_stream, class, remote);
                 match wire::read_packet(&mut recv_stream).await {
                     Ok((packet_type, payload)) => {
                         debug!("Received packet: {:?} ({} bytes)", packet_type, payload.len());
@@ -1306,8 +1317,10 @@ impl NodeServer {
 
                 let records = ctx.mailbox.handle_index_list(&index_key).await?;
                 if !records.is_empty() {
-                    // 1メッセージにまとめて返す: [TunnelID(32)][bincode(Vec<record>)]
-                    let body = bincode::serialize(&records)
+                    // 1メッセージにまとめて返す: [TunnelID(32)][bincode((ページのキー, Vec<record>))]
+                    // ページのキーを添えるのは、読者が日ごとのページのどれに返事があったかを
+                    // 知って、返事の無いページだけ残りの担当に聞くため（Part 25 の P13）
+                    let body = bincode::serialize(&(index_key, &records))
                         .map_err(|e| crate::AetherError::Serialization(e.to_string()))?;
                     let mut tunnel_payload = Vec::with_capacity(32 + body.len());
                     tunnel_payload.extend_from_slice(&reply_to.tunnel_id);

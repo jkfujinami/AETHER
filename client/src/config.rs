@@ -79,6 +79,13 @@ pub struct NetworkParams {
     pub directory_pow_difficulty: u32,
     /// Hint に要求する PoW 難易度
     pub hint_pow_difficulty: u8,
+    /// ガードとして一覧に無い送り手から受ける上りの、IP ごとの速さ（バイト/秒。0 = 無制限）
+    ///
+    /// 各ガードの手元の判断なので他ノードと揃える必要はないが、127.0.0.1 に全部が
+    /// 集まる試験網で外せるよう、ここに置く。
+    pub guest_upload_rate: u64,
+    /// 一覧に載っているリレーから受ける上りの、IP ごとの速さ（0 = 無制限）
+    pub relay_upload_rate: u64,
 }
 
 impl Default for NetworkParams {
@@ -87,6 +94,8 @@ impl Default for NetworkParams {
         Self {
             directory_pow_difficulty: c.directory_pow_difficulty,
             hint_pow_difficulty: c.pow_difficulty,
+            guest_upload_rate: c.guest_upload_rate,
+            relay_upload_rate: c.relay_upload_rate,
         }
     }
 }

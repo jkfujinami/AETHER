@@ -64,13 +64,26 @@ pub struct IndexRecord {
     pub ciphertext: Vec<u8>,
 }
 
-/// 索引の配置キーを導出する
+/// 1 ページが受け持つ時間（秒）。UTC の 1 日
+pub const INDEX_PAGE_SECS: u64 = 86_400;
+
+/// 記述子の時刻が属するページの日（UTC の 0 時で切る）
+///
+/// 板の索引は 1 つのキーに 256 件までしか載らないので、日ごとのページに分けて
+/// 上限と担当の負荷を散らす（Part 25 の P13）。
+pub fn page_day(timestamp: u64) -> u32 {
+    (timestamp / INDEX_PAGE_SECS) as u32
+}
+
+/// 索引のページの配置キーを導出する（板の `K_pub` と日の組）
 ///
 /// これと `K_pub` を [`RelayDirectory::mailbox_targets`] に渡すと担当保持者が出る。
-pub fn index_key(k_pub: &[u8; 32]) -> [u8; 32] {
+/// 板が違えば鍵が違い、日が違えば担当も別の場所になる。
+pub fn index_page_key(k_pub: &[u8; 32], day: u32) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"aether_index_key_v1");
+    h.update(b"aether_index_page_v1");
     h.update(k_pub);
+    h.update(day.to_be_bytes());
     h.finalize().into()
 }
 
@@ -189,9 +202,19 @@ mod tests {
     }
 
     #[test]
-    fn index_key_is_deterministic_per_keyword() {
+    fn page_key_differs_by_day_and_board_but_not_within_a_day() {
         let k = [7u8; 32];
-        assert_eq!(index_key(&k), index_key(&k));
-        assert_ne!(index_key(&k), index_key(&[8u8; 32]));
+        assert_eq!(index_page_key(&k, 20_000), index_page_key(&k, 20_000));
+        assert_ne!(index_page_key(&k, 20_000), index_page_key(&k, 20_001), "日が違えばページも違う");
+        assert_ne!(index_page_key(&k, 20_000), index_page_key(&[8u8; 32], 20_000), "板が違えば違う");
+    }
+
+    #[test]
+    fn page_day_rolls_over_at_midnight_utc() {
+        let day = 20_000u64;
+        assert_eq!(page_day(day * 86_400), 20_000, "0 時ちょうどはその日");
+        assert_eq!(page_day(day * 86_400 + 86_399), 20_000, "23:59:59 まで同じ日");
+        assert_eq!(page_day((day + 1) * 86_400), 20_001, "次の 0 時で次の日");
+        assert_eq!(page_day(day * 86_400 - 1), 19_999);
     }
 }
