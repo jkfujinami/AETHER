@@ -642,6 +642,54 @@ impl SchrodingerMailbox {
         Ok(())
     }
 
+    /// 指定したシャードだけを、担当の指定した順位の保持者へ要求する（hedged request の 1 段）
+    ///
+    /// `wants` は `(シャード index, 担当の順位)`。順位は距離の近い順（0 が一番近い）で、
+    /// 担当がその順位まで居なければ飛ばす（小さな網では担当が重なる・足りない）。
+    /// 送った本数を返す。どの保持者に何番目で頼むかは手元で決めるだけで、網には出ない。
+    /// 全シャードへ一斉に出す [`request_body`](Self::request_body) とは別で、そちらは変えない。
+    pub async fn request_shards(
+        &self,
+        mailbox_key: &[u8; 32],
+        secret: &SharedSecret,
+        wants: &[(u8, usize)],
+    ) -> Result<usize> {
+        let reply_to = {
+            let tunnels = self.inbound_tunnels.lock().unwrap();
+            tunnels
+                .first()
+                .map(|t| t.endpoint.clone())
+                .ok_or(AetherError::Config(
+                    "No inbound tunnel; cannot receive the reply anonymously".into(),
+                ))?
+        };
+
+        let mut sent = 0;
+        // 同じシャードの担当表は一度だけ計算する
+        let mut targets_by_index: HashMap<u8, Vec<SocketAddr>> = HashMap::new();
+        for &(index, rank) in wants {
+            if index as usize >= sharding::TOTAL_SHARDS {
+                continue;
+            }
+            let targets = match targets_by_index.entry(index) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(self.shard_targets(mailbox_key, secret, index).await)
+                }
+            };
+            let Some(&target) = targets.get(rank) else {
+                continue;
+            };
+            let shard_key = sharding::shard_key(mailbox_key, index);
+            let request = wire::build_mailbox_get(&shard_key, &reply_to)?;
+            self.relay
+                .send_onion_message_typed(wire::PacketType::MailboxGet, &request, target)
+                .await?;
+            sent += 1;
+        }
+        Ok(sent)
+    }
+
     /// Inbound Tunnel に届いた応答を復号して取り出す
     ///
     /// `raw` は自ノードの Mailbox から `fetch_tunnel_messages` で取り出したもの。

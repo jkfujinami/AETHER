@@ -17,7 +17,8 @@ use crate::pull::PullSession;
 use crate::boards::BoardId;
 use aether_core::mailbox::chunk::Manifest;
 use aether_core::mailbox::index::IndexDescriptor;
-use aether_core::mailbox::schrodinger::SchrodingerMailbox;
+use aether_core::mailbox::schrodinger::{K_REPLICAS, SchrodingerMailbox};
+use aether_core::mailbox::sharding::{DATA_SHARDS, TOTAL_SHARDS};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -33,6 +34,51 @@ const SEARCH_QUIET: Duration = Duration::from_millis(1500);
 const OBJECT_WAIT: Duration = Duration::from_secs(15);
 /// 返信の到着を見に行く間隔
 const POLL: Duration = Duration::from_millis(100);
+/// 段 1（予備のシャードと 2 番目の担当へ広げる）までの待ち
+///
+/// 要求は回路・保持者・返信トンネルを通り、試験網の往復は数百 ms。その数倍待って
+/// 揃わなければ、遅いか落ちた保持者に当たったとみなす。実網で測って詰める。
+/// 早すぎると下りが減らず、遅すぎると取得が遅れる。
+const HEDGE_1: Duration = Duration::from_secs(2);
+/// 段 2（残りの担当すべてへ広げる）までの待ち
+///
+/// 段 1 でも揃わないのは、近い担当が軒並み不在という場合。上限 `OBJECT_WAIT`（15 秒）に
+/// 余裕を残して最後の手を打てるよう、`HEDGE_1` の倍強にしている。
+const HEDGE_2: Duration = Duration::from_secs(5);
+
+/// 経過時間に応じて、この時点までに送るべき `(シャード index, 担当の順位)` の組を返す
+///
+/// 復元に要るのは `DATA_SHARDS` 個だけなので、まず最も近い担当へ必要な分だけ要求し、
+/// 揃わなければ段階的に広げる（Part 23 の 8 章）。段は単調で、前の段の組は後にも含まれる。
+/// 重複は無い。
+fn hedge_plan(elapsed: Duration) -> Vec<(u8, usize)> {
+    let mut plan = Vec::new();
+    // 段 0: データシャードを一番近い担当へ
+    for i in 0..DATA_SHARDS {
+        plan.push((i as u8, 0));
+    }
+    if elapsed >= HEDGE_1 {
+        // 段 1: 予備のシャードを一番近い担当へ、データシャードを 2 番目の担当へ
+        for i in DATA_SHARDS..TOTAL_SHARDS {
+            plan.push((i as u8, 0));
+        }
+        for i in 0..DATA_SHARDS {
+            plan.push((i as u8, 1));
+        }
+    }
+    if elapsed >= HEDGE_2 {
+        // 段 2: まだ送っていない組すべて
+        for rank in 0..K_REPLICAS {
+            for i in 0..TOTAL_SHARDS {
+                let want = (i as u8, rank);
+                if !plan.contains(&want) {
+                    plan.push(want);
+                }
+            }
+        }
+    }
+    plan
+}
 
 /// 取得した内容
 #[derive(Debug, Clone, Serialize)]
@@ -172,13 +218,19 @@ impl AetherClient {
         wait: Duration,
         done: impl Fn(&[Option<Vec<u8>>]) -> bool,
     ) -> Result<Vec<Option<Vec<u8>>>> {
-        for (key, _) in mailbox_keys {
-            session.mailbox.request_object(key, secret).await?;
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; mailbox_keys.len()];
+        // 送った (オブジェクト, index, 順位)。同じ組を二度送らない
+        let mut sent: HashSet<(usize, u8, usize)> = HashSet::new();
+        let started = tokio::time::Instant::now();
+
+        // 段 0（すぐ）。担当が一台も居なければ、従来どおりここでエラーにする
+        let first = self.send_hedge(session, mailbox_keys, secret, &results, &mut sent, Duration::ZERO).await?;
+        if first == 0 {
+            return Err(crate::error::ClientError::network("リレーの一覧が空です"));
         }
 
-        let mut results: Vec<Option<Vec<u8>>> = vec![None; mailbox_keys.len()];
         let mut collected = Vec::new();
-        let until = tokio::time::Instant::now() + wait;
+        let until = started + wait;
         while tokio::time::Instant::now() < until {
             let raw = self.take_replies(&session.receive_tunnel_id).await?;
             if !raw.is_empty() {
@@ -196,8 +248,93 @@ impl AetherClient {
                     break;
                 }
             }
+            // 経過時間に応じて次の段へ。揃ったオブジェクトには送らない
+            self.send_hedge(session, mailbox_keys, secret, &results, &mut sent, started.elapsed()).await?;
             tokio::time::sleep(POLL).await;
         }
         Ok(results)
+    }
+
+    /// `hedge_plan(elapsed)` のうち、まだ揃っていないオブジェクトに未送信の組を送る
+    ///
+    /// 送った本数を返す。
+    async fn send_hedge(
+        &self,
+        session: &PullSession,
+        mailbox_keys: &[([u8; 32], [u8; 32])],
+        secret: &[u8; 32],
+        results: &[Option<Vec<u8>>],
+        sent: &mut HashSet<(usize, u8, usize)>,
+        elapsed: Duration,
+    ) -> Result<usize> {
+        let plan = hedge_plan(elapsed);
+        let mut total = 0;
+        for (obj, ((key, _), slot)) in mailbox_keys.iter().zip(results).enumerate() {
+            if slot.is_some() {
+                continue;
+            }
+            let wants: Vec<(u8, usize)> =
+                plan.iter().copied().filter(|&(i, r)| sent.insert((obj, i, r))).collect();
+            if wants.is_empty() {
+                continue;
+            }
+            total += session.mailbox.request_shards(key, secret, &wants).await?;
+        }
+        Ok(total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_duplicates(plan: &[(u8, usize)]) -> bool {
+        plan.iter().collect::<HashSet<_>>().len() == plan.len()
+    }
+
+    #[test]
+    fn hedge_plan_starts_with_data_shards_on_nearest_holder() {
+        let plan = hedge_plan(Duration::ZERO);
+        assert_eq!(plan, vec![(0, 0), (1, 0), (2, 0)], "段 0 は index 0,1,2 を順位 0 へ");
+    }
+
+    #[test]
+    fn hedge_plan_stage1_adds_parity_and_second_holder() {
+        let plan = hedge_plan(HEDGE_1);
+        assert!(no_duplicates(&plan), "重複が無いこと");
+        let got: HashSet<_> = plan.iter().copied().collect();
+        let want: HashSet<_> =
+            [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (0, 1), (1, 1), (2, 1)].into_iter().collect();
+        assert_eq!(got, want, "段 0 と段 1 の組だけ");
+    }
+
+    #[test]
+    fn hedge_plan_stage2_covers_every_shard_and_rank() {
+        let plan = hedge_plan(HEDGE_2);
+        assert!(no_duplicates(&plan), "重複が無いこと");
+        assert_eq!(plan.len(), TOTAL_SHARDS * K_REPLICAS, "5 index x 5 順位の 25 組");
+        for i in 0..TOTAL_SHARDS {
+            for r in 0..K_REPLICAS {
+                assert!(plan.contains(&(i as u8, r)), "({i}, {r}) が含まれること");
+            }
+        }
+    }
+
+    #[test]
+    fn hedge_plan_is_monotonic() {
+        let steps = [
+            Duration::ZERO,
+            HEDGE_1 - Duration::from_millis(1),
+            HEDGE_1,
+            HEDGE_2 - Duration::from_millis(1),
+            HEDGE_2,
+            OBJECT_WAIT,
+        ];
+        for pair in steps.windows(2) {
+            let before = hedge_plan(pair[0]);
+            let after = hedge_plan(pair[1]);
+            assert!(before.iter().all(|w| after.contains(w)), "前の段の組は後の段にも含まれる");
+        }
+        assert_eq!(hedge_plan(HEDGE_1 - Duration::from_millis(1)).len(), DATA_SHARDS, "段 1 の直前はまだ段 0");
     }
 }
