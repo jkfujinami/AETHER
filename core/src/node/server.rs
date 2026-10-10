@@ -599,6 +599,22 @@ impl NodeServer {
             .await
     }
 
+    /// 外部シグナリングサーバー（トラッカー）を介してピアを探索し、
+    /// ホールパンチングで NAT を抜いた上でブートストラップ（PexRequest）を実行する
+    pub async fn bootstrap_via_signaling(&self, signaling_url: &str) -> Result<Vec<SocketAddr>> {
+        use crate::net::signaling::SignalingClient;
+        let client = SignalingClient::new(
+            signaling_url,
+            self.descriptor.node_id,
+            vec![self.descriptor.addr],
+        );
+        let peers = client.discover_and_punch(&self.server.shared_socket(), std::time::Duration::from_secs(5)).await?;
+        for addr in &peers {
+            let _ = self.bootstrap(*addr).await;
+        }
+        Ok(peers)
+    }
+
     /// 自分宛ての TunnelBuild をネットワークを通さずに登録する
     ///
     /// Inbound Tunnel の終端（＝自分）への構築指示を自分の広告アドレスへ送ると、

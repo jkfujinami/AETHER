@@ -94,6 +94,10 @@ enum Commands {
         #[arg(short, long)]
         connect: Option<String>,
 
+        /// 外部シグナリングサーバー（トラッカー）のアドレス（例: wss://odd-puffin-5778.jkfujinami.deno.net）
+        #[arg(long)]
+        signaling: Option<String>,
+
         /// 到達可能と宣言するアドレス
         ///
         /// 公開 IP や手動ポート開放で到達性が分かっている場合に指定する。
@@ -303,6 +307,7 @@ async fn join_ephemeral(
             passphrase: env_passphrase(),
             port,
             seed: Some(connect.parse()?),
+            signaling: None,
             min_relays,
             mode: NodeMode::Ephemeral,
             network: Default::default(),
@@ -551,6 +556,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             relay,
             port,
             connect,
+            signaling,
             advertise,
             allow_port_mapping,
             pow_difficulty,
@@ -572,6 +578,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     passphrase: env_passphrase(),
                     port: *port,
                     seed: connect.as_deref().map(str::parse::<SocketAddr>).transpose()?,
+                    signaling: signaling.clone(),
                     min_relays: 2,
                     mode: if *relay {
                         NodeMode::Relay(RelayOptions {
@@ -589,8 +596,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 events,
             )
             .await?;
-            if connect.is_none() {
-                println!("種ノードが未指定です (--connect)。単独で待ち受けます");
+            if connect.is_none() && signaling.is_none() {
+                println!("種ノードが未指定です (--connect / --signaling)。単独で待ち受けます");
             }
             println!("待ち受け開始。Ctrl+C で停止します");
 

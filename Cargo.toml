@@ -56,6 +56,8 @@ bytes = "1"
 hex = "0.4"
 stun = "0.6"  # Added for STUN support
 socket2 = "0.5"  # デュアルスタック bind (v6only=false)
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
 
 # CLI用
 clap = { version = "4", features = ["derive"] }

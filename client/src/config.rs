@@ -16,6 +16,8 @@ pub struct ClientConfig {
     pub port: u16,
     /// 種ノード
     pub seed: Option<SocketAddr>,
+    /// シグナリングサーバー（トラッカー）の WebSocket URL
+    pub signaling: Option<String>,
     /// 回路を組む前に待つ既知リレー数の下限
     pub min_relays: usize,
     pub mode: NodeMode,

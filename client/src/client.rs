@@ -215,7 +215,20 @@ impl AetherClient {
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        if let Some(seed) = config.seed {
+        if let Some(signaling_url) = &config.signaling {
+            events::progress(&events, format!("シグナリングサーバー {} へ参加要求を送信中...", signaling_url));
+            match node.bootstrap_via_signaling(signaling_url).await {
+                Ok(peers) => {
+                    events::progress(
+                        &events,
+                        format!("シグナリング経由で {} 件のピアを発見し、パンチングを実行しました", peers.len()),
+                    );
+                }
+                Err(e) => {
+                    events::warning(&events, format!("シグナリング接続に失敗しました: {}", e));
+                }
+            }
+        } else if let Some(seed) = config.seed {
             node.bootstrap(seed).await?;
             events::progress(&events, format!("種ノード {} へ参加要求を送信しました", seed));
         }

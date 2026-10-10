@@ -24,6 +24,7 @@ pub mod tunnel;
 pub mod connection_pool;
 pub mod dandelion; // Dandelion++ 放流元秘匿（3-2）
 pub mod epoch; // エポックビーコン（drand 由来の日次シード / 3-4）
+pub mod signaling; // トラッカー経由の外部シグナリング
 
 pub use quic::{QuicClient, QuicServer, QuicConnection};
 pub use stun::StunResolver;
