@@ -116,7 +116,7 @@ async fn shards_go_to_holders_through_their_inlets_and_only_the_guard_sends_to_a
 
     // --- v2 の大きなファイル（2MiB） ---
     let big: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
-    let chunks = chunk::v2_layout_chunks("big".len(), big.len() as u64, false).unwrap();
+    let chunks = chunk::v2_layout_chunks(big.len() as u64, false).unwrap();
     let v2_shards: usize = chunk::v2_stripe_shapes(chunks).unwrap().iter().map(|(k, m)| k + m).sum();
     let big_copy = big.clone();
     publisher

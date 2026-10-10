@@ -345,7 +345,7 @@ pub async fn bbs_reply(
 /// ファイルを選んで、スレに添付する。キャンセルなら `None`
 ///
 /// ダイアログはこちら（Rust 側）から出す。`name` が空なら元のファイル名を使う。
-/// 上限を超えるファイルは、読む前に大きさで断る。進み具合は `ticket` 付きの SendStatus で流れる。
+/// 上限を超えるファイルは、読む前に大きさで断る（ファイルは全部メモリに載せない）。進み具合は `ticket` 付きの SendStatus で流れる。
 #[tauri::command]
 pub async fn bbs_attach_file(
     app: AppHandle,
@@ -371,15 +371,9 @@ pub async fn bbs_attach_file(
             .map(|n| n.to_string_lossy().into_owned())
             .ok_or_else(|| "ファイル名を入れてください".to_string())?,
     };
-    // 読む前に大きさで断る（巨大なファイルをメモリに載せない）
-    let len = std::fs::metadata(&path).map_err(err)?.len();
-    let max = aether_core::mailbox::chunk::max_file_size_v2(name.len());
-    if len > max {
-        return Err(format!("ファイルが大きすぎます（上限 約 {} MB）", max / 1_000_000));
-    }
-    let content = std::fs::read(&path).map_err(err)?;
+    // 上限の判定と読み込みは client 側（大きさは metadata で見て、ディスクから少しずつ読む）
     client
-        .bbs_attach_file(&board, &ctx, &name, content, ticket)
+        .bbs_attach_file(&board, &ctx, &name, &path, ticket)
         .await
         .map(Some)
         .map_err(err)
@@ -412,12 +406,12 @@ pub async fn bbs_save_file(
     let Some(picked) = picked else { return Ok(false) };
     let path = picked.into_path().map_err(err)?;
 
-    let fetched = client
-        .get(&board, content_ref)
+    // 同じフォルダの一時ファイルへ順に書き、そろったら名前を付け替える（途中で失敗したら消える）
+    client
+        .get_to_path(&board, content_ref, &path)
         .await
         .map_err(err)?
         .ok_or_else(|| "ファイルを取得できませんでした（保持者に届いていないか、期限切れです）".to_string())?;
-    std::fs::write(&path, &fetched.bytes).map_err(err)?;
     Ok(true)
 }
 

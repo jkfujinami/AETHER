@@ -21,6 +21,7 @@ pub fn test_network() -> NetworkParams {
         // 全部 127.0.0.1 なので、IP ごとの上り制限は外す
         guest_upload_rate: 0,
         relay_upload_rate: 0,
+        manifest_page_stripes: None,
     }
 }
 

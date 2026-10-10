@@ -57,7 +57,7 @@ pub use client::{AetherClient, Status};
 pub use config::{ClientConfig, NetworkParams, NodeMode, PrivacyOptions, RelayOptions};
 pub use error::{ClientError, Result};
 pub use events::{ClientEvent, EventSender, MessageSource, SendState, event_channel};
-pub use fetch::Fetched;
+pub use fetch::{Fetched, FetchedInfo, GET_IN_MEMORY_LIMIT};
 pub use friends::{Friend, FriendCode, friend_code, parse_friend_code, parse_friend_id};
 pub use keys::KeyFiles;
 pub use receive::Contact;

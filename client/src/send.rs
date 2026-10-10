@@ -237,21 +237,12 @@ impl AetherClient {
         let k_pub = post.board.key();
         let target = board_target(&k_pub);
 
-        // 大きなファイルは、Manifest が 1 オブジェクトに収まる大きさまで。回路を組む前に、何も送らず断る
+        // 大きなファイルは、上限（MAX_FILE_BYTES）まで。回路を組む前に、何も送らず断る
         // （切り上げた後のチャンク数で数える。頭打ちは上限なので、切り上げで断る範囲は変わらない）
         let pad = self.privacy().pad_file_size;
         let as_v2 = as_file || chunk::needs_chunking(post.content.len());
         if as_v2 {
-            let fits = chunk::v2_layout_chunks(post.name.len(), post.content.len() as u64, pad)
-                .and_then(|chunks| chunk::manifest_v2_sealed_len(post.name.len(), chunks))
-                .is_ok_and(|n| n <= chunk::SINGLE_BODY_LIMIT);
-            if !fits {
-                let max = chunk::max_file_size_v2(post.name.len());
-                return Err(ClientError::invalid(format!(
-                    "ファイルが大きすぎます（上限 約 {} MB）",
-                    max / 1_000_000
-                )));
-            }
+            self.check_file_fits(post.name.len(), post.content.len() as u64, pad)?;
         }
 
         let (body_c, hint_c) = self.body_and_hint_circuits().await?;
@@ -261,44 +252,15 @@ impl AetherClient {
 
         let report = if as_v2 {
             let (content_ref, profile) = mailbox.place_file_v2(&k_pub, &post.name, &post.content, pad).await?;
-            // 利用者に見せるのは本当のチャンク数（埋め草は含めない）
-            let chunks = chunk::v2_chunk_count(post.content.len() as u64);
-            events::progress(
-                &self.events,
-                format!(
-                    "{} チャンクに分割して配置しました ({} バイト、{} バイト送出)",
-                    chunks,
-                    post.content.len(),
-                    profile.bytes
-                ),
-            );
-            self.send_status(ticket, SendState::Placed);
-            // 上げ終わった時刻と記述子が出る時刻を結びつけさせないため、窓の中でばらけて待つ。
-            // Hint は出さない（大きなファイルは pull 専用）。待つのは索引に出すことだけ
-            self.wait_before_descriptor(&mailbox, &profile, ticket).await;
-            // 待った分だけ時刻が進むので、記述子の時刻は出す直前に取る
             let descriptor = IndexDescriptor {
                 content_ref,
                 name: post.name.clone(),
                 size: post.content.len() as u64,
-                timestamp: current_timestamp(),
+                timestamp: 0,
                 chunked: true,
                 parents: post.parents.clone(),
             };
-            let record = mailbox.publish_descriptor(&k_pub, &descriptor).await?;
-            if descriptor.parents.is_empty() {
-                self.remember_root(&k_pub, &content_ref, &record, aether_core::mailbox::index::page_day(descriptor.timestamp));
-            }
-            events::progress(&self.events, "索引に記述子を公開しました");
-            self.send_status(ticket, SendState::Sent);
-            SendReport {
-                body_exit,
-                hint_exit: None,
-                bytes: post.content.len() as u64,
-                content_ref: Some(hex::encode(content_ref)),
-                chunks: Some(chunks),
-                message_id: None,
-            }
+            self.announce_file(&mailbox, &k_pub, descriptor, &profile, ticket, body_exit).await?
         } else {
             // 内容アドレスで置く（取得側が中身を ref と照合できる）
             let (hint, content_ref, profile) = mailbox.place_public_body(&k_pub, &post.content).await?;
@@ -330,6 +292,120 @@ impl AetherClient {
 
         self.flush_in_background(mailbox);
         Ok(report)
+    }
+
+    /// ディスクのファイルを読みながら置く。**全体をメモリに持たない**（添付ファイル）
+    ///
+    /// [`publish_file`](Self::publish_file) と同じく、大きさによらず常に v2 で置く。
+    /// 上限の判定は `std::fs::metadata` の大きさで、置く前（回路を組む前）に行う。
+    /// 置いている間、1 秒ごとに「置いています N/M ストライプ」を流す。
+    pub async fn publish_file_from_path(
+        &self,
+        board: &BoardId,
+        name: &str,
+        path: &std::path::Path,
+        parents: Vec<[u8; 32]>,
+        ticket: Option<u64>,
+    ) -> Result<SendReport> {
+        let meta = std::fs::metadata(path)
+            .map_err(|e| ClientError::invalid(format!("ファイルを読めません: {}", e)))?;
+        if !meta.is_file() {
+            return Err(ClientError::invalid("通常のファイルを選んでください"));
+        }
+        let size = meta.len();
+        if size == 0 {
+            return Err(ClientError::invalid("空のファイルは添付できません"));
+        }
+        let k_pub = board.key();
+        let pad = self.privacy().pad_file_size;
+        self.check_file_fits(name.len(), size, pad)?;
+
+        let (body_c, hint_c) = self.body_and_hint_circuits().await?;
+        let body_exit = hex_id(&body_c.exit.node_id);
+        let mailbox = self.sending_mailbox(body_c, hint_c, board_target(&k_pub), k_pub);
+
+        let events = self.events.clone();
+        let mut last = std::time::Instant::now();
+        let mut progress = move |done: usize, total: usize| {
+            if last.elapsed() >= Duration::from_secs(1) {
+                last = std::time::Instant::now();
+                events::progress(&events, format!("置いています {}/{} ストライプ", done, total));
+            }
+        };
+        let (content_ref, profile) = mailbox
+            .place_file_v2_from_path(&k_pub, name, path, pad, self.page_cap, &mut progress)
+            .await?;
+        let descriptor = IndexDescriptor {
+            content_ref,
+            name: name.to_string(),
+            size,
+            timestamp: 0,
+            chunked: true,
+            parents,
+        };
+        let report = self.announce_file(&mailbox, &k_pub, descriptor, &profile, ticket, body_exit).await?;
+        self.flush_in_background(mailbox);
+        Ok(report)
+    }
+
+    /// 大きさが置ける範囲か（上限と、目次の形）を、何も送らずに確かめる
+    fn check_file_fits(&self, name_len: usize, size: u64, pad: bool) -> Result<()> {
+        use aether_core::mailbox::chunk;
+        let fits = chunk::v2_layout_chunks(size, pad)
+            .and_then(|chunks| chunk::plan_manifest(name_len, chunks, self.page_cap))
+            .is_ok();
+        if !fits {
+            return Err(ClientError::invalid(format!(
+                "ファイルが大きすぎます（上限 {} GiB）",
+                chunk::MAX_FILE_BYTES >> 30
+            )));
+        }
+        Ok(())
+    }
+
+    /// 置き終えたファイルの記述子を、窓の中でばらけて待ってから索引に出す
+    ///
+    /// `descriptor.timestamp` は出す直前に取り直す。Hint は出さない（大きなファイルは pull 専用）。
+    async fn announce_file(
+        &self,
+        mailbox: &SchrodingerMailbox,
+        k_pub: &[u8; 32],
+        mut descriptor: IndexDescriptor,
+        profile: &UploadProfile,
+        ticket: Option<u64>,
+        body_exit: String,
+    ) -> Result<SendReport> {
+        use aether_core::mailbox::chunk;
+        // 利用者に見せるのは本当のチャンク数（埋め草は含めない）
+        let chunks = chunk::v2_chunk_count(descriptor.size);
+        events::progress(
+            &self.events,
+            format!(
+                "{} チャンクに分割して配置しました ({} バイト、{} バイト送出)",
+                chunks, descriptor.size, profile.bytes
+            ),
+        );
+        self.send_status(ticket, SendState::Placed);
+        // 上げ終わった時刻と記述子が出る時刻を結びつけさせないため、窓の中でばらけて待つ。
+        // 待つのは索引に出すことだけ
+        self.wait_before_descriptor(mailbox, profile, ticket).await;
+        // 待った分だけ時刻が進むので、記述子の時刻は出す直前に取る
+        descriptor.timestamp = current_timestamp();
+        let content_ref = descriptor.content_ref;
+        let record = mailbox.publish_descriptor(k_pub, &descriptor).await?;
+        if descriptor.parents.is_empty() {
+            self.remember_root(k_pub, &content_ref, &record, aether_core::mailbox::index::page_day(descriptor.timestamp));
+        }
+        events::progress(&self.events, "索引に記述子を公開しました");
+        self.send_status(ticket, SendState::Sent);
+        Ok(SendReport {
+            body_exit,
+            hint_exit: None,
+            bytes: descriptor.size,
+            content_ref: Some(hex::encode(content_ref)),
+            chunks: Some(chunks),
+            message_id: None,
+        })
     }
 
     /// 本体用と Hint 用の回路（出口を分ける）

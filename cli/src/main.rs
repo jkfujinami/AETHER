@@ -430,19 +430,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         } => {
             use aether_core::crypto::identity::NodeId;
 
-            // 送る中身：--message（テキスト）か --file（ファイル）
+            // 送る中身：--message（テキスト）か --file（ファイル）。
+            // 板へのファイルは、ディスクから少しずつ読む（全部はメモリに載せない）
+            let file_name_of = |path: &str| {
+                std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("file")
+                    .to_string()
+            };
             let (content, default_name): (Vec<u8>, String) = match (message, file) {
                 (Some(m), None) => (m.as_bytes().to_vec(), m.chars().take(40).collect()),
-                (None, Some(path)) => {
+                // 私信は小さな本文の経路なので、読み込む
+                (None, Some(path)) if to.is_some() => {
                     let bytes = std::fs::read(path)
                         .map_err(|e| format!("ファイルを読めません {}: {}", path, e))?;
-                    let base = std::path::Path::new(path)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("file")
-                        .to_string();
-                    (bytes, base)
+                    (bytes, file_name_of(path))
                 }
+                (None, Some(path)) => (Vec::new(), file_name_of(path)),
                 _ => return Err("--message か --file のどちらか一方を指定してください".into()),
             };
 
@@ -473,17 +478,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     };
                     println!("板 #{} に書き込みます", board_id.fingerprint());
                     let client = join_ephemeral(privacy_of(&cli), cli.data_dir.clone(), *port, connect, *min_relays).await?;
-                    let r = client
-                        .publish_tracked(
-                            PublicPost {
-                                board: board_id,
-                                content,
-                                name: name.clone().unwrap_or(default_name),
-                                parents,
-                            },
-                            0,
-                        )
-                        .await?;
+                    let post_name = name.clone().unwrap_or(default_name);
+                    let r = match file {
+                        Some(path) => {
+                            client
+                                .publish_file_from_path(&board_id, &post_name, std::path::Path::new(path), parents, Some(0))
+                                .await?
+                        }
+                        None => {
+                            client
+                                .publish_tracked(
+                                    PublicPost { board: board_id, content, name: post_name, parents },
+                                    0,
+                                )
+                                .await?
+                        }
+                    };
                     client.flush().await;
                     r
                 }
@@ -521,16 +531,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         } => {
             let content_ref = parse_hex32(r#ref, "--ref")?;
             let client = join_ephemeral(privacy_of(&cli), cli.data_dir.clone(), *port, connect, *min_relays).await?;
-            match client.get(&aether_client::resolve_board(board)?, content_ref).await? {
-                Some(fetched) => match out {
-                    Some(path) => {
-                        std::fs::write(path, &fetched.bytes)
-                            .map_err(|e| format!("保存に失敗 {}: {}", path, e))?;
-                        println!("\n--- 取得成功 ---\n{} バイトを {} に保存しました\n", fetched.bytes.len(), path);
-                    }
-                    None => println!("\n--- 取得成功 ---\n{}\n", String::from_utf8_lossy(&fetched.bytes)),
+            let board_id = aether_client::resolve_board(board)?;
+            match out {
+                // 保存先があれば、ディスクへ順に書く（大きなファイルでもメモリに載せない）
+                Some(path) => match client.get_to_path(&board_id, content_ref, std::path::Path::new(path)).await? {
+                    Some(info) => println!("\n--- 取得成功 ---\n{} バイトを {} に保存しました\n", info.size, path),
+                    None => println!("取得できませんでした（保持者が居ないか、期限切れ）"),
                 },
-                None => println!("取得できませんでした（保持者が居ないか、期限切れ）"),
+                None => match client.get(&board_id, content_ref).await? {
+                    Some(fetched) => println!("\n--- 取得成功 ---\n{}\n", String::from_utf8_lossy(&fetched.bytes)),
+                    None => println!("取得できませんでした（保持者が居ないか、期限切れ）"),
+                },
             }
             // 取ったファイルを網に残す手伝い（延命・置き直し）を送り終えてから終わる（最大 30 秒）
             client.flush().await;

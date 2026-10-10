@@ -48,14 +48,14 @@ pub struct PrivacyOptions {
     /// 書かれた位置に並ぶ（[`crate::talks`]）。代わりに会話の平文が端末に残る
     /// （パスフレーズがあれば暗号化される）。切ると親を付けずに送る。
     pub save_talk_history: bool,
-    /// 自分が上げるファイルの大きさを 2 倍刻みに切り上げて置く（既定: 有効）
+    /// 自分が上げるファイルの大きさを切り上げて置く（既定: 有効。1GiB まで 2 倍刻み、超えたら 2 の 1/4 乗刻み）
     ///
     /// ガードは自分のクライアントが置いた量・取った量を見ている。大きさがそのまま出ると、
     /// 公開ファイルが多い網では 1 回の取得から候補がごく少数に絞られる（Part 24 の L5）。
-    /// チャンク数を `max(4, 2 の冪)` に増やし、足した分はファイルごとに別の中身の埋め草にする。
+    /// チャンク数を刻み（最小 1MiB。[`aether_core::mailbox::chunk::size_bucket_bytes`]）に増やし、足した分はファイルごとに別の中身の埋め草にする。
     /// **効くのは置く側だけ**: 取る人は置かれた形（埋め草込み）をそのまま全部取るので、
     /// 上げた人がこれを切っていれば、取る人の量からも大きさが出る。
-    /// 代わりに、上り・保存と、取る人の下りが最大 2 倍（平均 1.4 倍）になる。切ると切り上げも埋め草もしない。
+    /// 代わりに、上り・保存と、取る人の下りが最大 2 倍（平均 1.4 倍。1GiB を超えると最大約 1.19 倍）になる。切ると切り上げも埋め草もしない。
     pub pad_file_size: bool,
     /// 取ったファイルの欠片の寿命を延ばし、欠けた欠片を置き直して、網からファイルが消えないよう手伝う（既定: 有効）
     ///
@@ -93,6 +93,13 @@ pub struct NetworkParams {
     pub guest_upload_rate: u64,
     /// 一覧に載っているリレーから受ける上りの、IP ごとの速さ（0 = 無制限）
     pub relay_upload_rate: u64,
+    /// 木の Manifest の 1 ページに入れるストライプ数を、これより多くしない（試験用）
+    ///
+    /// 本番は `None`（封じて 1 オブジェクトに収まる最大を計算した既定）。試験で数 MB のファイルを
+    /// 何ページにも分けるために小さくする。置く側だけの判断で、取る側は根のページ表のとおりに取るので
+    /// 網全体で揃える必要はない。
+    #[doc(hidden)]
+    pub manifest_page_stripes: Option<usize>,
 }
 
 impl Default for NetworkParams {
@@ -103,6 +110,7 @@ impl Default for NetworkParams {
             hint_pow_difficulty: c.pow_difficulty,
             guest_upload_rate: c.guest_upload_rate,
             relay_upload_rate: c.relay_upload_rate,
+            manifest_page_stripes: None,
         }
     }
 }

@@ -524,6 +524,8 @@ impl AetherClient {
 
     /// スレにファイルを添付する（スレの根を親にして、常に v2 で置く）
     ///
+    /// ファイルはディスクから少しずつ読む（全部はメモリに載せない。[`publish_file_from_path`](Self::publish_file_from_path)）。
+    ///
     /// `ticket` を付けると、進み具合が `SendStatus` で流れる（書き込みの吹き出しと対応させる）。
     /// 返り値は自分のレス。呼び出し側は `ctx.refs` にその ref を足してから次の書き込みに使う。
     pub async fn bbs_attach_file(
@@ -531,7 +533,7 @@ impl AetherClient {
         board: &BoardId,
         ctx: &ReplyContext,
         name: &str,
-        content: Vec<u8>,
+        path: &std::path::Path,
         ticket: u64,
     ) -> Result<Res> {
         let name = name.trim();
@@ -544,11 +546,11 @@ impl AetherClient {
                 MAX_FILE_NAME_BYTES
             )));
         }
-        let size = content.len() as u64;
         let root = crate::parse_hex32(&ctx.root_ref, "スレの ref")?;
         let report = self
-            .publish_file(board, name, content, vec![root], Some(ticket))
+            .publish_file_from_path(board, name, path, vec![root], Some(ticket))
             .await?;
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let content_ref = report
             .content_ref
             .ok_or_else(|| ClientError::invalid("ファイルの ref を得られませんでした"))?;

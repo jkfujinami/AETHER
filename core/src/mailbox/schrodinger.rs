@@ -454,16 +454,18 @@ impl SchrodingerMailbox {
     ///
     /// v2 では 16 チャンクごとに RS(16+m) を掛け、**各シャードを担当 1 台にだけ**置く。
     /// **メモリは 1 ストライプ分**: チャンクを封じ、パリティを作り、その場で全シャードを置いて捨てる。
-    /// 手元に残すのはハッシュだけ。最後に [`ManifestV2`](chunk::ManifestV2) を小さなものの経路
-    /// （[`place_object`](Self::place_object)）で置く。同じ中身のチャンクは収束暗号で同じシャード・
+    /// 手元に残すのはハッシュだけ。最後にストライプの表を小さなものの経路
+    /// （[`place_object`](Self::place_object)）で置く。1 つの [`ManifestV2`](chunk::ManifestV2) に
+    /// 収まらない大きさは、ページに分けた木（[`ManifestRoot`](chunk::ManifestRoot)）にする
+    /// （[`chunk::plan_manifest`]）。同じ中身のチャンクは収束暗号で同じシャード・
     /// 同じハッシュになり、2 回目の put は保持者が同じ値として受ける。
     ///
-    /// `pad` なら、大きさをバイトの 2 の冪に切り上げ（[`chunk::padded_chunks_for_size`]）、足した分は
+    /// `pad` なら、大きさを [`chunk::size_bucket_bytes`] の刻みに切り上げ、足した分は
     /// ファイルごとに別の中身の埋め草のチャンクにして**本物の後ろに**置く
     /// （[`chunk::pad_chunk_plain`]）。`size` は本当の大きさのまま ── 取る側は復元後に `size` で
     /// 切るので埋め草は落ちる。Manifest は暗号化されていて、ガードには見えない。
     ///
-    /// Manifest が 1 オブジェクトに収まらない大きさは、何も送らずにエラーにする。
+    /// 上限（[`chunk::MAX_FILE_BYTES`]）を超える大きさは、何も送らずにエラーにする。
     /// **互換は無い**（v1 の形では置かない）。公開コンテンツ専用。
     pub async fn place_file_v2(
         &self,
@@ -473,47 +475,121 @@ impl SchrodingerMailbox {
         pad: bool,
     ) -> Result<([u8; 32], UploadProfile)> {
         use sha2::Digest;
-        let started = Instant::now();
-        let size = data.len() as u64;
-        // 送る前に確かめる（途中まで置いて断ることのないように）。切り上げた後のチャンク数で数える
-        let total_chunks = chunk::v2_layout_chunks(name.len(), size, pad)?;
-        let shapes = chunk::v2_stripe_shapes(total_chunks)?;
-        let sealed_len = chunk::manifest_v2_sealed_len(name.len(), total_chunks)?;
-        if sealed_len > chunk::SINGLE_BODY_LIMIT {
-            return Err(AetherError::Config(format!(
-                "File too large for a single v2 manifest ({} bytes sealed, max {})",
-                sealed_len,
-                chunk::SINGLE_BODY_LIMIT
-            )));
-        }
         let file_hash: [u8; 32] = Sha256::digest(data).into();
+        let spec = FileSpec { source: FileSource::Memory(data), size: data.len() as u64, file_hash, pad, page_cap: None };
+        self.place_file_v2_with(secret, name, spec, &mut |_, _| {}).await
+    }
 
+    /// [`place_file_v2`](Self::place_file_v2) のディスク版。ファイルを全部は読まない
+    ///
+    /// 1 回目: 頭から読んで SHA-256 を取る（埋め草の導出に使う）。
+    /// 2 回目: 1 ストライプ分（16 チャンク）ずつ読んで封じて置く。メモリはストライプ数本分。
+    /// 読んでいる間にファイルの大きさが変わったらエラー。
+    /// `page_cap` は試験用（[`chunk::plan_manifest`]）。`progress` には置き終えたストライプ数と総数を渡す。
+    pub async fn place_file_v2_from_path(
+        &self,
+        secret: &SharedSecret,
+        name: &str,
+        path: &std::path::Path,
+        pad: bool,
+        page_cap: Option<usize>,
+        progress: &mut (dyn FnMut(usize, usize) + Send),
+    ) -> Result<([u8; 32], UploadProfile)> {
+        let size = std::fs::metadata(path)
+            .map_err(|e| AetherError::Config(format!("cannot stat the file: {}", e)))?
+            .len();
+        // 1 回目を読む前に、上限と木の形を確かめる（巨大なファイルを無駄に読まない）
+        let total_chunks = chunk::v2_layout_chunks(size, pad)?;
+        chunk::plan_manifest(name.len(), total_chunks, page_cap)?;
+        let owned = path.to_path_buf();
+        let (file_hash, read) = tokio::task::spawn_blocking(move || hash_file(&owned))
+            .await
+            .map_err(|e| AetherError::Config(format!("hash task failed: {}", e)))??;
+        if read != size {
+            return Err(AetherError::Config("the file changed while it was read".into()));
+        }
+        let spec = FileSpec { source: FileSource::Path(path), size, file_hash, pad, page_cap };
+        self.place_file_v2_with(secret, name, spec, progress).await
+    }
+
+    async fn place_file_v2_with(
+        &self,
+        secret: &SharedSecret,
+        name: &str,
+        spec: FileSpec<'_>,
+        progress: &mut (dyn FnMut(usize, usize) + Send),
+    ) -> Result<([u8; 32], UploadProfile)> {
+        let FileSpec { source, size, file_hash, pad, page_cap } = spec;
+        let started = Instant::now();
+        // 送る前に確かめる（途中まで置いて断ることのないように）。切り上げた後のチャンク数で数える
+        let total_chunks = chunk::v2_layout_chunks(size, pad)?;
+        let shapes = chunk::v2_stripe_shapes(total_chunks)?;
+        let plan = chunk::plan_manifest(name.len(), total_chunks, page_cap)?;
+
+        let per = chunk::V2_CHUNK_PLAIN;
         let mut sent_bytes: u64 = 0;
         let mut stripes = Vec::with_capacity(shapes.len());
         let mut next_index: usize = 0;
-        for (k, m) in shapes {
-            let mut objects = Vec::with_capacity(k);
-            for _ in 0..k {
-                let plain = v2_chunk_plain(secret, data, &file_hash, next_index, pad);
-                objects.push(self.seal_chunk(secret, &plain)?.1);
-                next_index += 1;
+        for (si, &(k, m)) in shapes.iter().enumerate() {
+            let raw = source.read_range((next_index * per) as u64, k * per).await?;
+            let want = (size.saturating_sub((next_index * per) as u64)).min((k * per) as u64) as usize;
+            if raw.len() != want {
+                return Err(AetherError::Config("the file changed while it was read".into()));
             }
+            let mut objects = Vec::with_capacity(k);
+            for j in 0..k {
+                let from = (j * per).min(raw.len());
+                let piece = &raw[from..((j + 1) * per).min(raw.len())];
+                let plain = v2_chunk_plain_from(secret, piece, &file_hash, next_index + j, pad);
+                objects.push(self.seal_chunk(secret, &plain)?.1);
+            }
+            drop(raw);
+            next_index += k;
             let built = sharding_v2::build_stripe(&objects, m)?;
             drop(objects);
             for shard in &built.shards {
                 sent_bytes += self.put_shard_v2(secret, shard).await?;
             }
             stripes.push(built.stripe);
+            progress(si + 1, shapes.len());
         }
 
-        let manifest = chunk::ManifestV2 {
-            version: chunk::MANIFEST_V2_VERSION,
-            name: name.to_string(),
-            size,
-            chunk_plain: chunk::V2_CHUNK_PLAIN as u32,
-            stripes,
+        let root_object = match plan {
+            chunk::ManifestPlan::Single => chunk::ManifestV2 {
+                version: chunk::MANIFEST_V2_VERSION,
+                name: name.to_string(),
+                size,
+                chunk_plain: chunk::V2_CHUNK_PLAIN as u32,
+                stripes,
+            }
+            .encode()?,
+            chunk::ManifestPlan::Tree { per_page } => {
+                let mut pages = Vec::new();
+                let stripe_count = stripes.len() as u64;
+                for range in chunk::page_ranges(stripes.len(), per_page) {
+                    let page = chunk::ManifestPage { stripes: stripes[range].to_vec() };
+                    let (pref, object) = self.seal_chunk(secret, &page.encode()?)?;
+                    if object.len() > chunk::SINGLE_BODY_LIMIT {
+                        return Err(AetherError::Config("a manifest page does not fit one object".into()));
+                    }
+                    sent_bytes += self.place_object(&pref, secret, &object).await?.bytes;
+                    pages.push(pref);
+                }
+                chunk::ManifestRoot {
+                    version: chunk::MANIFEST_ROOT_VERSION,
+                    name: name.to_string(),
+                    size,
+                    chunk_plain: chunk::V2_CHUNK_PLAIN as u32,
+                    stripe_count,
+                    pages,
+                }
+                .encode()?
+            }
         };
-        let (mref, object) = self.seal_chunk(secret, &manifest.encode()?)?;
+        let (mref, object) = self.seal_chunk(secret, &root_object)?;
+        if object.len() > chunk::SINGLE_BODY_LIMIT {
+            return Err(AetherError::Config("the manifest does not fit one object".into()));
+        }
         let profile = self.place_object(&mref, secret, &object).await?;
         Ok((
             mref,
@@ -1184,10 +1260,87 @@ impl SchrodingerMailbox {
     }
 }
 
-/// v2 の `index` 番目のチャンクの平文（本物、または埋め草）
+/// 置くファイル 1 つぶんの指定
+struct FileSpec<'a> {
+    source: FileSource<'a>,
+    size: u64,
+    file_hash: [u8; 32],
+    pad: bool,
+    page_cap: Option<usize>,
+}
+
+/// 置くファイルの読み元（メモリ、またはディスク）
+enum FileSource<'a> {
+    Memory(&'a [u8]),
+    Path(&'a std::path::Path),
+}
+
+impl FileSource<'_> {
+    /// `start` から最大 `len` バイト読む（ファイルの終わりでは短くなる）
+    async fn read_range(&self, start: u64, len: usize) -> Result<Vec<u8>> {
+        match self {
+            FileSource::Memory(data) => {
+                let from = (start as usize).min(data.len());
+                Ok(data[from..(from + len).min(data.len())].to_vec())
+            }
+            FileSource::Path(path) => {
+                let path = path.to_path_buf();
+                tokio::task::spawn_blocking(move || read_range_blocking(&path, start, len))
+                    .await
+                    .map_err(|e| AetherError::Config(format!("read task failed: {}", e)))?
+            }
+        }
+    }
+}
+
+fn read_range_blocking(path: &std::path::Path, start: u64, len: usize) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let io = |e: std::io::Error| AetherError::Config(format!("cannot read the file: {}", e));
+    let mut f = std::fs::File::open(path).map_err(io)?;
+    f.seek(SeekFrom::Start(start)).map_err(io)?;
+    let mut buf = Vec::with_capacity(len);
+    f.take(len as u64).read_to_end(&mut buf).map_err(io)?;
+    Ok(buf)
+}
+
+/// ファイル全体の SHA-256 と読んだバイト数（1 MiB ずつ読む）
+fn hash_file(path: &std::path::Path) -> Result<([u8; 32], u64)> {
+    use sha2::Digest;
+    use std::io::Read;
+    let io = |e: std::io::Error| AetherError::Config(format!("cannot read the file: {}", e));
+    let mut f = std::fs::File::open(path).map_err(io)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut total = 0u64;
+    loop {
+        let n = f.read(&mut buf).map_err(io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((hasher.finalize().into(), total))
+}
+
+/// v2 の `index` 番目のチャンクの平文（本物、または埋め草）。`piece` はそのチャンクに当たるファイルの部分
 ///
-/// 本物の後ろに埋め草を続けるので、`pad` のときは短い最後の本物のチャンクもゼロで満杯にする
+/// 空の `piece` はファイルの終わりより後ろ（埋め草）。本物の後ろに埋め草を続けるので、
+/// `pad` のときは短い最後の本物のチャンクもゼロで満杯にする
 /// （ストライプの途中に短いオブジェクトを置けない）。取る側は復元後に `size` で切るので落ちる。
+fn v2_chunk_plain_from(secret: &SharedSecret, piece: &[u8], file_hash: &[u8; 32], index: usize, pad: bool) -> Vec<u8> {
+    if piece.is_empty() {
+        return chunk::pad_chunk_plain(secret, file_hash, index as u32);
+    }
+    let mut plain = piece.to_vec();
+    if pad {
+        plain.resize(chunk::V2_CHUNK_PLAIN, 0);
+    }
+    plain
+}
+
+/// v2 の `index` 番目のチャンクの平文を、ファイル全体（メモリ）から作る
+#[cfg(test)]
 fn v2_chunk_plain(
     secret: &SharedSecret,
     data: &[u8],
@@ -1195,15 +1348,9 @@ fn v2_chunk_plain(
     index: usize,
     pad: bool,
 ) -> Vec<u8> {
-    let start = index * chunk::V2_CHUNK_PLAIN;
-    if start >= data.len() {
-        return chunk::pad_chunk_plain(secret, file_hash, index as u32);
-    }
-    let mut plain = data[start..(start + chunk::V2_CHUNK_PLAIN).min(data.len())].to_vec();
-    if pad {
-        plain.resize(chunk::V2_CHUNK_PLAIN, 0);
-    }
-    plain
+    let start = (index * chunk::V2_CHUNK_PLAIN).min(data.len());
+    let piece = &data[start..(start + chunk::V2_CHUNK_PLAIN).min(data.len())];
+    v2_chunk_plain_from(secret, piece, file_hash, index, pad)
 }
 
 #[cfg(test)]
@@ -1298,7 +1445,7 @@ mod tests {
         let size = 4 * chunk::V2_CHUNK_PLAIN + 777; // 1MiB 強 → 2MiB の刻みで 9 チャンク
         let data: Vec<u8> = (0..size).map(|i| (i * 13 % 247) as u8).collect();
         let hash: [u8; 32] = Sha256::digest(&data).into();
-        let total = chunk::v2_layout_chunks(5, size as u64, true).unwrap();
+        let total = chunk::v2_layout_chunks(size as u64, true).unwrap();
         assert_eq!(total, 9);
 
         let mut restored = Vec::new();
@@ -1324,6 +1471,47 @@ mod tests {
         assert_eq!(restored, data, "size で切ると元のファイル");
         let distinct: std::collections::HashSet<_> = all_hashes.iter().collect();
         assert_eq!(distinct.len(), 9, "埋め草も含めて、データシャードのハッシュはすべて別");
+    }
+
+    #[test]
+    fn file_reads_hash_and_slice_like_the_in_memory_data() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let (hash, n) = hash_file(&path).unwrap();
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(hash, <[u8; 32]>::from(Sha256::digest(&data)));
+        // 途中・終わりをまたぐ読み、終わりより後ろは空
+        assert_eq!(read_range_blocking(&path, 1_000_000, 4096).unwrap(), data[1_000_000..1_004_096]);
+        assert_eq!(read_range_blocking(&path, 2_999_000, 4096).unwrap(), data[2_999_000..]);
+        assert!(read_range_blocking(&path, 3_000_000, 4096).unwrap().is_empty());
+        // メモリの読み元も同じ答え
+        let mem = FileSource::Memory(&data);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        assert_eq!(rt.block_on(mem.read_range(2_999_000, 4096)).unwrap(), data[2_999_000..]);
+        assert!(rt.block_on(mem.read_range(9_999_999, 10)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn chunk_plain_from_a_piece_matches_the_whole_data_version() {
+        let secret = [3u8; 32];
+        let hash = [4u8; 32];
+        let data = vec![9u8; chunk::V2_CHUNK_PLAIN + 100];
+        for (index, pad) in [(0, true), (1, true), (1, false), (2, true), (7, true)] {
+            let start = (index * chunk::V2_CHUNK_PLAIN).min(data.len());
+            let piece = &data[start..(start + chunk::V2_CHUNK_PLAIN).min(data.len())];
+            assert_eq!(
+                v2_chunk_plain_from(&secret, piece, &hash, index, pad),
+                v2_chunk_plain(&secret, &data, &hash, index, pad)
+            );
+        }
+        // 本物の短い最後のチャンクは、pad のときだけゼロで満杯にする
+        assert_eq!(v2_chunk_plain(&secret, &data, &hash, 1, true).len(), chunk::V2_CHUNK_PLAIN);
+        assert_eq!(v2_chunk_plain(&secret, &data, &hash, 1, false).len(), 100);
+        // 終わりより後ろは埋め草
+        assert_eq!(v2_chunk_plain(&secret, &data, &hash, 2, false), chunk::pad_chunk_plain(&secret, &hash, 2));
     }
 
     fn relay(n: u8) -> crate::net::relay_list::RelayDescriptor {

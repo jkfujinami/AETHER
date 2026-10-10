@@ -45,6 +45,8 @@ pub struct AetherClient {
     pub(crate) holder: Arc<crate::storage::HolderShared>,
     /// 見た根の索引の記録（レスでスレを今日のページへ上げるため。メモリだけ・上限つき）
     pub(crate) index_memory: std::sync::Mutex<crate::index_pages::RecordMemory>,
+    /// 木の Manifest の 1 ページのストライプ数の上書き（試験用。[`NetworkParams`](crate::NetworkParams)）
+    pub(crate) page_cap: Option<usize>,
 }
 
 impl AetherClient {
@@ -246,6 +248,7 @@ impl AetherClient {
             circuit_pool: Default::default(),
             holder: Default::default(),
             index_memory: Default::default(),
+            page_cap: config.network.manifest_page_stripes,
         });
         // 一回限りでも動かす（CLI の send/get も待たずに済む）
         client.spawn_circuit_pool_refill();

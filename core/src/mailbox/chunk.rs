@@ -99,6 +99,20 @@ pub const V2_CHUNK_PLAIN: usize = V2_SHARD_BYTES - V2_SEAL_OVERHEAD;
 /// [`ManifestV2`] の版番号
 pub const MANIFEST_V2_VERSION: u8 = 2;
 
+/// [`ManifestRoot`]（ストライプの表を木にした根）の版番号。[`MANIFEST_V2_VERSION`] とは別の値
+///
+/// 取る側は、取れたオブジェクトを `ManifestV2` → 根の順に試して見分ける。
+pub const MANIFEST_ROOT_VERSION: u8 = 3;
+
+/// 1 ファイルの大きさの上限（64GiB）
+///
+/// 根は 1 オブジェクト（封じて [`SINGLE_BODY_LIMIT`]）に収まる必要がある。64GiB は約 16,400 ストライプで、
+/// 1 ページ約 180 ストライプなら約 92 ページ、根は 3KB ほどで十分余裕がある。
+/// これより上は、ページの参照が増えて根が収まらなくなる前に、置く側・取る側が手元に持つ
+/// ストライプの表（約 22MB）と、取る側の「どのシャードがどのストライプか」の索引（約 70MB）が重くなる。
+/// 刻みの一番上（2^36 バイト）でもあるので、切り上げでこの上限を超えることもない。
+pub const MAX_FILE_BYTES: u64 = 64 << 30;
+
 /// [`StripeV2`] 1 つの bincode での固定部分: data 1 + parity 1 + last_object_len 4 + ハッシュ列の長さ 8
 const STRIPE_V2_FIXED: usize = 1 + 1 + 4 + 8;
 
@@ -127,37 +141,84 @@ pub fn v2_chunk_count(size: u64) -> usize {
 /// 切り上げの最小の刻み（バイト）。小さなファイルを細かく区別させないため（約 4 チャンク分）
 pub const V2_MIN_BUCKET_BYTES: u64 = 1 << 20;
 
-/// 切り上げ後のチャンク数。ファイルの大きさを**バイトの 2 の冪**（最小 [`V2_MIN_BUCKET_BYTES`]）に
-/// 切り上げ、その大きさを収めるチャンク数にして、`max` で頭打ちにする
+/// 2 の冪の刻みをやめて、細かい刻みにする境目（1GiB）
+pub const V2_FINE_BUCKET_FROM: u64 = 1 << 30;
+
+/// 1GiB を超える刻みの、2 倍の間の 4 つの位置（4096 を 1 倍とした整数。2 の 1/4 乗刻み）
 ///
-/// ガードは自分のクライアントが置いた量・取った量を見ているので、大きさを 2 倍刻みに丸めて
+/// 4096 × 2^(i/4) の切り上げ。浮動小数にすると、置く側と置く前の見積もりで丸めがずれうるので、
+/// 整数の表にして、1GiB × 表 ÷ 4096 を倍々にする。
+const FINE_STEPS: [u64; 4] = [4096, 4871, 5793, 6889];
+
+/// ファイルの大きさを切り上げた刻み（バイト）
+///
+/// - 1GiB まで: 2 の冪（最小 [`V2_MIN_BUCKET_BYTES`]）
+/// - 1GiB を超えたら: 2 の 1/4 乗刻み（1, 1.19, 1.41, 1.68, 2, 2.38 … GiB）
+///
+/// 大きなファイルでも 2 倍刻みのままだと、1.1GiB が 2GiB に上がって上りがほぼ倍無駄になる。
+/// 1/4 乗刻みなら無駄は最大約 19% で済む。代わりに、刻みの数（ガードから見た候補の数）が
+/// 2 倍刻みの 4 倍に増え、同じ刻みに入る別のファイルが 4 分の 1 になる（匿名集合が小さくなる）。
+/// 1GiB を超えるファイルは数が少なく、無駄な上りの方が利用者に重いと判断した。
+pub fn size_bucket_bytes(size: u64) -> u64 {
+    let size = size.max(1);
+    if size <= V2_FINE_BUCKET_FROM {
+        return size.next_power_of_two().max(V2_MIN_BUCKET_BYTES);
+    }
+    let mut base = V2_FINE_BUCKET_FROM;
+    loop {
+        for step in FINE_STEPS {
+            let bucket = base / 4096 * step;
+            if bucket >= size {
+                return bucket;
+            }
+        }
+        // 2^60 を超える大きさは扱わない（桁あふれ防止。上限 MAX_FILE_BYTES より遥かに上）
+        if base >= 1 << 60 {
+            return base;
+        }
+        base *= 2;
+    }
+}
+
+/// 切り上げ後のチャンク数。ファイルの大きさを [`size_bucket_bytes`] の刻みに切り上げ、
+/// その大きさを収めるチャンク数にして、`max` で頭打ちにする
+///
+/// ガードは自分のクライアントが置いた量・取った量を見ているので、大きさを丸めて
 /// 候補を増やす（Part 24 の L5）。刻みをチャンク数の 2 の冪にすると、チャンクの平文が 256KiB より
 /// わずかに小さいため、ちょうど 4MiB のファイルが 17 チャンクになって次の刻みへ跳ねていた。
 /// バイトで決めれば 4MiB は 17、4MiB + 1 は 33 チャンクで、利用者が見る大きさと刻みが揃う。
-/// `max` は [`max_chunks_v2`]（Manifest に収まる最大）。**一番上の刻みは `max` になる**ので、
-/// `max`（名前 100 バイトで約 3,000 チャンク ≒ 800MB）に届く刻み（2^30 バイト）以上は全部 `max` になる。
-/// `size` が `max` チャンクを超えるものは呼び出し側が先に断っている前提。
+/// `max` は通常 [`max_chunks_file`]（[`MAX_FILE_BYTES`] のチャンク数）。**上限の大きさ以下のファイルなら、
+/// 刻みも上限以下**なので、頭打ちで本物のチャンク数を下回ることはない。
+/// `size` が上限を超えるものは呼び出し側が先に断っている前提。
 pub fn padded_chunks_for_size(size: u64, max: usize) -> usize {
-    let bucket = size.max(1).next_power_of_two().max(V2_MIN_BUCKET_BYTES);
-    bucket.div_ceil(V2_CHUNK_PLAIN as u64).min(max as u64) as usize
+    size_bucket_bytes(size).div_ceil(V2_CHUNK_PLAIN as u64).min(max as u64) as usize
+}
+
+/// 上限の大きさのファイルのチャンク数
+pub fn max_chunks_file() -> usize {
+    v2_chunk_count(MAX_FILE_BYTES)
+}
+
+/// 上限の大きさのファイルのストライプ数
+pub fn max_stripes_file() -> usize {
+    max_chunks_file().div_ceil(V2_DATA_PER_STRIPE)
 }
 
 /// 置くチャンク数（`pad` なら切り上げ込み）。上限を超えるファイルと空のファイルはエラー
 ///
 /// 置く側・置く前の見積もり・テストが同じ数を使うよう、ここに 1 つだけ置く。
-pub fn v2_layout_chunks(name_len: usize, size: u64, pad: bool) -> Result<usize> {
+pub fn v2_layout_chunks(size: u64, pad: bool) -> Result<usize> {
     let n = v2_chunk_count(size);
     if n == 0 {
         return Err(AetherError::Config("empty file cannot use the v2 layout".into()));
     }
-    let max = max_chunks_v2(name_len);
-    if n > max {
+    if size > MAX_FILE_BYTES {
         return Err(AetherError::Config(format!(
-            "File too large for a single v2 manifest ({} chunks, max {})",
-            n, max
+            "File too large ({} bytes, max {})",
+            size, MAX_FILE_BYTES
         )));
     }
-    Ok(if pad { padded_chunks_for_size(size, max) } else { n })
+    Ok(if pad { padded_chunks_for_size(size, max_chunks_file()) } else { n })
 }
 
 /// 埋め草のチャンク `index` の平文（長さ [`V2_CHUNK_PLAIN`]）
@@ -187,7 +248,7 @@ pub fn v2_stripe_shapes(chunks: usize) -> Result<Vec<(usize, usize)>> {
         return Err(AetherError::Config("empty file cannot use the v2 layout".into()));
     }
     let stripes = chunks.div_ceil(V2_DATA_PER_STRIPE);
-    if stripes > MAX_STRIPES_PER_MANIFEST_V2 {
+    if stripes > max_stripes_file() {
         return Err(AetherError::Config(format!("too many stripes: {}", stripes)));
     }
     let m = crate::mailbox::sharding_v2::m_for(
@@ -216,10 +277,9 @@ pub fn manifest_v2_sealed_len(name_len: usize, chunks: usize) -> Result<usize> {
     Ok(1 + 8 + name_len + 8 + 4 + 8 + body + V2_SEAL_OVERHEAD)
 }
 
-/// 暗号化後の Manifest が [`SINGLE_BODY_LIMIT`] に収まる最大のチャンク数
+/// 暗号化後の [`ManifestV2`] 1 つが [`SINGLE_BODY_LIMIT`] に収まる最大のチャンク数
 ///
-/// Manifest を木にするのは将来で、今はこれを超えるファイルを断る。名前が長いほど少し減る。
-/// 切り上げ後のチャンク数もこれで頭打ちになる（[`padded_chunks_for_size`]）。
+/// これを超えるファイルは、ストライプの表をページに分けた木（[`ManifestRoot`]）にする。名前が長いほど少し減る。
 pub fn max_chunks_v2(name_len: usize) -> usize {
     let fits = |chunks: usize| {
         manifest_v2_sealed_len(name_len, chunks).is_ok_and(|n| n <= SINGLE_BODY_LIMIT)
@@ -233,9 +293,70 @@ pub fn max_chunks_v2(name_len: usize) -> usize {
     lo
 }
 
-/// 上限のファイルの大きさ（バイト）。[`max_chunks_v2`] を満杯のチャンクで数えた値
-pub fn max_file_size_v2(name_len: usize) -> u64 {
-    max_chunks_v2(name_len) as u64 * V2_CHUNK_PLAIN as u64
+/// 暗号化した [`ManifestPage`] の大きさ（置く前の見積もり。nonce 12 + タグ 16 を含む）
+///
+/// bincode の長さ: ストライプ列(8 + 各 14 + 32 × (k+m))。
+pub fn manifest_page_sealed_len(shapes: &[(usize, usize)]) -> usize {
+    8 + shapes.iter().map(|(k, m)| STRIPE_V2_FIXED + 32 * (k + m)).sum::<usize>() + V2_SEAL_OVERHEAD
+}
+
+/// 冗長度 m のとき、1 ページに入れられるストライプ数（封じて [`SINGLE_BODY_LIMIT`] に収まる最大）
+///
+/// ページには満杯のストライプ（k=16, m）が並ぶとして数える（最後の短いストライプは小さいので必ず収まる）。
+/// m=27 で 188。取り直しの 1 往復で取れる大きさを決める既定値で、利用者は選べない。
+pub fn manifest_page_stripes(m: usize) -> usize {
+    let per = STRIPE_V2_FIXED + 32 * (V2_DATA_PER_STRIPE + m);
+    (SINGLE_BODY_LIMIT - 8 - V2_SEAL_OVERHEAD) / per
+}
+
+/// `total` 個のストライプを 1 ページ `per_page` 個ずつに分けた範囲（最後だけ短い）
+pub fn page_ranges(total: usize, per_page: usize) -> Vec<std::ops::Range<usize>> {
+    let per_page = per_page.max(1);
+    (0..total.div_ceil(per_page))
+        .map(|i| i * per_page..((i + 1) * per_page).min(total))
+        .collect()
+}
+
+/// 暗号化した [`ManifestRoot`] の大きさ（置く前の見積もり）
+///
+/// bincode の長さ: version 1 + 名前(8 + 名前長) + size 8 + chunk_plain 4 + stripe_count 8 + 参照列(8 + 32 × ページ数)。
+pub fn manifest_root_sealed_len(name_len: usize, pages: usize) -> usize {
+    1 + 8 + name_len + 8 + 4 + 8 + 8 + 32 * pages + V2_SEAL_OVERHEAD
+}
+
+/// ストライプの表の置き方
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestPlan {
+    /// 1 つの [`ManifestV2`]（1 回の往復で取れる）
+    Single,
+    /// 根 + ページ。1 ページ `per_page` ストライプ
+    Tree { per_page: usize },
+}
+
+/// ストライプの表の置き方を決める（置く側と、置く前の見積もりが同じ結果を使う）
+///
+/// 1 つの [`ManifestV2`] が封じて [`SINGLE_BODY_LIMIT`] に収まれば `Single`。収まらないときだけ木にする。
+/// `page_cap` は試験のときだけ 1 ページのストライプ数を小さくする口（本番は `None`で、計算した既定）。
+/// これが効くと、ストライプが `page_cap` を超えるファイルは小さくても木になる。
+/// 根も 1 オブジェクトに収まらない大きさ（[`MAX_FILE_BYTES`] を超える）はエラー。
+pub fn plan_manifest(name_len: usize, chunks: usize, page_cap: Option<usize>) -> Result<ManifestPlan> {
+    let shapes = v2_stripe_shapes(chunks)?;
+    let cap = page_cap.map(|c| c.max(1));
+    let single_fits = manifest_v2_sealed_len(name_len, chunks).is_ok_and(|n| n <= SINGLE_BODY_LIMIT);
+    if single_fits && cap.is_none_or(|c| shapes.len() <= c) {
+        return Ok(ManifestPlan::Single);
+    }
+    // 満杯のストライプの m は最大（短いストライプは比例して小さい）
+    let m = shapes[0].1;
+    let per_page = manifest_page_stripes(m).min(cap.unwrap_or(usize::MAX)).max(1);
+    let pages = shapes.len().div_ceil(per_page);
+    if manifest_root_sealed_len(name_len, pages) > SINGLE_BODY_LIMIT {
+        return Err(AetherError::Config(format!(
+            "File too large for the manifest root ({} pages)",
+            pages
+        )));
+    }
+    Ok(ManifestPlan::Tree { per_page })
 }
 
 /// シャードのハッシュ。Manifest v2 の `shard_hashes` と、同時に置き場所（担当の計算）の入力になる
@@ -254,6 +375,23 @@ pub struct StripeV2 {
     pub last_object_len: u32,
     /// データ k 個 → パリティ m 個の順の、シャードの SHA-256
     pub shard_hashes: Vec<[u8; 32]>,
+}
+
+/// ストライプの形を検べる（受信側の増幅・肥大と、後段の添字あふれを防ぐ）
+fn validate_stripe(s: &StripeV2) -> Result<()> {
+    let total = s.data as usize + s.parity as usize;
+    if s.data == 0
+        || s.parity == 0
+        || total > crate::mailbox::sharding_v2::MAX_TOTAL_SHARDS
+        || s.shard_hashes.len() != total
+    {
+        return Err(AetherError::Protocol("ManifestV2 stripe shape is invalid".into()));
+    }
+    let last = s.last_object_len as usize;
+    if last <= V2_SEAL_OVERHEAD || last > V2_SHARD_BYTES {
+        return Err(AetherError::Protocol("ManifestV2 last_object_len is out of range".into()));
+    }
+    Ok(())
 }
 
 impl StripeV2 {
@@ -318,20 +456,83 @@ impl ManifestV2 {
             return Err(AetherError::Protocol("ManifestV2 chunk size mismatch".into()));
         }
         for s in &m.stripes {
-            let total = s.data as usize + s.parity as usize;
-            if s.data == 0
-                || s.parity == 0
-                || total > crate::mailbox::sharding_v2::MAX_TOTAL_SHARDS
-                || s.shard_hashes.len() != total
-            {
-                return Err(AetherError::Protocol("ManifestV2 stripe shape is invalid".into()));
-            }
-            let last = s.last_object_len as usize;
-            if last <= V2_SEAL_OVERHEAD || last > V2_SHARD_BYTES {
-                return Err(AetherError::Protocol("ManifestV2 last_object_len is out of range".into()));
-            }
+            validate_stripe(s)?;
         }
         Ok(m)
+    }
+}
+
+/// 木の Manifest の根
+///
+/// ストライプの表が 1 オブジェクトに収まらないファイルで、記述子の `content_ref` はこれを指す。
+/// ストライプの表そのものは [`ManifestPage`] に分けて、小さなものの経路で置く（内容アドレスで参照）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManifestRoot {
+    /// 常に [`MANIFEST_ROOT_VERSION`]
+    pub version: u8,
+    /// 表示名（ファイル名）
+    pub name: String,
+    /// ファイルの平文の大きさ
+    pub size: u64,
+    /// チャンクの平文の大きさ（最後のチャンク以外）
+    pub chunk_plain: u32,
+    /// 全ページを合わせたストライプの総数
+    pub stripe_count: u64,
+    /// ページの内容アドレス。**並び順がストライプの順**
+    pub pages: Vec<[u8; 32]>,
+}
+
+impl ManifestRoot {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        bincode::serialize(self).map_err(|e| AetherError::Serialization(e.to_string()))
+    }
+
+    /// 復号して形を検べる
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let r: Self = bincode::deserialize(bytes)
+            .map_err(|e| AetherError::Protocol(format!("Invalid ManifestRoot: {}", e)))?;
+        if r.version != MANIFEST_ROOT_VERSION {
+            return Err(AetherError::Protocol(format!(
+                "ManifestRoot version {} is not supported",
+                r.version
+            )));
+        }
+        if r.chunk_plain as usize != V2_CHUNK_PLAIN {
+            return Err(AetherError::Protocol("ManifestRoot chunk size mismatch".into()));
+        }
+        if r.size > MAX_FILE_BYTES {
+            return Err(AetherError::Protocol("ManifestRoot size is over the file limit".into()));
+        }
+        let stripes = r.stripe_count as usize;
+        if r.stripe_count > max_stripes_file() as u64 || r.pages.is_empty() || r.pages.len() > stripes {
+            return Err(AetherError::Protocol("ManifestRoot page table is invalid".into()));
+        }
+        Ok(r)
+    }
+}
+
+/// 木の Manifest のページ ── ストライプの表の一部（連続するストライプ）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManifestPage {
+    pub stripes: Vec<StripeV2>,
+}
+
+impl ManifestPage {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        bincode::serialize(self).map_err(|e| AetherError::Serialization(e.to_string()))
+    }
+
+    /// 復号して形を検べる。1 ページのストライプ数は封じて [`SINGLE_BODY_LIMIT`] に収まる範囲
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let p: Self = bincode::deserialize(bytes)
+            .map_err(|e| AetherError::Protocol(format!("Invalid ManifestPage: {}", e)))?;
+        if p.stripes.is_empty() || p.stripes.len() > MAX_STRIPES_PER_MANIFEST_V2 {
+            return Err(AetherError::Protocol("ManifestPage stripe count is out of range".into()));
+        }
+        for s in &p.stripes {
+            validate_stripe(s)?;
+        }
+        Ok(p)
     }
 }
 
@@ -608,7 +809,7 @@ mod tests {
         let sizes = [(7usize, 5_000_000u64), (100, 300_000), (3, 40_000_000), (100, 3072 * V2_CHUNK_PLAIN as u64)];
         for (name_len, size) in sizes {
             for pad in [false, true] {
-                let chunks = v2_layout_chunks(name_len, size, pad).unwrap();
+                let chunks = v2_layout_chunks(size, pad).unwrap();
                 let shapes = v2_stripe_shapes(chunks).unwrap();
                 assert_eq!(shapes.iter().map(|s| s.0).sum::<usize>(), chunks, "データシャード数の合計がチャンク数");
                 let m = ManifestV2 {
@@ -657,29 +858,208 @@ mod tests {
     }
 
     #[test]
-    fn layout_pads_but_never_exceeds_the_manifest_limit() {
+    fn layout_pads_but_never_exceeds_the_file_limit() {
         let plain = V2_CHUNK_PLAIN as u64;
         // 1MiB 以下は 5 チャンク、1MiB を 1 バイト超えると 2MiB の刻みで 9 チャンク。pad=false なら切り上げない
-        assert_eq!(v2_layout_chunks(10, 4 * plain + 1, true).unwrap(), 5);
-        assert_eq!(v2_layout_chunks(10, 4 * plain + 1, false).unwrap(), 5);
-        assert_eq!(v2_layout_chunks(10, V2_MIN_BUCKET_BYTES + 1, true).unwrap(), 9);
-        assert_eq!(v2_layout_chunks(10, V2_MIN_BUCKET_BYTES + 1, false).unwrap(), 5);
-        assert_eq!(v2_layout_chunks(10, 4 << 20, true).unwrap(), 17, "ちょうど 4MiB は 17 チャンク");
-        assert_eq!(v2_layout_chunks(10, (4 << 20) + 1, true).unwrap(), 33);
-        assert_eq!(v2_layout_chunks(10, 1, true).unwrap(), 5, "小さいファイルも 1MiB の刻み");
-        assert_eq!(v2_layout_chunks(10, 1, false).unwrap(), 1);
-        // 上限ちょうどは通り、頭打ちが効いて切り上げでも上限を超えない
-        let max = max_chunks_v2(100);
-        assert!(max > 2048 && !max.is_power_of_two());
-        let at_max = max as u64 * plain;
-        assert_eq!(v2_layout_chunks(100, at_max, true).unwrap(), max);
-        assert_eq!(v2_layout_chunks(100, 2049 * plain, true).unwrap(), max, "2^29 バイトを超えると上限まで切り上がる");
-        assert_eq!(v2_layout_chunks(100, 1 << 29, true).unwrap(), 2049, "ちょうど 2^29 バイトの刻み");
-        assert!(manifest_v2_sealed_len(100, v2_layout_chunks(100, at_max, true).unwrap()).unwrap() <= SINGLE_BODY_LIMIT);
+        assert_eq!(v2_layout_chunks(4 * plain + 1, true).unwrap(), 5);
+        assert_eq!(v2_layout_chunks(4 * plain + 1, false).unwrap(), 5);
+        assert_eq!(v2_layout_chunks(V2_MIN_BUCKET_BYTES + 1, true).unwrap(), 9);
+        assert_eq!(v2_layout_chunks(V2_MIN_BUCKET_BYTES + 1, false).unwrap(), 5);
+        assert_eq!(v2_layout_chunks(4 << 20, true).unwrap(), 17, "ちょうど 4MiB は 17 チャンク");
+        assert_eq!(v2_layout_chunks((4 << 20) + 1, true).unwrap(), 33);
+        assert_eq!(v2_layout_chunks(1, true).unwrap(), 5, "小さいファイルも 1MiB の刻み");
+        assert_eq!(v2_layout_chunks(1, false).unwrap(), 1);
+        // 上限ちょうどは通り、切り上げでも上限を超えない
+        let max = max_chunks_file();
+        assert_eq!(v2_layout_chunks(MAX_FILE_BYTES, true).unwrap(), max);
+        assert_eq!(v2_layout_chunks(MAX_FILE_BYTES, false).unwrap(), max);
+        assert_eq!(v2_layout_chunks(MAX_FILE_BYTES - 1, true).unwrap(), max, "上限直下も刻みは上限");
         // 上限を超えれば pad の有無にかかわらず断る
-        assert!(v2_layout_chunks(100, at_max + 1, true).is_err());
-        assert!(v2_layout_chunks(100, at_max + 1, false).is_err());
-        assert!(v2_layout_chunks(100, 0, true).is_err());
+        assert!(v2_layout_chunks(MAX_FILE_BYTES + 1, true).is_err());
+        assert!(v2_layout_chunks(MAX_FILE_BYTES + 1, false).is_err());
+        assert!(v2_layout_chunks(0, true).is_err());
+    }
+
+    #[test]
+    fn buckets_are_powers_of_two_up_to_1gib_then_quarter_power_steps() {
+        let gib = 1u64 << 30;
+        // 1GiB まで: 2 の冪（最小 1MiB）
+        assert_eq!(size_bucket_bytes(1), V2_MIN_BUCKET_BYTES);
+        assert_eq!(size_bucket_bytes(gib / 2), gib / 2);
+        assert_eq!(size_bucket_bytes(gib / 2 + 1), gib);
+        assert_eq!(size_bucket_bytes(gib), gib, "ちょうど 1GiB は 1GiB のまま");
+        // 1GiB を超えたら 1/4 乗刻み
+        assert_eq!(size_bucket_bytes(gib + 1), gib * 4871 / 4096);
+        let table: Vec<u64> = [gib + 1, gib * 4871 / 4096 + 1, gib * 5793 / 4096 + 1, gib * 6889 / 4096 + 1, 2 * gib + 1]
+            .iter()
+            .map(|&s| size_bucket_bytes(s))
+            .collect();
+        assert_eq!(table, vec![gib * 4871 / 4096, gib * 5793 / 4096, gib * 6889 / 4096, 2 * gib, gib * 2 * 4871 / 4096]);
+        // 刻みの境目: ちょうどの値はその刻みに入り、1 バイト増えると次へ
+        for b in [gib * 4871 / 4096, gib * 5793 / 4096, gib * 6889 / 4096, 2 * gib, 4 * gib, 64 * gib] {
+            assert_eq!(size_bucket_bytes(b), b);
+            assert!(size_bucket_bytes(b + 1) > b);
+        }
+        // 刻みは単調で、無駄は 19% 以内（1GiB 超）。2 の 1/4 乗の近似
+        let mut prev = 0;
+        let mut size = gib + 1;
+        while size < MAX_FILE_BYTES {
+            let b = size_bucket_bytes(size);
+            assert!(b >= size && b >= prev);
+            assert!((b as f64) / (size as f64) < 1.19, "size = {}, bucket = {}", size, b);
+            prev = b;
+            size += gib / 7;
+        }
+        // 1GiB 超の刻みは 2 倍ごとに 4 つ（表を倍々にする）。1〜8GiB の表
+        let mut expect = Vec::new();
+        for e in 0..3u32 {
+            for step in [4096u64, 4871, 5793, 6889] {
+                expect.push((gib << e) / 4096 * step);
+            }
+        }
+        expect.push(8 * gib);
+        let mut got = Vec::new();
+        let mut size = gib;
+        while size <= 8 * gib {
+            let b = size_bucket_bytes(size);
+            got.push(b);
+            size = b + 1;
+        }
+        assert_eq!(got, expect);
+        assert_eq!(size_bucket_bytes(MAX_FILE_BYTES), MAX_FILE_BYTES, "上限は刻みの値");
+    }
+
+    #[test]
+    fn padded_chunks_never_fall_below_the_real_count_and_never_pass_the_file_limit() {
+        let gib = 1u64 << 30;
+        let max = max_chunks_file();
+        for size in [1u64, gib - 1, gib, gib + 1, 3 * gib, 10 * gib + 12345, MAX_FILE_BYTES - 1, MAX_FILE_BYTES] {
+            let padded = padded_chunks_for_size(size, max);
+            assert!(padded >= v2_chunk_count(size), "size = {}", size);
+            assert!(padded <= max, "size = {}", size);
+        }
+        // 1.1GiB は 1.19GiB の刻み（2GiB には上がらない）
+        let want = (gib * 4871 / 4096).div_ceil(V2_CHUNK_PLAIN as u64) as usize;
+        assert_eq!(padded_chunks_for_size(gib + gib / 10, max), want);
+    }
+
+    #[test]
+    fn plan_is_single_when_the_stripes_fit_and_a_tree_otherwise() {
+        // 小さなファイルは今の ManifestV2 のまま
+        let small = v2_layout_chunks(5_000_000, true).unwrap();
+        assert_eq!(plan_manifest(20, small, None).unwrap(), ManifestPlan::Single);
+        // 800MB（旧い上限）まで 1 つの ManifestV2 に収まる
+        let max_single = max_chunks_v2(20);
+        assert_eq!(plan_manifest(20, max_single, None).unwrap(), ManifestPlan::Single);
+        // 超えたら木
+        let ManifestPlan::Tree { per_page } = plan_manifest(20, max_single + 1, None).unwrap() else {
+            panic!("tree expected");
+        };
+        let m = v2_stripe_shapes(max_single + 1).unwrap()[0].1;
+        assert_eq!(per_page, manifest_page_stripes(m));
+        // 試験の口: ページの大きさを小さくすると、小さなファイルでも木になる
+        let five_stripes = 5 * V2_DATA_PER_STRIPE;
+        assert_eq!(plan_manifest(20, five_stripes, Some(2)).unwrap(), ManifestPlan::Tree { per_page: 2 });
+        assert_eq!(plan_manifest(20, five_stripes, Some(5)).unwrap(), ManifestPlan::Single, "収まるなら 1 つ");
+        // 上限の大きさでも根が収まる
+        let top = v2_layout_chunks(MAX_FILE_BYTES, true).unwrap();
+        let ManifestPlan::Tree { per_page } = plan_manifest(MAX_FILE_NAME_FOR_TEST, top, None).unwrap() else {
+            panic!("tree expected");
+        };
+        let stripes = top.div_ceil(V2_DATA_PER_STRIPE);
+        let pages = stripes.div_ceil(per_page);
+        assert!(manifest_root_sealed_len(MAX_FILE_NAME_FOR_TEST, pages) <= SINGLE_BODY_LIMIT);
+        assert!(pages < 200, "pages = {}", pages);
+        // 上限を超える大きさのチャンク数は断る
+        assert!(plan_manifest(20, top * 2, None).is_err());
+    }
+
+    const MAX_FILE_NAME_FOR_TEST: usize = 255;
+
+    #[test]
+    fn page_ranges_split_stripes_in_order() {
+        assert_eq!(page_ranges(5, 2), vec![0..2, 2..4, 4..5]);
+        assert_eq!(page_ranges(4, 2), vec![0..2, 2..4]);
+        assert_eq!(page_ranges(1, 188), vec![0..1]);
+        assert!(page_ranges(0, 3).is_empty());
+        assert_eq!(page_ranges(3, 0), vec![0..1, 1..2, 2..3], "0 は 1 として数える");
+        // どのストライプもちょうど 1 回、順番どおりに入る
+        let flat: Vec<usize> = page_ranges(1000, 188).into_iter().flatten().collect();
+        assert_eq!(flat, (0..1000).collect::<Vec<_>>());
+    }
+
+    fn full_stripe(m: usize) -> StripeV2 {
+        StripeV2 {
+            data: V2_DATA_PER_STRIPE as u8,
+            parity: m as u8,
+            last_object_len: V2_SHARD_BYTES as u32,
+            shard_hashes: vec![[7u8; 32]; V2_DATA_PER_STRIPE + m],
+        }
+    }
+
+    #[test]
+    fn manifest_page_fits_the_single_body_limit_and_estimate_matches_the_real_one() {
+        for m in [1usize, 5, 27, 40] {
+            let per = manifest_page_stripes(m);
+            let page = ManifestPage { stripes: vec![full_stripe(m); per] };
+            let real = page.encode().unwrap().len() + V2_SEAL_OVERHEAD;
+            assert!(real <= SINGLE_BODY_LIMIT, "m = {}: {} バイト", m, real);
+            assert_eq!(real, manifest_page_sealed_len(&vec![(V2_DATA_PER_STRIPE, m); per]), "見積もりが実物と一致");
+            // もう 1 つ入れると収まらない（既定は収まる最大）
+            let over = ManifestPage { stripes: vec![full_stripe(m); per + 1] };
+            assert!(over.encode().unwrap().len() + V2_SEAL_OVERHEAD > SINGLE_BODY_LIMIT, "m = {}", m);
+        }
+        assert_eq!(manifest_page_stripes(27), 188);
+    }
+
+    #[test]
+    fn manifest_root_and_page_roundtrip_and_reject_bad_shapes() {
+        let root = ManifestRoot {
+            version: MANIFEST_ROOT_VERSION,
+            name: "big.iso".into(),
+            size: 5_000_000_000,
+            chunk_plain: V2_CHUNK_PLAIN as u32,
+            stripe_count: 1200,
+            pages: vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32], [5u8; 32], [6u8; 32], [7u8; 32]],
+        };
+        let bytes = root.encode().unwrap();
+        assert_eq!(ManifestRoot::decode(&bytes).unwrap(), root);
+        assert_eq!(
+            bytes.len() + V2_SEAL_OVERHEAD,
+            manifest_root_sealed_len("big.iso".len(), root.pages.len()),
+            "見積もりが実物と一致"
+        );
+        // 根は ManifestV2 としては読めない（取る側が見分ける）
+        assert!(ManifestV2::decode(&bytes).is_err());
+        let bad = |f: &dyn Fn(&mut ManifestRoot)| {
+            let mut r = root.clone();
+            f(&mut r);
+            assert!(ManifestRoot::decode(&r.encode().unwrap()).is_err());
+        };
+        bad(&|r| r.version = MANIFEST_V2_VERSION);
+        bad(&|r| r.chunk_plain += 1);
+        bad(&|r| r.size = MAX_FILE_BYTES + 1);
+        bad(&|r| r.stripe_count = max_stripes_file() as u64 + 1);
+        bad(&|r| r.pages.clear());
+        bad(&|r| r.stripe_count = 3);
+
+        let page = ManifestPage { stripes: vec![full_stripe(27); 3] };
+        assert_eq!(ManifestPage::decode(&page.encode().unwrap()).unwrap(), page);
+        assert!(ManifestPage::decode(&ManifestPage { stripes: Vec::new() }.encode().unwrap()).is_err());
+        let mut broken = page.clone();
+        broken.stripes[1].shard_hashes.pop();
+        assert!(ManifestPage::decode(&broken.encode().unwrap()).is_err());
+        // ページは根としても ManifestV2 としても読めない
+        assert!(ManifestRoot::decode(&page.encode().unwrap()).is_err());
+        // ManifestV2 は根としては読めない
+        let v2 = ManifestV2 {
+            version: MANIFEST_V2_VERSION,
+            name: "a".into(),
+            size: 10,
+            chunk_plain: V2_CHUNK_PLAIN as u32,
+            stripes: vec![full_stripe(3)],
+        };
+        assert!(ManifestRoot::decode(&v2.encode().unwrap()).is_err());
     }
 
     #[test]
@@ -719,7 +1099,6 @@ mod tests {
         // 上限ちょうどは通り、1 チャンク足すと超える
         assert!(manifest_v2_sealed_len(100, max).unwrap() <= SINGLE_BODY_LIMIT);
         assert!(manifest_v2_sealed_len(100, max + 1).unwrap() > SINGLE_BODY_LIMIT);
-        assert_eq!(max_file_size_v2(100), max as u64 * V2_CHUNK_PLAIN as u64);
         assert!(max_chunks_v2(1000) <= max, "名前が長いほど上限は増えない");
     }
 

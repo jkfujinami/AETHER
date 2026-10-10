@@ -15,14 +15,15 @@ use crate::error::Result;
 use crate::events;
 use crate::pull::PullSession;
 use crate::boards::BoardId;
-use aether_core::mailbox::chunk::{self, Manifest, ManifestV2, StripeV2};
+use aether_core::mailbox::chunk::{self, Manifest, ManifestPage, ManifestRoot, ManifestV2, StripeV2};
 use crate::index_pages::{INDEX_HEDGE, fill_known_roots, index_ask_count, search_days};
 use aether_core::mailbox::index::{self, IndexDescriptor};
 use aether_core::mailbox::schrodinger::{K_REPLICAS, SchrodingerMailbox};
 use aether_core::mailbox::sharding::{DATA_SHARDS, TOTAL_SHARDS};
 use aether_core::mailbox::sharding_v2;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// 索引の返信を待つ上限（何も無いときはここまで待つ）
@@ -114,23 +115,34 @@ const V2_GIVE_UP: Duration = Duration::from_secs(30);
 const V2_PROGRESS_EVERY: Duration = Duration::from_secs(1);
 
 /// 滑る窓 ── 同時に要求中のストライプを `limit` 本までにして、1 本終わるたびに次を始める
+///
+/// 順番に書き出す側（[`OrderedWriter`]）が手元に溜めるのは、先頭の未完了より先に揃った分だけ。
+/// 先頭の 1 本が遅れても溜まりきらないよう、始めるのは「先頭の未完了 + `limit × 2`」の手前までにする。
 struct StripeWindow {
     total: usize,
     limit: usize,
     next: usize,
     active: Vec<usize>,
     stopped: bool,
+    /// 終えたストライプ（揃った・見切った）
+    finished: Vec<bool>,
+    /// 先頭から連続して終えた数（= 先頭の未完了の添字）
+    prefix: usize,
 }
 
 impl StripeWindow {
     fn new(total: usize, limit: usize) -> Self {
-        Self { total, limit, next: 0, active: Vec::new(), stopped: false }
+        Self { total, limit, next: 0, active: Vec::new(), stopped: false, finished: vec![false; total], prefix: 0 }
     }
 
     /// 窓に空きがあれば新しく始めるストライプを返す（順番どおり）
     fn start_more(&mut self) -> Vec<usize> {
         let mut started = Vec::new();
-        while !self.stopped && self.active.len() < self.limit && self.next < self.total {
+        while !self.stopped
+            && self.active.len() < self.limit
+            && self.next < self.total
+            && self.next < self.prefix + self.limit * 2
+        {
             self.active.push(self.next);
             started.push(self.next);
             self.next += 1;
@@ -141,6 +153,12 @@ impl StripeWindow {
     /// そのストライプの要求を終える（揃った・見切った）
     fn finish(&mut self, stripe: usize) {
         self.active.retain(|&i| i != stripe);
+        if let Some(f) = self.finished.get_mut(stripe) {
+            *f = true;
+        }
+        while self.finished.get(self.prefix).copied().unwrap_or(false) {
+            self.prefix += 1;
+        }
     }
 
     /// これ以上新しいストライプを始めない（1 本でも取れなければ全体が失敗するため）
@@ -421,6 +439,132 @@ fn stripe_requests(stripe: &StripeV2) -> Vec<[u8; 32]> {
     stripe.shard_hashes[..stripe.data as usize].to_vec()
 }
 
+/// メモリに載せて返す [`AetherClient::get`] が扱う、ファイルの本当の大きさの上限
+///
+/// これを超えるファイルは [`AetherClient::get_to_path`] で取る（ディスクへ順に書く）。
+pub const GET_IN_MEMORY_LIMIT: u64 = 256 << 20;
+/// 木の Manifest のページを一度に要求する数
+///
+/// 返信は自分の Mailbox に入るので、全ページを一斉に要求せず、この数ずつ取る。
+const PAGE_BATCH: usize = 8;
+
+/// ストライプを番号順にファイルへ書き出す ── 順不同で揃うストライプを、手元に溜めて順に書く
+///
+/// 最後のストライプは本当の大きさ（`size`）で切る（埋め草は書かない）。
+/// 溜めるのは、先頭の未完了より先に揃った分だけ（窓 [`StripeWindow`] が数を抑える）。
+struct OrderedWriter<W: std::io::Write> {
+    out: W,
+    /// 次に書くストライプの番号
+    next: usize,
+    pending: BTreeMap<usize, Vec<u8>>,
+    /// まだ書くべき本当のバイト数
+    remaining: u64,
+}
+
+impl<W: std::io::Write> OrderedWriter<W> {
+    fn new(out: W, size: u64) -> Self {
+        Self { out, next: 0, pending: BTreeMap::new(), remaining: size }
+    }
+
+    /// ストライプ `index` の平文を渡す。書ける分（番号が続く分）をすぐ書く
+    fn push(&mut self, index: usize, bytes: Vec<u8>) -> Result<()> {
+        if index < self.next || self.pending.contains_key(&index) {
+            return Err(crate::error::ClientError::invalid("同じストライプが二度届きました"));
+        }
+        self.pending.insert(index, bytes);
+        while let Some(bytes) = self.pending.remove(&self.next) {
+            let n = (bytes.len() as u64).min(self.remaining) as usize;
+            self.out.write_all(&bytes[..n])?;
+            self.remaining -= n as u64;
+            self.next += 1;
+        }
+        Ok(())
+    }
+
+    /// 溜めている（まだ書けない）ストライプの数
+    #[cfg(test)]
+    fn buffered(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// 全部書けたか確かめて、書き先を返す
+    fn finish(self) -> Result<W> {
+        if self.remaining != 0 || !self.pending.is_empty() {
+            return Err(crate::error::ClientError::invalid("ファイルの大きさが Manifest と合いません"));
+        }
+        Ok(self.out)
+    }
+}
+
+/// 書き込み中の一時ファイルの場所（同じフォルダの `.<名前>.aether-part`）
+fn part_path_for(target: &Path) -> Result<PathBuf> {
+    let name = target
+        .file_name()
+        .ok_or_else(|| crate::error::ClientError::invalid("保存先のファイル名がありません"))?;
+    let dir = target.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    Ok(dir.join(format!(".{}.aether-part", name.to_string_lossy())))
+}
+
+/// 一時ファイルの見張り ── [`commit`](Self::commit) されずに落とされたら消す
+///
+/// 失敗・途中で取れなかったときに、取りかけのファイルを手元に残さない（押収されたとき、
+/// 何を取ろうとしていたかが残る）。
+struct PartFile {
+    part: PathBuf,
+    armed: bool,
+}
+
+impl PartFile {
+    /// 一時ファイルを作って（あれば切り詰めて）開く
+    fn create(target: &Path) -> Result<(Self, std::fs::File)> {
+        let part = part_path_for(target)?;
+        let file = std::fs::File::create(&part)?;
+        Ok((Self { part, armed: true }, file))
+    }
+
+    /// 全部書けた。保存先へ名前を付け替える
+    fn commit(mut self, target: &Path) -> Result<()> {
+        std::fs::rename(&self.part, target)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for PartFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.part);
+        }
+    }
+}
+
+/// 取れた Manifest から決まる、ファイルの取り方
+struct FilePlan {
+    name: String,
+    /// 本当の大きさ
+    size: u64,
+    /// 全ストライプ（木ならページをつないだもの）
+    stripes: Vec<StripeV2>,
+}
+
+/// 取れたオブジェクトの見分け結果
+enum Planned {
+    /// Manifest ではない（単一 body か、読めない形）
+    NotManifest,
+    /// Manifest だが、ページが取れなかった
+    Missing,
+    Plan(FilePlan),
+}
+
+/// ファイルを書き出した結果（[`AetherClient::get_to_path`]）
+#[derive(Debug, Clone, Serialize)]
+pub struct FetchedInfo {
+    /// Manifest の名前（網から来た値。信用せず、保存名には使わない）
+    pub name: String,
+    /// 本当の大きさ（バイト）
+    pub size: u64,
+}
+
 /// 取得した内容
 #[derive(Debug, Clone, Serialize)]
 pub struct Fetched {
@@ -517,31 +661,36 @@ impl AetherClient {
 
     /// 検索で見つけた投稿・ファイルの本体を取得する
     ///
-    /// 保持者が居ない・期限切れなら `None`。
+    /// 保持者が居ない・期限切れなら `None`。**全体をメモリに持つ**ので、本当の大きさが
+    /// [`GET_IN_MEMORY_LIMIT`] を超えるファイルはエラーにする（[`get_to_path`](Self::get_to_path) で取る）。
     pub async fn get(&self, board: &BoardId, content_ref: [u8; 32]) -> Result<Option<Fetched>> {
         let k_pub = board.key();
         let session = self.open_pull_session(HashMap::new()).await?;
         events::progress(&self.events, format!("取得中 (ref {}...)", hex::encode(&content_ref[..8])));
+        let first = self.fetch_first(&session, content_ref, &k_pub).await?;
 
-        // Manifest（チャンク化）か単一 body かは、置いた側しか知らない。
-        // **両方を同時に要求し、先に揃った方で決める**（片方のタイムアウトを待たない）
-        let body_key = SchrodingerMailbox::body_mailbox_key(&content_ref);
-        let first = self
-            .fetch_objects(&session, &[(content_ref, content_ref), (body_key, content_ref)], &k_pub, OBJECT_WAIT, |got| {
-                got.iter().any(Option::is_some)
-            })
-            .await?;
-
-        if let Some(manifest) = first[0].as_deref().and_then(|b| ManifestV2::decode(b).ok()) {
-            let (fetched, help) = self.fetch_file_v2(&session, manifest, &k_pub).await?;
-            // 取ったファイルを先に返し、網に残す手伝い（延命・置き直し）は裏で送る。
-            // 終わる前に `flush` を呼ぶ側（CLI）は、これを送り終えるまで待つ
-            if let Some(help) = help {
-                let events = self.events.clone();
-                let handle = tokio::spawn(keep_files_alive(session, k_pub, help, events));
-                self.pending_flush.lock().unwrap().push(handle);
+        match self.plan_file(&session, &k_pub, first[0].as_deref(), Some(GET_IN_MEMORY_LIMIT)).await? {
+            Planned::Plan(plan) => {
+                let mut plain: Vec<Vec<u8>> = vec![Vec::new(); plan.stripes.len()];
+                let (ok, help) = self
+                    .fetch_stripes(&session, &plan, &k_pub, &mut |i, bytes| {
+                        plain[i] = bytes;
+                        Ok(())
+                    })
+                    .await?;
+                self.keep_in_background(session, k_pub, help);
+                if !ok {
+                    return Ok(None);
+                }
+                let mut bytes: Vec<u8> = plain.into_iter().flatten().collect();
+                if (bytes.len() as u64) < plan.size {
+                    return Err(crate::error::ClientError::invalid("ファイルの大きさが Manifest と合いません"));
+                }
+                bytes.truncate(plan.size as usize);
+                return Ok(Some(Fetched { name: Some(plan.name), bytes }));
             }
-            return Ok(fetched);
+            Planned::Missing => return Ok(None),
+            Planned::NotManifest => {}
         }
         // 古い形式（v1 の Manifest）は読まない。互換を切った
         if first[0].as_deref().is_some_and(|b| Manifest::decode(b).is_ok()) {
@@ -556,24 +705,158 @@ impl AetherClient {
             .map(|bytes| Fetched { name: None, bytes }))
     }
 
+    /// 検索で見つけたファイルを取って、`path` へ順に書く。全体をメモリに持たない
+    ///
+    /// 同じフォルダの一時ファイル（`.<名前>.aether-part`）に書き、全部そろって大きさを確かめたら
+    /// `path` へ名前を付け替える。失敗・途中で取れなかったときは一時ファイルを消す
+    /// （取りかけのファイルを残さない）。保持者が居ない・期限切れなら `None`。
+    pub async fn get_to_path(
+        &self,
+        board: &BoardId,
+        content_ref: [u8; 32],
+        path: &Path,
+    ) -> Result<Option<FetchedInfo>> {
+        let k_pub = board.key();
+        let session = self.open_pull_session(HashMap::new()).await?;
+        events::progress(&self.events, format!("取得中 (ref {}...)", hex::encode(&content_ref[..8])));
+        let first = self.fetch_first(&session, content_ref, &k_pub).await?;
+
+        match self.plan_file(&session, &k_pub, first[0].as_deref(), None).await? {
+            Planned::Plan(plan) => {
+                let (part, file) = PartFile::create(path)?;
+                let mut writer = OrderedWriter::new(file, plan.size);
+                let (ok, help) = self
+                    .fetch_stripes(&session, &plan, &k_pub, &mut |i, bytes| writer.push(i, bytes))
+                    .await?;
+                self.keep_in_background(session, k_pub, help);
+                if !ok {
+                    return Ok(None);
+                }
+                let file = writer.finish()?;
+                file.sync_all()?;
+                drop(file);
+                part.commit(path)?;
+                return Ok(Some(FetchedInfo { name: plan.name, size: plan.size }));
+            }
+            Planned::Missing => return Ok(None),
+            Planned::NotManifest => {}
+        }
+        if first[0].as_deref().is_some_and(|b| Manifest::decode(b).is_ok()) {
+            events::warning(&self.events, "古い形式のファイルです（読めません）");
+            return Ok(None);
+        }
+        // 単一 body の投稿（小さい）。同じ手順で書く
+        let Some(bytes) = first.into_iter().nth(1).flatten() else {
+            return Ok(None);
+        };
+        let (part, mut file) = PartFile::create(path)?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.sync_all()?;
+        drop(file);
+        part.commit(path)?;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        Ok(Some(FetchedInfo { name, size: bytes.len() as u64 }))
+    }
+
+    /// Manifest（チャンク化）か単一 body かは、置いた側しか知らない。
+    /// **両方を同時に要求し、先に揃った方で決める**（片方のタイムアウトを待たない）
+    async fn fetch_first(
+        &self,
+        session: &PullSession,
+        content_ref: [u8; 32],
+        k_pub: &[u8; 32],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let body_key = SchrodingerMailbox::body_mailbox_key(&content_ref);
+        self.fetch_objects(session, &[(content_ref, content_ref), (body_key, content_ref)], k_pub, OBJECT_WAIT, |got| {
+            got.iter().any(Option::is_some)
+        })
+        .await
+    }
+
+    /// 取ったファイルを先に返し、網に残す手伝い（延命・置き直し）は裏で送る。
+    /// 終わる前に `flush` を呼ぶ側（CLI）は、これを送り終えるまで待つ
+    fn keep_in_background(&self, session: PullSession, k_pub: [u8; 32], help: Option<KeepHelp>) {
+        if let Some(help) = help {
+            let events = self.events.clone();
+            let handle = tokio::spawn(keep_files_alive(session, k_pub, help, events));
+            self.pending_flush.lock().unwrap().push(handle);
+        }
+    }
+
+    /// 取れた最初のオブジェクトが Manifest なら、ファイルの取り方を決める
+    ///
+    /// `ManifestV2`（1 つ）→ `ManifestRoot`（木）の順に試す。木ならページを取って、ストライプの表をつなぐ。
+    /// ページは根に書かれた内容アドレスで照合して使う（[`fetch_objects`](Self::fetch_objects)）。
+    /// `size_limit` を超える大きさは、ページを取る前に断る。
+    async fn plan_file(
+        &self,
+        session: &PullSession,
+        k_pub: &[u8; 32],
+        first: Option<&[u8]>,
+        size_limit: Option<u64>,
+    ) -> Result<Planned> {
+        let too_big = |size: u64| match size_limit {
+            Some(limit) if size > limit => Err(crate::error::ClientError::invalid(format!(
+                "大きなファイルです（{} MB 超）。ファイルへ書き出す取得（get_to_path / CLI の --out）を使ってください",
+                limit >> 20
+            ))),
+            _ => Ok(()),
+        };
+        let Some(bytes) = first else {
+            return Ok(Planned::NotManifest);
+        };
+        if let Ok(m) = ManifestV2::decode(bytes) {
+            too_big(m.size)?;
+            return Ok(Planned::Plan(FilePlan { name: m.name, size: m.size, stripes: m.stripes }));
+        }
+        let Ok(root) = ManifestRoot::decode(bytes) else {
+            return Ok(Planned::NotManifest);
+        };
+        too_big(root.size)?;
+        let mut stripes = Vec::with_capacity(root.stripe_count as usize);
+        for batch in root.pages.chunks(PAGE_BATCH) {
+            let keys: Vec<([u8; 32], [u8; 32])> = batch.iter().map(|r| (*r, *r)).collect();
+            let got = self
+                .fetch_objects(session, &keys, k_pub, OBJECT_WAIT, |got| got.iter().all(Option::is_some))
+                .await?;
+            for page in got {
+                let Some(page) = page else {
+                    events::warning(&self.events, "ファイルの目次（ページ）を取得できませんでした");
+                    return Ok(Planned::Missing);
+                };
+                let page = ManifestPage::decode(&page)
+                    .map_err(|_| crate::error::ClientError::invalid("目次のページが壊れています"))?;
+                stripes.extend(page.stripes);
+            }
+        }
+        // 根が言うストライプの数と、ページに入っていた数が合うこと。大きさが収まること
+        let capacity: u64 = stripes.iter().map(|s| s.data as u64 * chunk::V2_CHUNK_PLAIN as u64).sum();
+        if stripes.len() as u64 != root.stripe_count || capacity < root.size {
+            return Err(crate::error::ClientError::invalid("目次の形が根と合いません（壊れたファイル）"));
+        }
+        Ok(Planned::Plan(FilePlan { name: root.name, size: root.size, stripes }))
+    }
+
     /// v2 のファイルを取る。ストライプを `V2_STRIPES_IN_FLIGHT` 本ずつの窓で進める
     ///
     /// ストライプごとに、まずデータ k 個を要求し、失われた要求（[`HedgeTracker`]）1 本につき
     /// パリティを 1 つ足す。回線が遅いだけならパリティは要求しない。届いたシャードは Manifest のハッシュと照合し、合ったものだけ使う。
-    /// 全体をメモリに持つ（最大 約 800MB。逐次ファイルへ書く形は将来）。
-    async fn fetch_file_v2(
+    /// 揃ったストライプは平文にして `on_stripe(番号, 平文)` へ渡す（**順不同**。順に書くのは呼び出し側）。
+    /// 返すのは（全ストライプを取れたか, 網に残す手伝い）。
+    async fn fetch_stripes(
         &self,
         session: &PullSession,
-        manifest: ManifestV2,
+        plan: &FilePlan,
         k_pub: &[u8; 32],
-    ) -> Result<(Option<Fetched>, Option<KeepHelp>)> {
-        let total = manifest.stripes.len();
+        on_stripe: &mut (dyn FnMut(usize, Vec<u8>) -> Result<()> + Send),
+    ) -> Result<(bool, Option<KeepHelp>)> {
+        let total = plan.stripes.len();
         events::progress(
             &self.events,
-            format!("{} を取得します ({} ストライプ / {} バイト)", manifest.name, total, manifest.size),
+            format!("{} を取得します ({} ストライプ / {} バイト)", plan.name, total, plan.size),
         );
-        let routes = sharding_v2::shard_routes(&manifest.stripes);
-        let mut states: Vec<StripeState> = manifest
+        let routes = sharding_v2::shard_routes(&plan.stripes);
+        let mut states: Vec<StripeState> = plan
             .stripes
             .iter()
             .map(|s| StripeState { got: vec![None; s.shard_hashes.len()], ..Default::default() })
@@ -581,14 +864,13 @@ impl AetherClient {
         let mut tracker = HedgeTracker::new(Instant::now());
         let help_on = self.privacy().help_keep_files;
         let mut help = KeepHelp::default();
-        let mut plain: Vec<Vec<u8>> = vec![Vec::new(); total];
         let mut window = StripeWindow::new(total, V2_STRIPES_IN_FLIGHT);
         let (mut finished, mut failed) = (0usize, 0usize);
         let mut last_progress = tokio::time::Instant::now();
 
         loop {
             for i in window.start_more() {
-                let stripe = &manifest.stripes[i];
+                let stripe = &plan.stripes[i];
                 let filled: Vec<bool> = states[i].got.iter().map(Option::is_some).collect();
                 tracker.start_stripe(i, stripe.data as usize, &filled, Instant::now());
                 self.request_v2(session, k_pub, &stripe_requests(stripe)).await?;
@@ -607,7 +889,7 @@ impl AetherClient {
 
             let mut gave_up = Vec::new();
             for i in window.active.clone() {
-                let stripe = &manifest.stripes[i];
+                let stripe = &plan.stripes[i];
                 if states[i].have() >= stripe.data as usize {
                     let objects = sharding_v2::restore_stripe(stripe, &states[i].got)?;
                     let mut bytes = Vec::with_capacity(objects.len() * chunk::V2_CHUNK_PLAIN);
@@ -618,7 +900,7 @@ impl AetherClient {
                         })?;
                         bytes.extend_from_slice(&piece);
                     }
-                    plain[i] = bytes;
+                    on_stripe(i, bytes)?;
                     let filled: Vec<bool> = states[i].got.iter().map(Option::is_some).collect();
                     states[i].done = true;
                     states[i].got = Vec::new();
@@ -649,7 +931,7 @@ impl AetherClient {
             }
             if !hedges.is_empty() {
                 let wants: Vec<[u8; 32]> =
-                    hedges.iter().map(|&(si, pos)| manifest.stripes[si].shard_hashes[pos]).collect();
+                    hedges.iter().map(|&(si, pos)| plan.stripes[si].shard_hashes[pos]).collect();
                 self.request_v2(session, k_pub, &wants).await?;
             }
 
@@ -667,15 +949,9 @@ impl AetherClient {
                 &self.events,
                 format!("{}/{} ストライプを取得できませんでした{}", failed, total, detail),
             );
-            return Ok((None, None));
+            return Ok((false, None));
         }
-
-        let mut bytes: Vec<u8> = plain.into_iter().flatten().collect();
-        if (bytes.len() as u64) < manifest.size {
-            return Err(crate::error::ClientError::invalid("ファイルの大きさが Manifest と合いません"));
-        }
-        bytes.truncate(manifest.size as usize);
-        Ok((Some(Fetched { name: Some(manifest.name), bytes }), help_on.then_some(help)))
+        Ok((true, help_on.then_some(help)))
     }
 
     /// シャードを要求する。担当が 1 台も居なければエラー
@@ -865,6 +1141,98 @@ mod tests {
             w.finish(i);
         }
         assert!(w.is_finished());
+    }
+
+    #[test]
+    fn window_does_not_run_far_ahead_of_a_stalled_first_stripe() {
+        // 先頭の 1 本が遅れても、始めるのは先頭の未完了 + 窓 × 2 の手前まで（順に書く側が溜めすぎない）
+        let mut w = StripeWindow::new(100, 4);
+        assert_eq!(w.start_more(), vec![0, 1, 2, 3]);
+        let mut started = 4;
+        for i in 1..100 {
+            w.finish(i);
+            started += w.start_more().len();
+            if started >= 8 {
+                break;
+            }
+        }
+        assert_eq!(started, 8, "先頭が未完了のまま始められるのは 8 本まで");
+        assert_eq!(w.prefix, 0);
+        for i in 1..8 {
+            w.finish(i);
+            assert!(w.start_more().is_empty(), "先頭が終わるまで進まない");
+        }
+        w.finish(0);
+        assert_eq!(w.prefix, 8, "先頭が終われば連続して終えた分まで進む");
+        assert_eq!(w.start_more(), vec![8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn ordered_writer_writes_in_order_even_when_stripes_arrive_out_of_order() {
+        let mut w = OrderedWriter::new(Vec::<u8>::new(), 10);
+        w.push(2, vec![b'c'; 4]).unwrap();
+        w.push(1, vec![b'b'; 4]).unwrap();
+        assert_eq!(w.buffered(), 2, "0 番が来るまで書けない");
+        assert!(w.out.is_empty());
+        w.push(0, vec![b'a'; 4]).unwrap();
+        assert_eq!(w.buffered(), 0);
+        // 本当の大きさ 10 バイトで切る（最後は 2 バイトだけ）
+        assert_eq!(w.finish().unwrap(), b"aaaabbbbcc");
+    }
+
+    #[test]
+    fn ordered_writer_drops_the_padding_stripes_and_rejects_bad_input() {
+        // 埋め草のストライプ（本当の大きさの後ろ）は書かない
+        let mut w = OrderedWriter::new(Vec::<u8>::new(), 4);
+        w.push(0, vec![1; 4]).unwrap();
+        w.push(1, vec![9; 4]).unwrap();
+        assert_eq!(w.finish().unwrap(), vec![1; 4]);
+        // 同じストライプの二重、書き終えた番号の再送は断る
+        let mut w = OrderedWriter::new(Vec::<u8>::new(), 8);
+        w.push(1, vec![0; 4]).unwrap();
+        assert!(w.push(1, vec![0; 4]).is_err());
+        w.push(0, vec![0; 4]).unwrap();
+        assert!(w.push(0, vec![0; 4]).is_err());
+        // 足りないまま終えたらエラー（Manifest の大きさと合わない）
+        let mut w = OrderedWriter::new(Vec::<u8>::new(), 9);
+        w.push(0, vec![0; 4]).unwrap();
+        assert!(w.finish().is_err());
+        // 飛んだ番号が残っていてもエラー
+        let mut w = OrderedWriter::new(Vec::<u8>::new(), 4);
+        w.push(0, vec![0; 4]).unwrap();
+        w.push(2, vec![0; 4]).unwrap();
+        assert!(w.finish().is_err());
+    }
+
+    #[test]
+    fn part_file_is_removed_unless_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("movie.bin");
+        let part = dir.path().join(".movie.bin.aether-part");
+        assert_eq!(part_path_for(&target).unwrap(), part);
+        assert_eq!(part_path_for(Path::new("x.bin")).unwrap(), Path::new("./.x.bin.aether-part"));
+        assert!(part_path_for(Path::new("/")).is_err());
+
+        // 失敗（commit されずに落ちる）と、一時ファイルは消え、保存先は作られない
+        {
+            let (_guard, mut file) = PartFile::create(&target).unwrap();
+            std::io::Write::write_all(&mut file, b"half").unwrap();
+            assert!(part.exists());
+        }
+        assert!(!part.exists(), "失敗したら取りかけのファイルを残さない");
+        assert!(!target.exists());
+
+        // 成功すると保存先へ名前が付け替わり、一時ファイルは残らない
+        let (guard, mut file) = PartFile::create(&target).unwrap();
+        std::io::Write::write_all(&mut file, b"whole").unwrap();
+        drop(file);
+        guard.commit(&target).unwrap();
+        assert!(!part.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"whole");
+
+        // 名前の付け替えに失敗（保存先が作れない）しても一時ファイルは消える
+        let bad = dir.path().join("no-such-dir").join("f");
+        assert!(PartFile::create(&bad).is_err());
     }
 
     #[test]
